@@ -650,27 +650,46 @@ PLUGIN_ID="monitoring-stack"
 PLUGIN_NAME="Monitoring Stack"
 PLUGIN_VERSION="latest"
 PLUGIN_CATEGORY="monitoring"
-PLUGIN_DESCRIPTION="Complete monitoring stack: Prometheus, Grafana, Loki, Node Exporter"
+PLUGIN_DESCRIPTION="Complete monitoring stack: Prometheus, Grafana, Loki, Node Exporter with HTTPS"
 PLUGIN_DOCKER_SUPPORT="true"
 PLUGIN_NATIVE_SUPPORT="false"
-PLUGIN_DOCKER_PORT="3000"
-PLUGIN_DOCKER_URL="Grafana: http://{IP}:3000\nPrometheus: http://{IP}:9090"
-PLUGIN_DOCKER_CREDENTIALS=""
-PLUGIN_DOCKER_CONTAINER="grafana"
+PLUGIN_DOCKER_PORT="443"
+PLUGIN_DOCKER_URL="Grafana: https://{IP}/\nPrometheus: https://{IP}/prometheus/"
+PLUGIN_DOCKER_CREDENTIALS="Grafana: admin/admin"
+PLUGIN_DOCKER_CONTAINER="nginx-proxy"
+PLUGIN_HTTPS_ENABLED="true"
 EOF
 
-    # compose.yml
+    # compose.yml with nginx reverse proxy for HTTPS
     cat > "$dir/compose.yml" << 'EOF'
 version: '3.8'
 services:
+  nginx-proxy:
+    image: nginx:alpine
+    container_name: nginx-proxy
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - grafana
+      - prometheus
+    networks:
+      - monitoring
+
   prometheus:
     image: prom/prometheus:latest
     container_name: prometheus
     restart: unless-stopped
     security_opt:
       - apparmor:unconfined
-    ports:
-      - "9090:9090"
+    expose:
+      - "9090"
     volumes:
       - prometheus_data:/prometheus
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
@@ -678,6 +697,8 @@ services:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
       - '--web.enable-lifecycle'
+    networks:
+      - monitoring
 
   grafana:
     image: grafana/grafana:latest
@@ -685,14 +706,16 @@ services:
     restart: unless-stopped
     security_opt:
       - apparmor:unconfined
-    ports:
-      - "3000:3000"
+    expose:
+      - "3000"
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
     volumes:
       - grafana_data:/var/lib/grafana
     depends_on:
       - prometheus
+    networks:
+      - monitoring
 
   loki:
     image: grafana/loki:latest
@@ -700,11 +723,13 @@ services:
     restart: unless-stopped
     security_opt:
       - apparmor:unconfined
-    ports:
-      - "3100:3100"
+    expose:
+      - "3100"
     volumes:
       - loki_data:/loki
     command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - monitoring
 
   node-exporter:
     image: prom/node-exporter:latest
@@ -712,8 +737,8 @@ services:
     restart: unless-stopped
     security_opt:
       - apparmor:unconfined
-    ports:
-      - "9100:9100"
+    expose:
+      - "9100"
     volumes:
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro
@@ -722,11 +747,97 @@ services:
       - '--path.procfs=/host/proc'
       - '--path.sysfs=/host/sys'
       - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    networks:
+      - monitoring
+
+networks:
+  monitoring:
+    driver: bridge
 
 volumes:
   prometheus_data:
   grafana_data:
   loki_data:
+EOF
+
+    # nginx.conf for reverse proxy with HTTPS
+    cat > "$dir/nginx.conf" << 'EOF'
+worker_processes auto;
+error_log /var/log/nginx/error.log warn;
+pid /var/run/nginx.pid;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+    sendfile on;
+    keepalive_timeout 65;
+
+    # Redirect HTTP to HTTPS
+    server {
+        listen 80;
+        server_name _;
+        return 301 https://$host$request_uri;
+    }
+
+    # HTTPS server
+    server {
+        listen 443 ssl;
+        server_name _;
+
+        ssl_certificate /etc/nginx/ssl/server.crt;
+        ssl_certificate_key /etc/nginx/ssl/server.key;
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_ciphers HIGH:!aNULL:!MD5;
+        ssl_prefer_server_ciphers on;
+        ssl_session_cache shared:SSL:10m;
+
+        # Root redirect to Grafana
+        location = / {
+            return 302 /grafana/;
+        }
+
+        # Grafana
+        location /grafana/ {
+            proxy_pass http://grafana:3000/;
+            proxy_set_header Host $http_host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+        }
+
+        # Prometheus
+        location /prometheus/ {
+            proxy_pass http://prometheus:9090/prometheus/;
+            proxy_set_header Host $http_host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # Loki (API access)
+        location /loki/ {
+            proxy_pass http://loki:3100/;
+            proxy_set_header Host $http_host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # Node Exporter metrics
+        location /node-metrics/ {
+            proxy_pass http://node-exporter:9100/;
+            proxy_set_header Host $http_host;
+            proxy_set_header X-Real-IP $remote_addr;
+        }
+    }
+}
 EOF
 
     # prometheus.yml (extra config)
@@ -744,6 +855,29 @@ scrape_configs:
     static_configs:
       - targets: ['node-exporter:9100']
 EOF
+
+    # setup-ssl.sh - Script to generate SSL certificates
+    cat > "$dir/setup-ssl.sh" << 'EOF'
+#!/bin/bash
+# Generate self-signed SSL certificate for monitoring stack
+SSL_DIR="$1"
+DOMAIN="${2:-localhost}"
+
+mkdir -p "$SSL_DIR"
+
+# Generate private key and self-signed certificate
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+    -keyout "$SSL_DIR/server.key" \
+    -out "$SSL_DIR/server.crt" \
+    -subj "/C=US/ST=State/L=City/O=Organization/CN=$DOMAIN" \
+    -addext "subjectAltName=DNS:$DOMAIN,DNS:localhost,IP:127.0.0.1"
+
+chmod 600 "$SSL_DIR/server.key"
+chmod 644 "$SSL_DIR/server.crt"
+
+echo "SSL certificates generated in $SSL_DIR"
+EOF
+    chmod +x "$dir/setup-ssl.sh"
 }
 
 #######################################
@@ -6018,6 +6152,18 @@ loki.write "default" {
 EOF
 }
 
+# Write nginx config for monitoring stack HTTPS proxy
+# Uses base64 encoding to avoid variable substitution issues with heredocs
+write_nginx_monitoring_config() {
+    local vmid="$1"
+    local service_dir="$2"
+
+    # Base64-encoded nginx config (Grafana at root, Prometheus at /prometheus/)
+    local nginx_config_b64="d29ya2VyX3Byb2Nlc3NlcyBhdXRvOwplcnJvcl9sb2cgL3Zhci9sb2cvbmdpbngvZXJyb3IubG9nIHdhcm47CnBpZCAvdmFyL3J1bi9uZ2lueC5waWQ7CgpldmVudHMgewogICAgd29ya2VyX2Nvbm5lY3Rpb25zIDEwMjQ7Cn0KCmh0dHAgewogICAgaW5jbHVkZSAvZXRjL25naW54L21pbWUudHlwZXM7CiAgICBkZWZhdWx0X3R5cGUgYXBwbGljYXRpb24vb2N0ZXQtc3RyZWFtOwogICAgc2VuZGZpbGUgb247CiAgICBrZWVwYWxpdmVfdGltZW91dCA2NTsKCiAgICBzZXJ2ZXIgewogICAgICAgIGxpc3RlbiA4MDsKICAgICAgICBzZXJ2ZXJfbmFtZSBfOwogICAgICAgIHJldHVybiAzMDEgaHR0cHM6Ly8kaG9zdCRyZXF1ZXN0X3VyaTsKICAgIH0KCiAgICBzZXJ2ZXIgewogICAgICAgIGxpc3RlbiA0NDMgc3NsOwogICAgICAgIHNlcnZlcl9uYW1lIF87CgogICAgICAgIHNzbF9jZXJ0aWZpY2F0ZSAvZXRjL25naW54L3NzbC9zZXJ2ZXIuY3J0OwogICAgICAgIHNzbF9jZXJ0aWZpY2F0ZV9rZXkgL2V0Yy9uZ2lueC9zc2wvc2VydmVyLmtleTsKICAgICAgICBzc2xfcHJvdG9jb2xzIFRMU3YxLjIgVExTdjEuMzsKICAgICAgICBzc2xfY2lwaGVycyBISUdIOiFhTlVMTDohTUQ1OwoKICAgICAgICBsb2NhdGlvbiAvIHsKICAgICAgICAgICAgcHJveHlfcGFzcyBodHRwOi8vZ3JhZmFuYTozMDAwOwogICAgICAgICAgICBwcm94eV9odHRwX3ZlcnNpb24gMS4xOwogICAgICAgICAgICBwcm94eV9zZXRfaGVhZGVyIFVwZ3JhZGUgJGh0dHBfdXBncmFkZTsKICAgICAgICAgICAgcHJveHlfc2V0X2hlYWRlciBDb25uZWN0aW9uICJ1cGdyYWRlIjsKICAgICAgICAgICAgcHJveHlfc2V0X2hlYWRlciBIb3N0ICRob3N0OwogICAgICAgICAgICBwcm94eV9zZXRfaGVhZGVyIFgtUmVhbC1JUCAkcmVtb3RlX2FkZHI7CiAgICAgICAgICAgIHByb3h5X3NldF9oZWFkZXIgWC1Gb3J3YXJkZWQtRm9yICRwcm94eV9hZGRfeF9mb3J3YXJkZWRfZm9yOwogICAgICAgICAgICBwcm94eV9zZXRfaGVhZGVyIFgtRm9yd2FyZGVkLVByb3RvIGh0dHBzOwogICAgICAgIH0KCiAgICAgICAgbG9jYXRpb24gL3Byb21ldGhldXMvIHsKICAgICAgICAgICAgcHJveHlfcGFzcyBodHRwOi8vcHJvbWV0aGV1czo5MDkwLzsKICAgICAgICAgICAgcHJveHlfaHR0cF92ZXJzaW9uIDEuMTsKICAgICAgICAgICAgcHJveHlfc2V0X2hlYWRlciBIb3N0ICRob3N0OwogICAgICAgICAgICBwcm94eV9zZXRfaGVhZGVyIFgtUmVhbC1JUCAkcmVtb3RlX2FkZHI7CiAgICAgICAgICAgIHByb3h5X3NldF9oZWFkZXIgWC1Gb3J3YXJkZWQtRm9yICRwcm94eV9hZGRfeF9mb3J3YXJkZWRfZm9yOwogICAgICAgICAgICBwcm94eV9zZXRfaGVhZGVyIFgtRm9yd2FyZGVkLVByb3RvIGh0dHBzOwogICAgICAgIH0KCiAgICAgICAgbG9jYXRpb24gL2xva2kvIHsKICAgICAgICAgICAgcHJveHlfcGFzcyBodHRwOi8vbG9raTozMTAwLzsKICAgICAgICAgICAgcHJveHlfc2V0X2hlYWRlciBIb3N0ICRob3N0OwogICAgICAgICAgICBwcm94eV9zZXRfaGVhZGVyIFgtUmVhbC1JUCAkcmVtb3RlX2FkZHI7CiAgICAgICAgfQoKICAgICAgICBsb2NhdGlvbiAvbm9kZS1tZXRyaWNzLyB7CiAgICAgICAgICAgIHByb3h5X3Bhc3MgaHR0cDovL25vZGUtZXhwb3J0ZXI6OTEwMC87CiAgICAgICAgICAgIHByb3h5X3NldF9oZWFkZXIgSG9zdCAkaG9zdDsKICAgICAgICB9CiAgICB9Cn0K"
+
+    lxc_exec "$vmid" "echo '$nginx_config_b64' | base64 -d > ${service_dir}/nginx.conf"
+}
+
 # Deploy service natively (without Docker)
 deploy_service_native() {
     local vmid="$1"
@@ -6164,7 +6310,34 @@ COMPOSEEOF"
 
         # Write additional config files if needed
         case "$service" in
-            prometheus|monitoring-stack)
+            monitoring-stack)
+                echo "Writing prometheus.yml..."
+                prom_config=$(get_prometheus_config)
+                lxc_exec "$vmid" "cat > ${service_dir}/prometheus.yml << 'PROMEOF'
+${prom_config}
+PROMEOF"
+                echo "Done."
+
+                echo "Setting up SSL certificates..."
+                # Get container IP for certificate
+                container_ip=$(lxc_exec "$vmid" "hostname -I | awk '{print \$1}'" 2>/dev/null | tr -d '[:space:]')
+                lxc_exec_live "$vmid" "mkdir -p ${service_dir}/ssl"
+                # Generate self-signed SSL certificate
+                lxc_exec "$vmid" "openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+                    -keyout ${service_dir}/ssl/server.key \
+                    -out ${service_dir}/ssl/server.crt \
+                    -subj '/C=US/ST=State/L=City/O=Monitoring/CN=${container_ip:-localhost}' \
+                    -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1,IP:${container_ip:-127.0.0.1}' 2>/dev/null"
+                lxc_exec_live "$vmid" "chmod 600 ${service_dir}/ssl/server.key"
+                echo "SSL certificates generated."
+
+                echo "Writing nginx.conf..."
+                # Use base64-encoded config to avoid variable substitution issues
+                write_nginx_monitoring_config "$vmid" "$service_dir"
+                echo "Done."
+                echo ""
+                ;;
+            prometheus)
                 echo "Writing prometheus.yml..."
                 prom_config=$(get_prometheus_config)
                 lxc_exec "$vmid" "cat > ${service_dir}/prometheus.yml << 'PROMEOF'
