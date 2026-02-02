@@ -4521,15 +4521,21 @@ docker_install_with_progress() {
 }
 EOF'
 
-        # Disable AppArmor for Docker in LXC (creates systemd override)
-        echo "Configuring Docker to work without AppArmor..."
+        # Fix potential UID/GID ownership issues in LXC containers
+        # This can happen if container was converted from unprivileged to privileged
+        echo "Fixing file ownership for LXC container..."
+        lxc_exec_live "$vmid" "chown -R root:root /etc /usr /var /lib 2>/dev/null || true"
+        lxc_exec_live "$vmid" "chmod 4755 /usr/bin/sudo /usr/bin/passwd 2>/dev/null || true"
+
+        # Create Docker systemd override for LXC containers
+        # Note: --security-opt is NOT a valid dockerd flag, it's for docker run
+        echo "Configuring Docker for LXC environment..."
         lxc_exec "$vmid" "mkdir -p /etc/systemd/system/docker.service.d"
         lxc_exec_live "$vmid" 'cat > /etc/systemd/system/docker.service.d/lxc-override.conf << EOF
 [Service]
-# Disable AppArmor for Docker in LXC containers
-Environment="DOCKER_OPTS=--security-opt apparmor=unconfined"
+# Override for Docker in LXC containers
 ExecStart=
-ExecStart=/usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock --security-opt apparmor=unconfined
+ExecStart=/usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
 EOF'
         lxc_exec_live "$vmid" "systemctl daemon-reload"
         echo ""
