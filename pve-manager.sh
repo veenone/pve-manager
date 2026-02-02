@@ -6197,18 +6197,45 @@ ALLOYEOF"
         esac
 
         # Start the service
-        echo "Pulling Docker images..."
-        echo ""
-        pull_output=$(lxc_exec "$vmid" "cd ${service_dir} && docker compose pull 2>&1")
-        pull_status=$?
-        echo "$pull_output"
+        echo "Pulling Docker images (this may take a few minutes)..."
         echo ""
 
+        # Pull with timeout and retry logic for reliability
+        local pull_attempts=0
+        local max_pull_attempts=3
+        local pull_status=1
+
+        while [[ $pull_attempts -lt $max_pull_attempts && $pull_status -ne 0 ]]; do
+            pull_attempts=$((pull_attempts + 1))
+            echo "Pull attempt $pull_attempts of $max_pull_attempts..."
+
+            # Use timeout to prevent indefinite hangs (5 minutes per attempt)
+            pull_output=$(lxc_exec_timeout "$vmid" 300 "cd ${service_dir} && docker compose pull --quiet 2>&1")
+            pull_status=$?
+
+            if [[ $pull_status -eq 124 ]]; then
+                echo "Pull timed out. Retrying..."
+                # Reset Docker network on timeout
+                lxc_exec "$vmid" "systemctl restart docker 2>/dev/null || true" > /dev/null 2>&1
+                sleep 5
+            elif [[ $pull_status -ne 0 ]]; then
+                echo "Pull failed: $pull_output"
+                if [[ $pull_attempts -lt $max_pull_attempts ]]; then
+                    echo "Waiting 10 seconds before retry..."
+                    sleep 10
+                fi
+            else
+                echo "Images pulled successfully."
+            fi
+        done
+
         if [[ $pull_status -ne 0 ]]; then
-            echo "ERROR: Failed to pull Docker images"
+            echo "ERROR: Failed to pull Docker images after $max_pull_attempts attempts"
+            echo "Possible causes: network issues, Docker registry unavailable"
             echo "1" > "$deploy_result_file"
             exit 1
         fi
+        echo ""
 
         echo "Starting $service_name..."
         echo ""
@@ -6489,9 +6516,22 @@ COMPOSEEOF"
         fi
         echo ""
 
-        # Pull latest images
+        # Pull latest images with timeout and retry
         echo "Pulling latest images..."
-        lxc_exec_live "$vmid" "cd $service_dir && docker compose pull 2>&1"
+        local pull_ok=false
+        for attempt in 1 2 3; do
+            echo "Pull attempt $attempt..."
+            if lxc_exec_timeout "$vmid" 300 "cd $service_dir && docker compose pull --quiet 2>&1"; then
+                pull_ok=true
+                echo "Images pulled successfully."
+                break
+            fi
+            echo "Pull attempt $attempt failed, retrying..."
+            sleep 5
+        done
+        if [[ "$pull_ok" != "true" ]]; then
+            echo "WARNING: Failed to pull latest images, continuing with existing..."
+        fi
         echo ""
 
         # Start service
