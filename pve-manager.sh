@@ -1333,7 +1333,7 @@ create_plugin_harbor() {
     cat > "$dir/plugin.conf" << 'EOF'
 PLUGIN_ID="harbor"
 PLUGIN_NAME="Harbor"
-PLUGIN_VERSION="v2.10.0"
+PLUGIN_VERSION="v2.14.2"
 PLUGIN_CATEGORY="devtools"
 PLUGIN_DESCRIPTION="Container registry with security scanning"
 PLUGIN_DOCKER_SUPPORT="true"
@@ -1341,135 +1341,26 @@ PLUGIN_NATIVE_SUPPORT="true"
 PLUGIN_DOCKER_PORT="443"
 PLUGIN_DOCKER_URL="Portal: https://{IP}/ (admin/Harbor12345)\nRegistry: docker login {IP}"
 PLUGIN_DOCKER_CREDENTIALS="admin/Harbor12345"
-PLUGIN_DOCKER_CONTAINER="harbor-nginx"
+PLUGIN_DOCKER_CONTAINER="nginx"
+PLUGIN_DOCKER_CUSTOM_DEPLOY="true"
 EOF
 
-    # compose.yml with nginx for HTTPS
+    # compose.yml - placeholder, Harbor uses official installer
     cat > "$dir/compose.yml" << 'EOF'
+# Harbor requires the official installer to generate proper docker-compose
+# This file is a placeholder - actual deployment uses install.sh
 version: '3.8'
 services:
-  harbor-nginx:
-    image: nginx:alpine
-    container_name: harbor-nginx
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./ssl:/etc/nginx/ssl:ro
-      - /etc/localtime:/etc/localtime:ro
-      - /etc/timezone:/etc/timezone:ro
-    depends_on:
-      - harbor-portal
-      - harbor-core
-      - harbor-registry
-
-  harbor-core:
-    image: goharbor/harbor-core:v2.10.0
-    container_name: harbor-core
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    environment:
-      - CONFIG_PATH=/etc/harbor/app.conf
-      - EXT_ENDPOINT=https://${HARBOR_HOSTNAME:-localhost}
-      - CORE_SECRET=${HARBOR_SECRET:-harbor-secret-key}
-      - JOBSERVICE_SECRET=${HARBOR_SECRET:-harbor-secret-key}
-      - REGISTRY_CREDENTIAL_USERNAME=harbor_registry_user
-      - REGISTRY_CREDENTIAL_PASSWORD=${HARBOR_SECRET:-harbor-secret-key}
-    volumes:
-      - harbor_data:/data
-      - ./harbor.yml:/etc/harbor/app.conf:ro
-      - /etc/localtime:/etc/localtime:ro
-      - /etc/timezone:/etc/timezone:ro
-    depends_on:
-      - harbor-db
-      - harbor-redis
-
-  harbor-portal:
-    image: goharbor/harbor-portal:v2.10.0
-    container_name: harbor-portal
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    volumes:
-      - /etc/localtime:/etc/localtime:ro
-      - /etc/timezone:/etc/timezone:ro
-    depends_on:
-      - harbor-core
-
-  harbor-db:
-    image: goharbor/harbor-db:v2.10.0
-    container_name: harbor-db
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=${HARBOR_DB_PASSWORD:-Harbor12345}
-    volumes:
-      - harbor_db:/var/lib/postgresql/data
-      - /etc/localtime:/etc/localtime:ro
-      - /etc/timezone:/etc/timezone:ro
-    healthcheck:
-      test: ["CMD", "pg_isready", "-U", "postgres"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-
-  harbor-redis:
-    image: goharbor/redis-photon:v2.10.0
-    container_name: harbor-redis
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    volumes:
-      - harbor_redis:/var/lib/redis
-      - /etc/localtime:/etc/localtime:ro
-      - /etc/timezone:/etc/timezone:ro
-
-  harbor-registry:
-    image: goharbor/registry-photon:v2.10.0
-    container_name: harbor-registry
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    volumes:
-      - harbor_registry:/storage
-      - /etc/localtime:/etc/localtime:ro
-      - /etc/timezone:/etc/timezone:ro
-    environment:
-      - REGISTRY_HTTP_SECRET=${HARBOR_SECRET:-harbor-secret-key}
-
-  harbor-jobservice:
-    image: goharbor/harbor-jobservice:v2.10.0
-    container_name: harbor-jobservice
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    volumes:
-      - /etc/localtime:/etc/localtime:ro
-      - /etc/timezone:/etc/timezone:ro
-    depends_on:
-      - harbor-core
-      - harbor-redis
-
-volumes:
-  harbor_data:
-  harbor_db:
-  harbor_redis:
-  harbor_registry:
+  placeholder:
+    image: alpine
+    command: echo "Harbor requires official installer"
 EOF
 
-    # install.sh - Native Harbor installation using official installer
+    # install.sh - Harbor installation using official installer (works for both Docker and Native)
     cat > "$dir/install.sh" << 'INSTALLEOF'
 #!/bin/bash
-# Native installation script for Harbor using official installer
-HARBOR_VERSION="v2.10.0"
+# Installation script for Harbor using official installer
+HARBOR_VERSION="v2.14.2"
 
 case "$OS_TYPE" in
     debian|ubuntu)
@@ -1494,32 +1385,33 @@ case "$OS_TYPE" in
 
         # Download Harbor offline installer
         echo "Downloading Harbor ${HARBOR_VERSION}..."
-        lxc_exec_live "$VMID" "mkdir -p /opt/harbor-installer"
-        lxc_exec_live "$VMID" "cd /opt/harbor-installer && wget -q https://github.com/goharbor/harbor/releases/download/${HARBOR_VERSION}/harbor-offline-installer-${HARBOR_VERSION}.tgz"
-        lxc_exec_live "$VMID" "cd /opt/harbor-installer && tar xzf harbor-offline-installer-${HARBOR_VERSION}.tgz"
+        lxc_exec_live "$VMID" "mkdir -p /opt/harbor"
+        lxc_exec_live "$VMID" "cd /opt && wget -q https://github.com/goharbor/harbor/releases/download/${HARBOR_VERSION}/harbor-offline-installer-${HARBOR_VERSION}.tgz"
+        lxc_exec_live "$VMID" "cd /opt && tar xzf harbor-offline-installer-${HARBOR_VERSION}.tgz"
+        lxc_exec_live "$VMID" "rm -f /opt/harbor-offline-installer-${HARBOR_VERSION}.tgz"
 
         # Get container IP for configuration
         CONTAINER_IP=$(lxc_exec "$VMID" "hostname -I | awk '{print \$1}'" | tr -d '[:space:]')
 
         # Generate SSL certificates
         echo "Generating SSL certificates..."
-        lxc_exec_live "$VMID" "mkdir -p /opt/harbor-installer/harbor/ssl"
+        lxc_exec_live "$VMID" "mkdir -p /opt/harbor/ssl"
         lxc_exec "$VMID" "openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-            -keyout /opt/harbor-installer/harbor/ssl/server.key \
-            -out /opt/harbor-installer/harbor/ssl/server.crt \
+            -keyout /opt/harbor/ssl/server.key \
+            -out /opt/harbor/ssl/server.crt \
             -subj '/C=US/ST=State/L=City/O=Harbor/CN=${CONTAINER_IP:-localhost}' \
             -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1,IP:${CONTAINER_IP:-127.0.0.1}' 2>/dev/null"
 
         # Create harbor.yml configuration
         echo "Configuring Harbor..."
-        lxc_exec "$VMID" "cat > /opt/harbor-installer/harbor/harbor.yml << 'HARBORYCFG'
+        lxc_exec "$VMID" "cat > /opt/harbor/harbor.yml << HARBORYCFG
 hostname: ${CONTAINER_IP:-localhost}
 http:
   port: 80
 https:
   port: 443
-  certificate: /opt/harbor-installer/harbor/ssl/server.crt
-  private_key: /opt/harbor-installer/harbor/ssl/server.key
+  certificate: /opt/harbor/ssl/server.crt
+  private_key: /opt/harbor/ssl/server.key
 harbor_admin_password: Harbor12345
 database:
   password: Harbor12345
@@ -1540,22 +1432,25 @@ log:
     rotate_count: 50
     rotate_size: 200M
     location: /var/log/harbor
-_version: 2.10.0
+_version: 2.14.0
 HARBORYCFG"
 
         # Prepare data directory
         lxc_exec_live "$VMID" "mkdir -p /data/harbor"
 
         # Run Harbor installer
-        echo "Installing Harbor..."
-        lxc_exec_live "$VMID" "cd /opt/harbor-installer/harbor && ./install.sh --with-trivy"
+        echo "Installing Harbor (this may take several minutes)..."
+        lxc_exec_live "$VMID" "cd /opt/harbor && ./install.sh --with-trivy"
+
+        # Create symlink for service directory compatibility
+        lxc_exec_live "$VMID" "ln -sf /opt/harbor /opt/services/harbor 2>/dev/null || true"
 
         echo "Harbor installation complete!"
         echo "Access Harbor at https://${CONTAINER_IP}/"
         echo "Default credentials: admin / Harbor12345"
         ;;
     *)
-        echo "ERROR: Native Harbor installation only supported on Debian/Ubuntu"
+        echo "ERROR: Harbor installation only supported on Debian/Ubuntu"
         exit 1
         ;;
 esac
@@ -1566,8 +1461,9 @@ INSTALLEOF
 #!/bin/bash
 # Removal script for Harbor
 echo "Stopping Harbor services..."
-lxc_exec_live "$VMID" "cd /opt/harbor-installer/harbor && docker-compose down -v 2>/dev/null || true"
-lxc_exec_live "$VMID" "rm -rf /opt/harbor-installer"
+lxc_exec_live "$VMID" "cd /opt/harbor && docker-compose down -v 2>/dev/null || true"
+lxc_exec_live "$VMID" "rm -rf /opt/harbor"
+lxc_exec_live "$VMID" "rm -rf /opt/services/harbor"
 lxc_exec_live "$VMID" "rm -rf /data/harbor"
 echo "Harbor removed."
 EOF
@@ -6591,51 +6487,80 @@ ALLOYEOF"
                 echo ""
                 ;;
             harbor)
-                echo "Setting up SSL certificates for Harbor..."
-                # Get container IP for certificate
-                container_ip=$(lxc_exec "$vmid" "hostname -I | awk '{print \$1}'" 2>/dev/null | tr -d '[:space:]')
-                lxc_exec_live "$vmid" "mkdir -p ${service_dir}/ssl"
-                # Generate self-signed SSL certificate
-                lxc_exec "$vmid" "openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-                    -keyout ${service_dir}/ssl/server.key \
-                    -out ${service_dir}/ssl/server.crt \
-                    -subj '/C=US/ST=State/L=City/O=Harbor/CN=${container_ip:-localhost}' \
-                    -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1,IP:${container_ip:-127.0.0.1}' 2>/dev/null"
-                lxc_exec_live "$vmid" "chmod 600 ${service_dir}/ssl/server.key"
-                echo "SSL certificates generated."
-
-                echo "Writing nginx.conf..."
-                write_nginx_harbor_config "$vmid" "$service_dir"
+                # Harbor uses official installer - handle specially
+                echo "Harbor requires the official installer..."
+                echo "Downloading Harbor v2.14.2 offline installer..."
+                lxc_exec_live "$vmid" "cd /opt && wget -q https://github.com/goharbor/harbor/releases/download/v2.14.2/harbor-offline-installer-v2.14.2.tgz"
+                lxc_exec_live "$vmid" "cd /opt && tar xzf harbor-offline-installer-v2.14.2.tgz"
+                lxc_exec_live "$vmid" "rm -f /opt/harbor-offline-installer-v2.14.2.tgz"
                 echo "Done."
 
-                # Create minimal harbor.yml for core service config
-                echo "Writing harbor.yml configuration..."
-                lxc_exec "$vmid" "cat > ${service_dir}/harbor.yml << 'HARBOREOF'
+                # Get container IP for configuration
+                container_ip=$(lxc_exec "$vmid" "hostname -I | awk '{print \$1}'" 2>/dev/null | tr -d '[:space:]')
+
+                echo "Generating SSL certificates..."
+                lxc_exec_live "$vmid" "mkdir -p /opt/harbor/ssl"
+                lxc_exec "$vmid" "openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+                    -keyout /opt/harbor/ssl/server.key \
+                    -out /opt/harbor/ssl/server.crt \
+                    -subj '/C=US/ST=State/L=City/O=Harbor/CN=${container_ip:-localhost}' \
+                    -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1,IP:${container_ip:-127.0.0.1}' 2>/dev/null"
+                echo "SSL certificates generated."
+
+                echo "Configuring Harbor..."
+                lxc_exec "$vmid" "cat > /opt/harbor/harbor.yml << HARBOREOF
 hostname: ${container_ip:-localhost}
 http:
   port: 80
 https:
   port: 443
+  certificate: /opt/harbor/ssl/server.crt
+  private_key: /opt/harbor/ssl/server.key
 harbor_admin_password: Harbor12345
 database:
   password: Harbor12345
   max_idle_conns: 50
   max_open_conns: 100
-data_volume: /data
+data_volume: /data/harbor
+trivy:
+  ignore_unfixed: false
+  skip_update: false
+  insecure: false
+jobservice:
+  max_job_workers: 10
+notification:
+  webhook_job_max_retry: 10
 log:
   level: info
   local:
     rotate_count: 50
     rotate_size: 200M
     location: /var/log/harbor
-_version: 2.10.0
+_version: 2.14.0
 HARBOREOF"
                 echo "Done."
+
+                # Prepare data directory
+                lxc_exec_live "$vmid" "mkdir -p /data/harbor"
+
+                # Run Harbor installer (this pulls images and starts containers)
                 echo ""
+                echo "Running Harbor installer (this may take several minutes)..."
+                lxc_exec_live "$vmid" "cd /opt/harbor && ./install.sh --with-trivy"
+
+                # Create symlink for service directory compatibility
+                lxc_exec_live "$vmid" "ln -sf /opt/harbor ${service_dir} 2>/dev/null || true"
+
+                echo ""
+                echo "=== Harbor Deployment Complete ==="
+                echo "Portal: https://${container_ip}/"
+                echo "Credentials: admin / Harbor12345"
+                echo "0" > "$deploy_result_file"
+                exit 0
                 ;;
         esac
 
-        # Start the service
+        # Start the service (skip for Harbor which uses its own installer)
         echo "Pulling Docker images (this may take a few minutes)..."
         echo ""
 
