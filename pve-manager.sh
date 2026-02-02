@@ -28,7 +28,10 @@ readonly PROFILES_FILE="$CONFIG_DIR/profiles.conf"
 readonly CA_DIR="$CONFIG_DIR/ca"
 readonly CERTS_DIR="$CA_DIR/certs"
 readonly SSH_DIR="$CONFIG_DIR/ssh"
-readonly LOG_FILE="$CONFIG_DIR/pve-manager.log"
+readonly LOG_DIR="/var/log/pve-manager"
+readonly LOG_FILE="$LOG_DIR/pve-manager.log"
+readonly OPERATIONS_LOG="$LOG_DIR/operations.log"
+readonly ERROR_LOG="$LOG_DIR/error.log"
 readonly TEMPLATES_DIR="$CONFIG_DIR/templates"
 readonly PLUGINS_DIR="$CONFIG_DIR/plugins"
 readonly PROGRESS_LOG="/tmp/pve-manager-progress-$$.log"
@@ -71,6 +74,14 @@ trap cleanup EXIT
 init_config() {
     mkdir -p "$CONFIG_DIR" "$CA_DIR" "$CERTS_DIR" "$SSH_DIR" "$TEMPLATES_DIR" "$PLUGINS_DIR"
     chmod 700 "$CONFIG_DIR" "$CA_DIR" "$SSH_DIR"
+
+    # Initialize logging directory
+    if [[ ! -d "$LOG_DIR" ]]; then
+        sudo mkdir -p "$LOG_DIR" 2>/dev/null || mkdir -p "$LOG_DIR"
+        sudo chown "$(whoami):$(whoami)" "$LOG_DIR" 2>/dev/null || true
+        chmod 755 "$LOG_DIR"
+    fi
+    touch "$LOG_FILE" "$OPERATIONS_LOG" "$ERROR_LOG" 2>/dev/null || true
 
     # Create default config if not exists
     if [[ ! -f "$CONFIG_FILE" ]]; then
@@ -226,12 +237,8 @@ create_plugin_dir() {
     echo "$plugin_dir"
 }
 
-# Initialize built-in plugins (only if plugins directory is empty)
+# Initialize built-in plugins (always regenerate to ensure latest versions)
 init_builtin_plugins() {
-    local plugin_count
-    plugin_count=$(find "$PLUGINS_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
-    [[ "$plugin_count" -gt 0 ]] && return
-
     log_info "Initializing built-in plugins..."
     create_builtin_plugins
 }
@@ -1460,7 +1467,7 @@ case "$OS_TYPE" in
         lxc_exec_live "$VMID" "update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8"
 
         echo "Installing system dependencies..."
-        lxc_exec_live "$VMID" "DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-pip python3-venv python3-dev gcc libpq-dev postgresql postgresql-contrib nginx git libxml2-dev libxslt1-dev libffi-dev libssl-dev cargo pkg-config curl nodejs npm"
+        lxc_exec_live "$VMID" "DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-pip python3-venv python3-dev gcc libpq-dev postgresql postgresql-contrib nginx git libxml2-dev libxslt1-dev libffi-dev libssl-dev cargo pkg-config curl nodejs npm default-libmysqlclient-dev pkg-config"
 
         lxc_exec_live "$VMID" "systemctl enable postgresql"
         lxc_exec_live "$VMID" "systemctl start postgresql"
@@ -1475,16 +1482,32 @@ case "$OS_TYPE" in
         echo "Setting up Python virtual environment..."
         lxc_exec_live "$VMID" "python3 -m venv /opt/kiwi/venv"
 
-        echo "Installing Kiwi TCMS from PyPI..."
+        echo "Installing Kiwi TCMS from GitHub..."
         lxc_exec_live "$VMID" "/opt/kiwi/venv/bin/pip install --upgrade pip wheel setuptools"
-        lxc_exec_live "$VMID" "/opt/kiwi/venv/bin/pip install kiwitcms gunicorn psycopg2-binary"
+        lxc_exec_live "$VMID" "/opt/kiwi/venv/bin/pip install 'Django>=4.2,<5.0' gunicorn psycopg2-binary mysqlclient"
+
+        # Clone Kiwi TCMS from GitHub and install
+        echo "Cloning Kiwi TCMS repository..."
+        lxc_exec_live "$VMID" "rm -rf /opt/kiwi/Kiwi"
+        lxc_exec_live "$VMID" "git clone --depth 1 https://github.com/kiwitcms/Kiwi.git /opt/kiwi/Kiwi"
+
+        echo "Installing Kiwi TCMS dependencies..."
+        lxc_exec_live "$VMID" "/opt/kiwi/venv/bin/pip install -r /opt/kiwi/Kiwi/requirements/base.txt"
+
+        # Verify tcms module installation
+        echo "Verifying tcms module..."
+        if ! lxc_exec "$VMID" "source /opt/kiwi/venv/bin/activate && PYTHONPATH=/opt/kiwi/Kiwi python -c 'import tcms; print(tcms)'"; then
+            echo "ERROR: tcms module not found"
+            exit 1
+        fi
 
         echo "Configuring Kiwi TCMS..."
-        lxc_exec_live "$VMID" "mkdir -p /opt/kiwi/Kiwi /Kiwi/uploads /Kiwi/static"
+        lxc_exec_live "$VMID" "mkdir -p /Kiwi/uploads /Kiwi/static"
         lxc_exec_live "$VMID" "chown -R kiwi:kiwi /opt/kiwi /Kiwi"
 
-        # Create local settings
-        lxc_exec "$VMID" "cat > /opt/kiwi/Kiwi/tcms_local_settings.py << 'SETTINGSEOF'
+        # Create local settings in the CORRECT location for product.py to find it
+        # product.py imports from tcms.settings.local_settings, not tcms_local_settings.py
+        lxc_exec "$VMID" "cat > /opt/kiwi/Kiwi/tcms/settings/local_settings.py << 'SETTINGSEOF'
 import os
 DATABASES = {
     'default': {
@@ -1503,8 +1526,64 @@ MEDIA_ROOT = '/Kiwi/uploads'
 DEBUG = False
 SETTINGSEOF"
 
-        lxc_exec_live "$VMID" "export DJANGO_SETTINGS_MODULE=tcms.settings.local && export KIWI_SETTINGS_DIR=/opt/kiwi/Kiwi && /opt/kiwi/venv/bin/python -c 'import django; django.setup(); from django.core.management import call_command; call_command(\"migrate\")'"
-        lxc_exec_live "$VMID" "export DJANGO_SETTINGS_MODULE=tcms.settings.local && export KIWI_SETTINGS_DIR=/opt/kiwi/Kiwi && /opt/kiwi/venv/bin/python -c 'import django; django.setup(); from django.core.management import call_command; call_command(\"collectstatic\", \"--noinput\")'"
+        # Also create a copy at the old location for backwards compatibility
+        lxc_exec_live "$VMID" "cp /opt/kiwi/Kiwi/tcms/settings/local_settings.py /opt/kiwi/Kiwi/tcms_local_settings.py"
+
+        # Install npm packages for frontend dependencies (bootstrap, jquery, patternfly, etc.)
+        echo "Installing frontend dependencies (npm packages)..."
+        lxc_exec_live "$VMID" "cd /opt/kiwi/Kiwi/tcms && npm install"
+
+        # Clear Python cache to avoid stale bytecode issues
+        echo "Clearing Python cache..."
+        lxc_exec_live "$VMID" "find /opt/kiwi/Kiwi -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true"
+
+        # Set all Kiwi environment variables (database + static files + secret key)
+        local kiwi_env="export KIWI_DB_ENGINE=django.db.backends.postgresql && export KIWI_DB_NAME=kiwi && export KIWI_DB_USER=kiwi && export KIWI_DB_PASSWORD=kiwi && export KIWI_DB_HOST=localhost && export KIWI_DB_PORT=5432 && export STATIC_ROOT=/Kiwi/static && export MEDIA_ROOT=/Kiwi/uploads && export SECRET_KEY=change-me-in-production-$(date +%s)"
+
+        echo "Running Django migrations..."
+        lxc_exec_live "$VMID" "source /opt/kiwi/venv/bin/activate && export PYTHONPATH=/opt/kiwi/Kiwi && export DJANGO_SETTINGS_MODULE=tcms.settings.product && export KIWI_SETTINGS_DIR=/opt/kiwi/Kiwi && $kiwi_env && cd /opt/kiwi/Kiwi && python -m django migrate"
+
+        echo "Collecting static files (including npm packages)..."
+        lxc_exec_live "$VMID" "source /opt/kiwi/venv/bin/activate && export PYTHONPATH=/opt/kiwi/Kiwi && export DJANGO_SETTINGS_MODULE=tcms.settings.product && export KIWI_SETTINGS_DIR=/opt/kiwi/Kiwi && $kiwi_env && cd /opt/kiwi/Kiwi && python -m django collectstatic --noinput --clear"
+
+        # Verify static files were collected (including frontend packages)
+        echo "Verifying static files..."
+        lxc_exec_live "$VMID" "ls -la /Kiwi/static/ | head -20"
+        lxc_exec_live "$VMID" "ls -la /Kiwi/static/admin/css/ 2>/dev/null | head -3 || echo 'WARNING: Admin CSS not found'"
+        lxc_exec_live "$VMID" "ls /Kiwi/static/patternfly/dist/css/ 2>/dev/null | head -3 || echo 'WARNING: Patternfly CSS not found'"
+        lxc_exec_live "$VMID" "ls /Kiwi/static/bootstrap/dist/js/ 2>/dev/null | head -3 || echo 'WARNING: Bootstrap JS not found'"
+        lxc_exec_live "$VMID" "ls /Kiwi/static/jquery/dist/ 2>/dev/null | head -3 || echo 'WARNING: jQuery not found'"
+
+        # Set proper permissions for static files (readable by nginx)
+        echo "Setting static files permissions..."
+        lxc_exec_live "$VMID" "chown -R kiwi:www-data /Kiwi/static /Kiwi/uploads"
+        lxc_exec_live "$VMID" "chmod -R 755 /Kiwi/static"
+        lxc_exec_live "$VMID" "chmod -R 755 /Kiwi/uploads"
+        lxc_exec_live "$VMID" "find /Kiwi/static -type f -exec chmod 644 {} \\;"
+
+        # Create systemd service using wrapper script for proper venv activation
+        lxc_exec "$VMID" "cat > /opt/kiwi/start_kiwi.sh << 'STARTEOF'
+#!/bin/bash
+source /opt/kiwi/venv/bin/activate
+export PYTHONPATH=/opt/kiwi/Kiwi
+export DJANGO_SETTINGS_MODULE=tcms.settings.product
+export KIWI_SETTINGS_DIR=/opt/kiwi/Kiwi
+# PostgreSQL database configuration
+export KIWI_DB_ENGINE=django.db.backends.postgresql
+export KIWI_DB_NAME=kiwi
+export KIWI_DB_USER=kiwi
+export KIWI_DB_PASSWORD=kiwi
+export KIWI_DB_HOST=localhost
+export KIWI_DB_PORT=5432
+# Static and media files
+export STATIC_ROOT=/Kiwi/static
+export MEDIA_ROOT=/Kiwi/uploads
+export SECRET_KEY=change-me-in-production
+cd /opt/kiwi/Kiwi
+exec gunicorn --bind 127.0.0.1:8080 --workers 3 --timeout 120 tcms.wsgi:application
+STARTEOF"
+        lxc_exec_live "$VMID" "chmod +x /opt/kiwi/start_kiwi.sh"
+        lxc_exec_live "$VMID" "chown kiwi:kiwi /opt/kiwi/start_kiwi.sh"
 
         # Create systemd service
         lxc_exec "$VMID" "cat > /etc/systemd/system/kiwi.service << 'SVCEOF'
@@ -1518,9 +1597,7 @@ Type=simple
 User=kiwi
 Group=kiwi
 WorkingDirectory=/opt/kiwi/Kiwi
-Environment=DJANGO_SETTINGS_MODULE=tcms.settings.local
-Environment=KIWI_SETTINGS_DIR=/opt/kiwi/Kiwi
-ExecStart=/opt/kiwi/venv/bin/gunicorn --bind 127.0.0.1:8080 --workers 3 --timeout 120 tcms.wsgi:application
+ExecStart=/opt/kiwi/start_kiwi.sh
 Restart=always
 RestartSec=10
 
@@ -1528,26 +1605,59 @@ RestartSec=10
 WantedBy=multi-user.target
 SVCEOF"
 
-        # Configure nginx
+        # Configure nginx with proper static file serving
         lxc_exec "$VMID" "cat > /etc/nginx/sites-available/kiwi << 'NGINXEOF'
 server {
     listen 80 default_server;
     server_name _;
     client_max_body_size 100M;
 
+    # Serve static files directly
     location /static/ {
         alias /Kiwi/static/;
+        autoindex off;
+        expires 30d;
+        add_header Cache-Control public;
+
+        # Ensure correct MIME types
+        types {
+            text/css css;
+            application/javascript js;
+            application/json json;
+            image/svg+xml svg svgz;
+            font/woff woff;
+            font/woff2 woff2;
+            application/vnd.ms-fontobject eot;
+            font/ttf ttf;
+            font/otf otf;
+        }
     }
 
+    # Media/uploads files
     location /uploads/ {
         alias /Kiwi/uploads/;
+        autoindex off;
+        expires 7d;
     }
 
+    # Favicon
+    location = /favicon.ico {
+        alias /Kiwi/static/images/favicon.ico;
+        expires 30d;
+        access_log off;
+        log_not_found off;
+    }
+
+    # Proxy to gunicorn
     location / {
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_connect_timeout 300;
+        proxy_send_timeout 300;
+        proxy_read_timeout 300;
     }
 }
 NGINXEOF"
@@ -1558,10 +1668,23 @@ NGINXEOF"
         # Create superuser script
         lxc_exec "$VMID" "cat > /opt/kiwi/create_superuser.sh << 'SUPEREOF'
 #!/bin/bash
-cd /opt/kiwi/Kiwi
-export DJANGO_SETTINGS_MODULE=tcms.settings.local
+source /opt/kiwi/venv/bin/activate
+export PYTHONPATH=/opt/kiwi/Kiwi
+export DJANGO_SETTINGS_MODULE=tcms.settings.product
 export KIWI_SETTINGS_DIR=/opt/kiwi/Kiwi
-/opt/kiwi/venv/bin/python -c 'import django; django.setup(); from django.core.management import call_command; call_command(\"createsuperuser\")'
+# PostgreSQL database configuration
+export KIWI_DB_ENGINE=django.db.backends.postgresql
+export KIWI_DB_NAME=kiwi
+export KIWI_DB_USER=kiwi
+export KIWI_DB_PASSWORD=kiwi
+export KIWI_DB_HOST=localhost
+export KIWI_DB_PORT=5432
+# Static and media files
+export STATIC_ROOT=/Kiwi/static
+export MEDIA_ROOT=/Kiwi/uploads
+export SECRET_KEY=change-me-in-production
+cd /opt/kiwi/Kiwi
+python -m django createsuperuser
 SUPEREOF"
         lxc_exec_live "$VMID" "chmod +x /opt/kiwi/create_superuser.sh"
 
@@ -1569,6 +1692,15 @@ SUPEREOF"
         lxc_exec_live "$VMID" "systemctl enable kiwi nginx"
         lxc_exec_live "$VMID" "systemctl restart kiwi"
         lxc_exec_live "$VMID" "systemctl restart nginx"
+
+        # Set the Kiwi TCMS domain to the container IP
+        echo "Setting Kiwi TCMS domain..."
+        local container_ip
+        container_ip=$(lxc_exec "$VMID" "hostname -I | awk '{print \$1}'" 2>/dev/null | tr -d '[:space:]')
+        if [ -n "$container_ip" ]; then
+            lxc_exec_live "$VMID" "source /opt/kiwi/venv/bin/activate && export PYTHONPATH=/opt/kiwi/Kiwi && export DJANGO_SETTINGS_MODULE=tcms.settings.product && cd /opt/kiwi/Kiwi && python -m django set_domain $container_ip"
+            echo "Kiwi TCMS domain set to: $container_ip"
+        fi
         ;;
     *)
         echo "ERROR: Unsupported OS for native Kiwi TCMS installation"
@@ -2291,13 +2423,84 @@ log() {
     local message="$*"
     local timestamp
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
+    local log_entry="[$timestamp] [$level] $message"
+
+    # Write to main log file
+    echo "$log_entry" >> "$LOG_FILE" 2>/dev/null || true
+
+    # Write errors to error log
+    if [[ "$level" == "ERROR" ]]; then
+        echo "$log_entry" >> "$ERROR_LOG" 2>/dev/null || true
+    fi
+}
+
+# Log operation with details (for operations log)
+log_operation() {
+    local operation="$1"
+    shift
+    local details="$*"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local user="${SUDO_USER:-$(whoami)}"
+    local log_entry="[$timestamp] [USER:$user] [OP:$operation] $details"
+
+    echo "$log_entry" >> "$OPERATIONS_LOG" 2>/dev/null || true
+    echo "$log_entry" >> "$LOG_FILE" 2>/dev/null || true
 }
 
 log_info() { log "INFO" "$@"; }
 log_warn() { log "WARN" "$@"; }
 log_error() { log "ERROR" "$@"; }
 log_debug() { [[ "${LOG_LEVEL:-INFO}" == "DEBUG" ]] && log "DEBUG" "$@"; }
+
+# Log container operations
+log_container_op() {
+    local vmid="$1"
+    local operation="$2"
+    shift 2
+    log_operation "CONTAINER" "vmid=$vmid action=$operation $*"
+}
+
+# Log service/plugin operations
+log_service_op() {
+    local service="$1"
+    local operation="$2"
+    shift 2
+    log_operation "SERVICE" "service=$service action=$operation $*"
+}
+
+# Log SSH operations
+log_ssh_op() {
+    local operation="$1"
+    shift
+    log_operation "SSH" "action=$operation $*"
+}
+
+# Log certificate operations
+log_cert_op() {
+    local operation="$1"
+    shift
+    log_operation "CERT" "action=$operation $*"
+}
+
+# Log installation section header
+log_install_section() {
+    local section="$1"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "" >> "$OPERATIONS_LOG" 2>/dev/null
+    echo "[$timestamp] ========== $section ==========" >> "$OPERATIONS_LOG" 2>/dev/null
+}
+
+# Log raw output (for capturing command output)
+log_output() {
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    while IFS= read -r line; do
+        echo "[$timestamp] [OUTPUT] $line" >> "$OPERATIONS_LOG" 2>/dev/null
+        echo "$line"
+    done
+}
 
 # Detect dialog command (prefer dialog over whiptail)
 detect_dialog() {
@@ -2515,13 +2718,20 @@ show_gauge() {
 
 # Show progress box with live command output
 # This is the key function for showing progress during long operations
+# Also logs all output to the operations log
 show_progress_box() {
     local title="$1"
     local height="${2:-$DIALOG_HEIGHT}"
     local width="${3:-$DIALOG_WIDTH}"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+
+    # Log start of operation
+    echo "[$timestamp] [PROGRESS_START] $title" >> "$OPERATIONS_LOG" 2>/dev/null
 
     if [[ "$DIALOG_CMD" == "dialog" ]]; then
-        $DIALOG_CMD --backtitle "$SCRIPT_NAME v$VERSION" \
+        # Use tee to log output while displaying
+        tee -a "$OPERATIONS_LOG" 2>/dev/null | $DIALOG_CMD --backtitle "$SCRIPT_NAME v$VERSION" \
             --title "$title" --progressbox \
             "$height" "$width" 2>&1 >/dev/tty
     else
@@ -2530,11 +2740,17 @@ show_progress_box() {
         output=$(cat)
         local tmpfile="/tmp/pve-manager-wprog-$$.txt"
         echo "$output" > "$tmpfile"
+        # Also log to operations log
+        echo "$output" >> "$OPERATIONS_LOG" 2>/dev/null
         $DIALOG_CMD --backtitle "$SCRIPT_NAME v$VERSION" \
             --title "$title" --textbox "$tmpfile" \
             "$height" "$width" 3>&1 1>&2 2>&3
         rm -f "$tmpfile"
     fi
+
+    # Log end of operation
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] [PROGRESS_END] $title" >> "$OPERATIONS_LOG" 2>/dev/null
 }
 
 # Run command with progress display
@@ -3255,6 +3471,7 @@ lxc_create() {
         --start 0"
 
     log_info "Creating container $vmid ($hostname)"
+    log_container_op "$vmid" "CREATE" "hostname=$hostname template=$template storage=$storage cores=$cores memory=$memory disk=$disk"
 
     # Show progress during creation
     (
@@ -3280,6 +3497,7 @@ lxc_start() {
     local vmid="$1"
     local timeout_secs="${2:-30}"
     log_info "Starting container $vmid (timeout: ${timeout_secs}s)"
+    log_container_op "$vmid" "START" "timeout=${timeout_secs}s"
     pve_exec "timeout $timeout_secs pct start $vmid" 2>&1
 }
 
@@ -3288,6 +3506,7 @@ lxc_stop() {
     local vmid="$1"
     local timeout_secs="${2:-15}"
     log_info "Stopping container $vmid (timeout: ${timeout_secs}s)"
+    log_container_op "$vmid" "STOP" "timeout=${timeout_secs}s"
 
     # Try graceful shutdown first
     if pve_exec "pct shutdown $vmid --timeout $timeout_secs" 2>&1; then
@@ -3304,6 +3523,7 @@ lxc_stop() {
 lxc_delete() {
     local vmid="$1"
     log_info "Deleting container $vmid"
+    log_container_op "$vmid" "DELETE" "purge=true"
     pve_exec "pct destroy $vmid --purge" 2>&1
 }
 
@@ -3330,11 +3550,16 @@ lxc_wait_ready() {
     return 1
 }
 
-# Execute command in container
+# Execute command in container (logs command, not output)
 lxc_exec() {
     local vmid="$1"
     shift
     local cmd="$*"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+
+    # Log command being executed (debug level)
+    [[ "${LOG_LEVEL:-INFO}" == "DEBUG" ]] && echo "[$timestamp] [EXEC] vmid=$vmid cmd=$cmd" >> "$OPERATIONS_LOG" 2>/dev/null
 
     if [[ "$IS_LOCAL_PVE" == true ]]; then
         # Local: use bash -c with proper quoting
@@ -3372,22 +3597,27 @@ lxc_exec_timeout() {
     fi
 }
 
-# Execute command in container with live output
+# Execute command in container with live output (also logs to file)
 lxc_exec_live() {
     local vmid="$1"
     shift
     local cmd="$*"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+
+    # Log command being executed
+    echo "[$timestamp] [EXEC] vmid=$vmid cmd=$cmd" >> "$OPERATIONS_LOG" 2>/dev/null
 
     if [[ "$IS_LOCAL_PVE" == true ]]; then
         # Note: < /dev/null prevents consuming stdin (important in while loops)
-        pct exec "$vmid" -- /bin/bash -c "$cmd" < /dev/null 2>&1
+        pct exec "$vmid" -- /bin/bash -c "$cmd" < /dev/null 2>&1 | tee -a "$OPERATIONS_LOG"
     else
         local cmd_b64
         cmd_b64=$(echo -n "$cmd" | base64 -w0)
         # Note: < /dev/null prevents consuming stdin (important in while loops)
         ssh -o ConnectTimeout=10 -p "$CURRENT_PVE_PORT" \
             "${CURRENT_PVE_USER}@${CURRENT_PVE_HOST}" \
-            "echo $cmd_b64 | base64 -d | pct exec $vmid -- /bin/bash -s" < /dev/null 2>&1
+            "echo $cmd_b64 | base64 -d | pct exec $vmid -- /bin/bash -s" < /dev/null 2>&1 | tee -a "$OPERATIONS_LOG"
     fi
 }
 
@@ -4693,6 +4923,7 @@ ssh_generate_key() {
     fi
 
     log_info "Generating SSH keypair (type: $key_type)"
+    log_ssh_op "GENERATE_KEYPAIR" "type=$key_type file=$key_file"
     ssh-keygen -t "$key_type" -f "$key_file" -N "" -C "pve-manager@$(hostname)"
     chmod 600 "$key_file"
     chmod 644 "${key_file}.pub"
@@ -4722,6 +4953,7 @@ ssh_copy_to_container() {
     fi
 
     log_info "Copying SSH key to container $vmid"
+    log_ssh_op "COPY_KEY" "vmid=$vmid"
 
     # Create .ssh directory and add key
     lxc_exec "$vmid" "mkdir -p /root/.ssh && chmod 700 /root/.ssh"
@@ -5024,6 +5256,7 @@ ca_init() {
     log_info "Creating new Certificate Authority"
     log_info "  CN: $cn"
     log_info "  Organization: $org"
+    log_cert_op "CREATE_CA" "cn=$cn org=$org valid_days=$valid_days"
 
     # Generate CA private key
     openssl genrsa -out "$ca_key" 4096 2>/dev/null
@@ -5074,6 +5307,7 @@ ca_generate_cert() {
     fi
 
     log_info "Generating certificate for $hostname ($ip)"
+    log_cert_op "GENERATE_CERT" "hostname=$hostname ip=$ip valid_days=$valid_days"
 
     # Generate private key
     openssl genrsa -out "$key_file" 2048 2>/dev/null
@@ -5786,6 +6020,7 @@ deploy_service_native() {
     local deploy_result_file="/tmp/pve-deploy-native-result-$$.txt"
 
     log_info "Deploying $service natively to container $vmid"
+    log_service_op "$service" "DEPLOY_NATIVE" "vmid=$vmid service_name=$service_name"
 
     # Check if plugin supports native installation
     if ! is_plugin_service "$service" || ! plugin_supports_native "$service"; then
@@ -5878,6 +6113,7 @@ deploy_service_with_progress() {
     local deploy_result_file="/tmp/pve-deploy-result-$$.txt"
 
     log_info "Deploying $service to container $vmid"
+    log_service_op "$service" "DEPLOY_DOCKER" "vmid=$vmid service_name=$service_name"
 
     # Initialize result file
     echo "0" > "$deploy_result_file"
@@ -6616,16 +6852,43 @@ server {
 
     client_max_body_size 100M;
 
+    # Serve static files directly
     location /static/ {
         alias /Kiwi/static/;
+        autoindex off;
         expires 30d;
-        add_header Cache-Control \"public, immutable\";
+        add_header Cache-Control public;
+
+        # Ensure correct MIME types
+        types {
+            text/css css;
+            application/javascript js;
+            application/json json;
+            image/svg+xml svg svgz;
+            font/woff woff;
+            font/woff2 woff2;
+            application/vnd.ms-fontobject eot;
+            font/ttf ttf;
+            font/otf otf;
+        }
     }
 
+    # Media/uploads files
     location /uploads/ {
         alias /Kiwi/uploads/;
+        autoindex off;
+        expires 7d;
     }
 
+    # Favicon
+    location = /favicon.ico {
+        alias /Kiwi/static/images/favicon.ico;
+        expires 30d;
+        access_log off;
+        log_not_found off;
+    }
+
+    # Proxy to gunicorn
     location / {
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host \$host;
