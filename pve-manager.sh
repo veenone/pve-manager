@@ -1417,15 +1417,24 @@ database:
   password: Harbor12345
   max_idle_conns: 50
   max_open_conns: 100
+  conn_max_lifetime: 5m
+  conn_max_idle_time: 0
 data_volume: /data/harbor
 trivy:
   ignore_unfixed: false
   skip_update: false
+  offline_scan: false
+  security_check: vuln
   insecure: false
 jobservice:
   max_job_workers: 10
+  job_loggers:
+    - STD_OUTPUT
+    - FILE
+  logger_sweeper_duration: 1
 notification:
-  webhook_job_max_retry: 10
+  webhook_job_max_retry: 3
+  webhook_job_http_client_timeout: 3
 log:
   level: info
   local:
@@ -1433,6 +1442,22 @@ log:
     rotate_size: 200M
     location: /var/log/harbor
 _version: 2.14.0
+proxy:
+  http_proxy:
+  https_proxy:
+  no_proxy:
+  components:
+    - core
+    - jobservice
+    - trivy
+upload_purging:
+  enabled: true
+  age: 168h
+  interval: 24h
+  dryrun: false
+cache:
+  enabled: false
+  expire_hours: 24
 HARBORYCFG"
 
         # Prepare data directory
@@ -6489,6 +6514,16 @@ ALLOYEOF"
             harbor)
                 # Harbor uses official installer - handle specially
                 echo "Harbor requires the official installer..."
+
+                # Install docker-compose standalone (required by Harbor installer)
+                echo "Checking docker-compose..."
+                if ! lxc_exec "$vmid" "command -v docker-compose" > /dev/null 2>&1; then
+                    echo "Installing docker-compose..."
+                    lxc_exec_live "$vmid" "ARCH=\$(uname -m) && curl -L https://github.com/docker/compose/releases/latest/download/docker-compose-linux-\${ARCH} -o /usr/local/bin/docker-compose"
+                    lxc_exec_live "$vmid" "chmod +x /usr/local/bin/docker-compose"
+                fi
+                echo "Done."
+
                 echo "Downloading Harbor v2.14.2 offline installer..."
                 lxc_exec_live "$vmid" "cd /opt && wget -q https://github.com/goharbor/harbor/releases/download/v2.14.2/harbor-offline-installer-v2.14.2.tgz"
                 lxc_exec_live "$vmid" "cd /opt && tar xzf harbor-offline-installer-v2.14.2.tgz"
@@ -6521,15 +6556,24 @@ database:
   password: Harbor12345
   max_idle_conns: 50
   max_open_conns: 100
+  conn_max_lifetime: 5m
+  conn_max_idle_time: 0
 data_volume: /data/harbor
 trivy:
   ignore_unfixed: false
   skip_update: false
+  offline_scan: false
+  security_check: vuln
   insecure: false
 jobservice:
   max_job_workers: 10
+  job_loggers:
+    - STD_OUTPUT
+    - FILE
+  logger_sweeper_duration: 1
 notification:
-  webhook_job_max_retry: 10
+  webhook_job_max_retry: 3
+  webhook_job_http_client_timeout: 3
 log:
   level: info
   local:
@@ -6537,6 +6581,22 @@ log:
     rotate_size: 200M
     location: /var/log/harbor
 _version: 2.14.0
+proxy:
+  http_proxy:
+  https_proxy:
+  no_proxy:
+  components:
+    - core
+    - jobservice
+    - trivy
+upload_purging:
+  enabled: true
+  age: 168h
+  interval: 24h
+  dryrun: false
+cache:
+  enabled: false
+  expire_hours: 24
 HARBOREOF"
                 echo "Done."
 
