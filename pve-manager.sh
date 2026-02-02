@@ -1488,7 +1488,7 @@ case "$OS_TYPE" in
         # Install docker-compose if not present
         if ! lxc_exec "$VMID" "command -v docker-compose" > /dev/null 2>&1; then
             echo "Installing docker-compose..."
-            lxc_exec_live "$VMID" "curl -L 'https://github.com/docker/compose/releases/latest/download/docker-compose-linux-\$(uname -m)' -o /usr/local/bin/docker-compose"
+            lxc_exec_live "$VMID" "ARCH=\$(uname -m) && curl -L https://github.com/docker/compose/releases/latest/download/docker-compose-linux-\${ARCH} -o /usr/local/bin/docker-compose"
             lxc_exec_live "$VMID" "chmod +x /usr/local/bin/docker-compose"
         fi
 
