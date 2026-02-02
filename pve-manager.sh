@@ -20,7 +20,7 @@ set -o pipefail
 # CONFIGURATION & VARIABLES
 #######################################
 
-readonly VERSION="1.0.0"
+readonly VERSION="2.0.0"
 readonly SCRIPT_NAME="PVE Manager"
 readonly CONFIG_DIR="$HOME/.pve-manager"
 readonly CONFIG_FILE="$CONFIG_DIR/config.conf"
@@ -30,6 +30,7 @@ readonly CERTS_DIR="$CA_DIR/certs"
 readonly SSH_DIR="$CONFIG_DIR/ssh"
 readonly LOG_FILE="$CONFIG_DIR/pve-manager.log"
 readonly TEMPLATES_DIR="$CONFIG_DIR/templates"
+readonly PLUGINS_DIR="$CONFIG_DIR/plugins"
 readonly PROGRESS_LOG="/tmp/pve-manager-progress-$$.log"
 
 # Dialog dimensions
@@ -52,6 +53,10 @@ CURRENT_PVE_USER=""
 CURRENT_PVE_PORT=""
 IS_LOCAL_PVE=false
 
+# Plugin system arrays
+declare -gA PLUGINS
+declare -gA PLUGIN_CATEGORIES
+
 #######################################
 # UTILITY FUNCTIONS
 #######################################
@@ -64,7 +69,7 @@ trap cleanup EXIT
 
 # Initialize configuration directories
 init_config() {
-    mkdir -p "$CONFIG_DIR" "$CA_DIR" "$CERTS_DIR" "$SSH_DIR" "$TEMPLATES_DIR"
+    mkdir -p "$CONFIG_DIR" "$CA_DIR" "$CERTS_DIR" "$SSH_DIR" "$TEMPLATES_DIR" "$PLUGINS_DIR"
     chmod 700 "$CONFIG_DIR" "$CA_DIR" "$SSH_DIR"
 
     # Create default config if not exists
@@ -89,6 +94,2175 @@ EOF
         touch "$PROFILES_FILE"
     fi
 }
+
+#######################################
+# PLUGIN SYSTEM
+#######################################
+
+# Load plugins from plugins directory
+load_plugins() {
+    PLUGINS=()
+    PLUGIN_CATEGORIES=()
+    [[ ! -d "$PLUGINS_DIR" ]] && return
+
+    for plugin_dir in "$PLUGINS_DIR"/*/; do
+        [[ -d "$plugin_dir" ]] || continue
+        local plugin_id
+        plugin_id=$(basename "$plugin_dir")
+        local conf="$plugin_dir/plugin.conf"
+
+        if [[ -f "$conf" ]]; then
+            PLUGINS["$plugin_id"]="$plugin_dir"
+            local category
+            category=$(get_plugin_value "$conf" "PLUGIN_CATEGORY")
+            [[ -n "$category" ]] && PLUGIN_CATEGORIES["$category"]=1
+        fi
+    done
+
+    log_debug "Loaded ${#PLUGINS[@]} plugins"
+}
+
+# Get a value from plugin.conf
+get_plugin_value() {
+    local conf="$1"
+    local key="$2"
+    grep "^${key}=" "$conf" 2>/dev/null | head -1 | cut -d'=' -f2- | tr -d '"' | tr -d "'"
+}
+
+# Check if a service is a plugin
+is_plugin_service() {
+    local service="$1"
+    [[ -n "${PLUGINS[$service]}" ]]
+}
+
+# Check if plugin supports Docker deployment
+plugin_supports_docker() {
+    local service="$1"
+    local conf="${PLUGINS[$service]}/plugin.conf"
+    [[ "$(get_plugin_value "$conf" "PLUGIN_DOCKER_SUPPORT")" == "true" ]]
+}
+
+# Check if plugin supports native deployment
+plugin_supports_native() {
+    local service="$1"
+    local conf="${PLUGINS[$service]}/plugin.conf"
+    [[ "$(get_plugin_value "$conf" "PLUGIN_NATIVE_SUPPORT")" == "true" ]]
+}
+
+# Get plugin compose content
+get_plugin_compose() {
+    local plugin_id="$1"
+    local compose_file="${PLUGINS[$plugin_id]}/compose.yml"
+    [[ -f "$compose_file" ]] && cat "$compose_file"
+}
+
+# Get plugin Docker access info (substitutes {IP} placeholder)
+get_plugin_docker_access_info() {
+    local plugin_id="$1"
+    local ip="$2"
+    local conf="${PLUGINS[$plugin_id]}/plugin.conf"
+
+    local url creds
+    url=$(get_plugin_value "$conf" "PLUGIN_DOCKER_URL")
+    creds=$(get_plugin_value "$conf" "PLUGIN_DOCKER_CREDENTIALS")
+
+    # Substitute {IP} placeholder
+    url="${url//\{IP\}/$ip}"
+
+    if [[ -n "$creds" && "$creds" != "<"* ]]; then
+        echo -e "$url\nCredentials: $creds"
+    else
+        echo "$url"
+    fi
+}
+
+# Get plugin native access info (substitutes {IP} placeholder)
+get_plugin_native_access_info() {
+    local plugin_id="$1"
+    local ip="$2"
+    local conf="${PLUGINS[$plugin_id]}/plugin.conf"
+
+    local url creds
+    url=$(get_plugin_value "$conf" "PLUGIN_NATIVE_URL")
+    creds=$(get_plugin_value "$conf" "PLUGIN_NATIVE_CREDENTIALS")
+
+    # Substitute {IP} placeholder
+    url="${url//\{IP\}/$ip}"
+
+    if [[ -n "$creds" && "$creds" != "<"* ]]; then
+        echo -e "$url\nCredentials: $creds"
+    else
+        echo "$url"
+    fi
+}
+
+# List plugins by category
+list_plugins_by_category() {
+    local category="$1"
+    for plugin_id in "${!PLUGINS[@]}"; do
+        local conf="${PLUGINS[$plugin_id]}/plugin.conf"
+        local plugin_category
+        plugin_category=$(get_plugin_value "$conf" "PLUGIN_CATEGORY")
+        [[ "$plugin_category" == "$category" ]] && echo "$plugin_id"
+    done | sort
+}
+
+# Get plugin display name
+get_plugin_name() {
+    local plugin_id="$1"
+    local conf="${PLUGINS[$plugin_id]}/plugin.conf"
+    get_plugin_value "$conf" "PLUGIN_NAME"
+}
+
+#######################################
+# PLUGIN CREATION
+#######################################
+
+# Helper to create a plugin directory
+create_plugin_dir() {
+    local plugin_id="$1"
+    local plugin_dir="$PLUGINS_DIR/$plugin_id"
+    mkdir -p "$plugin_dir"
+    echo "$plugin_dir"
+}
+
+# Initialize built-in plugins (only if plugins directory is empty)
+init_builtin_plugins() {
+    local plugin_count
+    plugin_count=$(find "$PLUGINS_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+    [[ "$plugin_count" -gt 0 ]] && return
+
+    log_info "Initializing built-in plugins..."
+    create_builtin_plugins
+}
+
+# Create all built-in plugins
+create_builtin_plugins() {
+    # Monitoring plugins
+    create_plugin_prometheus
+    create_plugin_grafana
+    create_plugin_loki
+    create_plugin_alloy
+    create_plugin_node_exporter
+    create_plugin_monitoring_stack
+
+    # Development tools plugins
+    create_plugin_sonarqube
+    create_plugin_nexus
+    create_plugin_gitea
+    create_plugin_jenkins
+    create_plugin_harbor
+    create_plugin_dependency_track
+
+    # Testing tools plugins
+    create_plugin_kiwi_tcms
+    create_plugin_selenium_grid
+    create_plugin_testlink
+
+    # Infrastructure plugins
+    create_plugin_pihole
+    create_plugin_keycloak
+    create_plugin_freeipa
+    create_plugin_postfix_relay
+    create_plugin_traefik
+
+    log_info "Created 20 built-in plugins"
+}
+
+#######################################
+# MONITORING PLUGINS
+#######################################
+
+# Create prometheus plugin
+create_plugin_prometheus() {
+    local dir
+    dir=$(create_plugin_dir "prometheus")
+
+    # plugin.conf
+    cat > "$dir/plugin.conf" << 'EOF'
+PLUGIN_ID="prometheus"
+PLUGIN_NAME="Prometheus"
+PLUGIN_VERSION="latest"
+PLUGIN_CATEGORY="monitoring"
+PLUGIN_DESCRIPTION="Metrics collection and alerting"
+PLUGIN_DOCKER_SUPPORT="true"
+PLUGIN_NATIVE_SUPPORT="true"
+PLUGIN_NATIVE_OS="debian ubuntu alpine"
+PLUGIN_DOCKER_PORT="9090"
+PLUGIN_DOCKER_URL="http://{IP}:9090"
+PLUGIN_DOCKER_CREDENTIALS=""
+PLUGIN_NATIVE_URL="http://{IP}:9090"
+PLUGIN_NATIVE_CREDENTIALS=""
+PLUGIN_SYSTEMD_SERVICE="prometheus"
+PLUGIN_DOCKER_CONTAINER="prometheus"
+EOF
+
+    # compose.yml
+    cat > "$dir/compose.yml" << 'EOF'
+version: '3.8'
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    ports:
+      - "9090:9090"
+    volumes:
+      - prometheus_data:/prometheus
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+
+volumes:
+  prometheus_data:
+EOF
+
+    # prometheus.yml (extra config)
+    cat > "$dir/prometheus.yml" << 'EOF'
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'node'
+    static_configs:
+      - targets: ['node-exporter:9100']
+EOF
+
+    # install.sh
+    cat > "$dir/install.sh" << 'EOF'
+#!/bin/bash
+# Native installation script for Prometheus
+case "$OS_TYPE" in
+    debian|ubuntu)
+        lxc_exec_live "$VMID" "apt-get update"
+        lxc_exec_live "$VMID" "apt-get install -y prometheus"
+        lxc_exec_live "$VMID" "systemctl enable prometheus"
+        lxc_exec_live "$VMID" "systemctl start prometheus"
+        ;;
+    alpine)
+        lxc_exec_live "$VMID" "apk add --no-cache prometheus"
+        lxc_exec_live "$VMID" "rc-update add prometheus"
+        lxc_exec_live "$VMID" "rc-service prometheus start"
+        ;;
+    *)
+        echo "ERROR: Unsupported OS for native Prometheus installation"
+        exit 1
+        ;;
+esac
+EOF
+
+    # remove.sh
+    cat > "$dir/remove.sh" << 'EOF'
+#!/bin/bash
+# Removal script for Prometheus
+lxc_exec_live "$VMID" "systemctl stop prometheus 2>/dev/null || true"
+lxc_exec_live "$VMID" "systemctl disable prometheus 2>/dev/null || true"
+case "$OS_TYPE" in
+    debian|ubuntu)
+        lxc_exec_live "$VMID" "apt-get purge -y prometheus 2>/dev/null || true"
+        lxc_exec_live "$VMID" "apt-get autoremove -y 2>/dev/null || true"
+        ;;
+    alpine)
+        lxc_exec_live "$VMID" "apk del prometheus 2>/dev/null || true"
+        ;;
+esac
+lxc_exec_live "$VMID" "rm -rf /var/lib/prometheus"
+lxc_exec_live "$VMID" "rm -rf /etc/prometheus"
+EOF
+}
+
+# Create grafana plugin
+create_plugin_grafana() {
+    local dir
+    dir=$(create_plugin_dir "grafana")
+
+    # plugin.conf
+    cat > "$dir/plugin.conf" << 'EOF'
+PLUGIN_ID="grafana"
+PLUGIN_NAME="Grafana"
+PLUGIN_VERSION="latest"
+PLUGIN_CATEGORY="monitoring"
+PLUGIN_DESCRIPTION="Visualization and analytics platform"
+PLUGIN_DOCKER_SUPPORT="true"
+PLUGIN_NATIVE_SUPPORT="true"
+PLUGIN_NATIVE_OS="debian ubuntu alpine"
+PLUGIN_DOCKER_PORT="3000"
+PLUGIN_DOCKER_URL="http://{IP}:3000"
+PLUGIN_DOCKER_CREDENTIALS="admin/admin"
+PLUGIN_NATIVE_URL="http://{IP}:3000"
+PLUGIN_NATIVE_CREDENTIALS="admin/admin"
+PLUGIN_SYSTEMD_SERVICE="grafana-server"
+PLUGIN_DOCKER_CONTAINER="grafana"
+EOF
+
+    # compose.yml
+    cat > "$dir/compose.yml" << 'EOF'
+version: '3.8'
+services:
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_SERVER_ROOT_URL=${GRAFANA_URL:-http://localhost:3000}
+    volumes:
+      - grafana_data:/var/lib/grafana
+
+volumes:
+  grafana_data:
+EOF
+
+    # install.sh
+    cat > "$dir/install.sh" << 'EOF'
+#!/bin/bash
+# Native installation script for Grafana
+case "$OS_TYPE" in
+    debian|ubuntu)
+        lxc_exec_live "$VMID" "apt-get update"
+        lxc_exec_live "$VMID" "apt-get install -y apt-transport-https software-properties-common wget"
+        lxc_exec_live "$VMID" "wget -q -O /usr/share/keyrings/grafana.key https://apt.grafana.com/gpg.key"
+        lxc_exec_live "$VMID" "echo 'deb [signed-by=/usr/share/keyrings/grafana.key] https://apt.grafana.com stable main' | tee /etc/apt/sources.list.d/grafana.list"
+        lxc_exec_live "$VMID" "apt-get update"
+        lxc_exec_live "$VMID" "apt-get install -y grafana"
+        lxc_exec_live "$VMID" "systemctl daemon-reload"
+        lxc_exec_live "$VMID" "systemctl enable grafana-server"
+        lxc_exec_live "$VMID" "systemctl start grafana-server"
+        ;;
+    alpine)
+        lxc_exec_live "$VMID" "apk add --no-cache grafana"
+        lxc_exec_live "$VMID" "rc-update add grafana"
+        lxc_exec_live "$VMID" "rc-service grafana start"
+        ;;
+    *)
+        echo "ERROR: Unsupported OS for native Grafana installation"
+        exit 1
+        ;;
+esac
+EOF
+
+    # remove.sh
+    cat > "$dir/remove.sh" << 'EOF'
+#!/bin/bash
+# Removal script for Grafana
+lxc_exec_live "$VMID" "systemctl stop grafana-server 2>/dev/null || true"
+lxc_exec_live "$VMID" "systemctl disable grafana-server 2>/dev/null || true"
+case "$OS_TYPE" in
+    debian|ubuntu)
+        lxc_exec_live "$VMID" "apt-get purge -y grafana 2>/dev/null || true"
+        lxc_exec_live "$VMID" "apt-get autoremove -y 2>/dev/null || true"
+        lxc_exec_live "$VMID" "rm -f /etc/apt/sources.list.d/grafana.list"
+        lxc_exec_live "$VMID" "rm -f /usr/share/keyrings/grafana.key"
+        ;;
+    alpine)
+        lxc_exec_live "$VMID" "apk del grafana 2>/dev/null || true"
+        ;;
+esac
+lxc_exec_live "$VMID" "rm -rf /var/lib/grafana"
+lxc_exec_live "$VMID" "rm -rf /etc/grafana"
+EOF
+}
+
+# Create loki plugin
+create_plugin_loki() {
+    local dir
+    dir=$(create_plugin_dir "loki")
+
+    # plugin.conf
+    cat > "$dir/plugin.conf" << 'EOF'
+PLUGIN_ID="loki"
+PLUGIN_NAME="Loki"
+PLUGIN_VERSION="latest"
+PLUGIN_CATEGORY="monitoring"
+PLUGIN_DESCRIPTION="Log aggregation system"
+PLUGIN_DOCKER_SUPPORT="true"
+PLUGIN_NATIVE_SUPPORT="false"
+PLUGIN_DOCKER_PORT="3100"
+PLUGIN_DOCKER_URL="http://{IP}:3100"
+PLUGIN_DOCKER_CREDENTIALS=""
+PLUGIN_DOCKER_CONTAINER="loki"
+EOF
+
+    # compose.yml
+    cat > "$dir/compose.yml" << 'EOF'
+version: '3.8'
+services:
+  loki:
+    image: grafana/loki:latest
+    container_name: loki
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    ports:
+      - "3100:3100"
+    volumes:
+      - loki_data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+
+volumes:
+  loki_data:
+EOF
+}
+
+# Create alloy plugin
+create_plugin_alloy() {
+    local dir
+    dir=$(create_plugin_dir "alloy")
+
+    # plugin.conf
+    cat > "$dir/plugin.conf" << 'EOF'
+PLUGIN_ID="alloy"
+PLUGIN_NAME="Grafana Alloy"
+PLUGIN_VERSION="latest"
+PLUGIN_CATEGORY="monitoring"
+PLUGIN_DESCRIPTION="OpenTelemetry collector"
+PLUGIN_DOCKER_SUPPORT="true"
+PLUGIN_NATIVE_SUPPORT="false"
+PLUGIN_DOCKER_PORT="12345"
+PLUGIN_DOCKER_URL="http://{IP}:12345"
+PLUGIN_DOCKER_CREDENTIALS=""
+PLUGIN_DOCKER_CONTAINER="alloy"
+EOF
+
+    # compose.yml
+    cat > "$dir/compose.yml" << 'EOF'
+version: '3.8'
+services:
+  alloy:
+    image: grafana/alloy:latest
+    container_name: alloy
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    ports:
+      - "12345:12345"
+    volumes:
+      - ./config.alloy:/etc/alloy/config.alloy:ro
+      - /var/log:/var/log:ro
+    command:
+      - run
+      - /etc/alloy/config.alloy
+      - --server.http.listen-addr=0.0.0.0:12345
+EOF
+
+    # config.alloy (extra config)
+    cat > "$dir/config.alloy" << 'EOF'
+logging {
+  level = "info"
+}
+
+prometheus.scrape "default" {
+  targets = [
+    {"__address__" = "localhost:9100"},
+  ]
+  forward_to = [prometheus.remote_write.default.receiver]
+}
+
+prometheus.remote_write "default" {
+  endpoint {
+    url = "http://prometheus:9090/api/v1/write"
+  }
+}
+
+loki.source.journal "read" {
+  forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
+EOF
+}
+
+# Create node-exporter plugin
+create_plugin_node_exporter() {
+    local dir
+    dir=$(create_plugin_dir "node-exporter")
+
+    # plugin.conf
+    cat > "$dir/plugin.conf" << 'EOF'
+PLUGIN_ID="node-exporter"
+PLUGIN_NAME="Node Exporter"
+PLUGIN_VERSION="latest"
+PLUGIN_CATEGORY="monitoring"
+PLUGIN_DESCRIPTION="System metrics exporter for Prometheus"
+PLUGIN_DOCKER_SUPPORT="true"
+PLUGIN_NATIVE_SUPPORT="false"
+PLUGIN_DOCKER_PORT="9100"
+PLUGIN_DOCKER_URL="http://{IP}:9100"
+PLUGIN_DOCKER_CREDENTIALS=""
+PLUGIN_DOCKER_CONTAINER="node-exporter"
+EOF
+
+    # compose.yml
+    cat > "$dir/compose.yml" << 'EOF'
+version: '3.8'
+services:
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+EOF
+}
+
+# Create monitoring-stack plugin
+create_plugin_monitoring_stack() {
+    local dir
+    dir=$(create_plugin_dir "monitoring-stack")
+
+    # plugin.conf
+    cat > "$dir/plugin.conf" << 'EOF'
+PLUGIN_ID="monitoring-stack"
+PLUGIN_NAME="Monitoring Stack"
+PLUGIN_VERSION="latest"
+PLUGIN_CATEGORY="monitoring"
+PLUGIN_DESCRIPTION="Complete monitoring stack: Prometheus, Grafana, Loki, Node Exporter"
+PLUGIN_DOCKER_SUPPORT="true"
+PLUGIN_NATIVE_SUPPORT="false"
+PLUGIN_DOCKER_PORT="3000"
+PLUGIN_DOCKER_URL="Grafana: http://{IP}:3000\nPrometheus: http://{IP}:9090"
+PLUGIN_DOCKER_CREDENTIALS=""
+PLUGIN_DOCKER_CONTAINER="grafana"
+EOF
+
+    # compose.yml
+    cat > "$dir/compose.yml" << 'EOF'
+version: '3.8'
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    ports:
+      - "9090:9090"
+    volumes:
+      - prometheus_data:/prometheus
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+  loki:
+    image: grafana/loki:latest
+    container_name: loki
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    ports:
+      - "3100:3100"
+    volumes:
+      - loki_data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+
+volumes:
+  prometheus_data:
+  grafana_data:
+  loki_data:
+EOF
+
+    # prometheus.yml (extra config)
+    cat > "$dir/prometheus.yml" << 'EOF'
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'node'
+    static_configs:
+      - targets: ['node-exporter:9100']
+EOF
+}
+
+#######################################
+# DEVTOOLS PLUGINS
+#######################################
+
+# Create sonarqube plugin
+create_plugin_sonarqube() {
+    local dir
+    dir=$(create_plugin_dir "sonarqube")
+
+    # plugin.conf
+    cat > "$dir/plugin.conf" << 'EOF'
+PLUGIN_ID="sonarqube"
+PLUGIN_NAME="SonarQube"
+PLUGIN_VERSION="community"
+PLUGIN_CATEGORY="devtools"
+PLUGIN_DESCRIPTION="Code quality and security analysis"
+PLUGIN_DOCKER_SUPPORT="true"
+PLUGIN_NATIVE_SUPPORT="true"
+PLUGIN_NATIVE_OS="debian ubuntu"
+PLUGIN_DOCKER_PORT="9000"
+PLUGIN_DOCKER_URL="http://{IP}:9000"
+PLUGIN_DOCKER_CREDENTIALS="admin/admin"
+PLUGIN_NATIVE_URL="http://{IP}:9000"
+PLUGIN_NATIVE_CREDENTIALS="admin/admin"
+PLUGIN_SYSTEMD_SERVICE="sonarqube"
+PLUGIN_DOCKER_CONTAINER="sonarqube"
+EOF
+
+    # compose.yml
+    cat > "$dir/compose.yml" << 'EOF'
+version: '3.8'
+services:
+  sonarqube:
+    image: sonarqube:community
+    container_name: sonarqube
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    ports:
+      - "9000:9000"
+    environment:
+      - SONAR_JDBC_URL=jdbc:postgresql://sonarqube-db:5432/sonar
+      - SONAR_JDBC_USERNAME=sonar
+      - SONAR_JDBC_PASSWORD=${SONAR_DB_PASSWORD:-sonar}
+    volumes:
+      - sonarqube_data:/opt/sonarqube/data
+      - sonarqube_extensions:/opt/sonarqube/extensions
+      - sonarqube_logs:/opt/sonarqube/logs
+    depends_on:
+      sonarqube-db:
+        condition: service_healthy
+
+  sonarqube-db:
+    image: postgres:15
+    container_name: sonarqube-db
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    environment:
+      - POSTGRES_USER=sonar
+      - POSTGRES_PASSWORD=${SONAR_DB_PASSWORD:-sonar}
+      - POSTGRES_DB=sonar
+    volumes:
+      - sonarqube_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "sonar", "-d", "sonar"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  sonarqube_data:
+  sonarqube_extensions:
+  sonarqube_logs:
+  sonarqube_db:
+EOF
+
+    # install.sh - sonarqube native requires complex setup
+    cat > "$dir/install.sh" << 'INSTALLEOF'
+#!/bin/bash
+# Native installation script for SonarQube
+case "$OS_TYPE" in
+    debian|ubuntu)
+        echo "Installing SonarQube dependencies..."
+        lxc_exec_live "$VMID" "apt-get update"
+        lxc_exec_live "$VMID" "apt-get install -y openjdk-17-jdk-headless postgresql wget unzip"
+
+        # Configure system limits
+        lxc_exec_live "$VMID" "echo 'vm.max_map_count=524288' >> /etc/sysctl.conf"
+        lxc_exec_live "$VMID" "echo 'fs.file-max=131072' >> /etc/sysctl.conf"
+        lxc_exec_live "$VMID" "sysctl -p"
+
+        # Configure limits for sonarqube user
+        lxc_exec_live "$VMID" "echo 'sonarqube - nofile 131072' >> /etc/security/limits.conf"
+        lxc_exec_live "$VMID" "echo 'sonarqube - nproc 8192' >> /etc/security/limits.conf"
+
+        # Setup PostgreSQL
+        lxc_exec_live "$VMID" "systemctl start postgresql"
+        lxc_exec_live "$VMID" "systemctl enable postgresql"
+        lxc_exec_live "$VMID" "sudo -u postgres psql -c \"CREATE USER sonar WITH PASSWORD 'sonar';\""
+        lxc_exec_live "$VMID" "sudo -u postgres psql -c 'CREATE DATABASE sonarqube OWNER sonar;'"
+
+        # Create sonarqube user
+        lxc_exec_live "$VMID" "useradd -r -s /bin/bash -d /opt/sonarqube sonarqube 2>/dev/null || true"
+
+        # Download and install SonarQube
+        echo "Downloading SonarQube..."
+        lxc_exec_live "$VMID" "wget -q -O /tmp/sonarqube.zip https://binaries.sonarsource.com/Distribution/sonarqube/sonarqube-10.4.1.88267.zip"
+        lxc_exec_live "$VMID" "unzip -q /tmp/sonarqube.zip -d /opt/"
+        lxc_exec_live "$VMID" "mv /opt/sonarqube-* /opt/sonarqube"
+        lxc_exec_live "$VMID" "chown -R sonarqube:sonarqube /opt/sonarqube"
+
+        # Configure SonarQube
+        lxc_exec_live "$VMID" "sed -i 's/#sonar.jdbc.username=/sonar.jdbc.username=sonar/' /opt/sonarqube/conf/sonar.properties"
+        lxc_exec_live "$VMID" "sed -i 's/#sonar.jdbc.password=/sonar.jdbc.password=sonar/' /opt/sonarqube/conf/sonar.properties"
+        lxc_exec_live "$VMID" "sed -i 's|#sonar.jdbc.url=jdbc:postgresql://localhost/sonarqube|sonar.jdbc.url=jdbc:postgresql://localhost/sonarqube|' /opt/sonarqube/conf/sonar.properties"
+
+        # Create systemd service
+        lxc_exec "$VMID" "cat > /etc/systemd/system/sonarqube.service << 'SVCEOF'
+[Unit]
+Description=SonarQube service
+After=syslog.target network.target postgresql.service
+
+[Service]
+Type=forking
+ExecStart=/opt/sonarqube/bin/linux-x86-64/sonar.sh start
+ExecStop=/opt/sonarqube/bin/linux-x86-64/sonar.sh stop
+User=sonarqube
+Group=sonarqube
+Restart=always
+LimitNOFILE=131072
+LimitNPROC=8192
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF"
+
+        lxc_exec_live "$VMID" "systemctl daemon-reload"
+        lxc_exec_live "$VMID" "systemctl enable sonarqube"
+        lxc_exec_live "$VMID" "systemctl start sonarqube"
+        ;;
+    *)
+        echo "ERROR: Unsupported OS for native SonarQube installation"
+        exit 1
+        ;;
+esac
+INSTALLEOF
+
+    # remove.sh
+    cat > "$dir/remove.sh" << 'EOF'
+#!/bin/bash
+# Removal script for SonarQube
+lxc_exec_live "$VMID" "systemctl stop sonarqube 2>/dev/null || true"
+lxc_exec_live "$VMID" "systemctl disable sonarqube 2>/dev/null || true"
+lxc_exec_live "$VMID" "rm -f /etc/systemd/system/sonarqube.service"
+lxc_exec_live "$VMID" "rm -rf /opt/sonarqube"
+lxc_exec_live "$VMID" "sudo -u postgres psql -c 'DROP DATABASE IF EXISTS sonarqube;' 2>/dev/null || true"
+lxc_exec_live "$VMID" "sudo -u postgres psql -c 'DROP USER IF EXISTS sonar;' 2>/dev/null || true"
+lxc_exec_live "$VMID" "userdel -r sonarqube 2>/dev/null || true"
+lxc_exec_live "$VMID" "sed -i '/vm.max_map_count=524288/d' /etc/sysctl.conf 2>/dev/null || true"
+lxc_exec_live "$VMID" "sed -i '/fs.file-max=131072/d' /etc/sysctl.conf 2>/dev/null || true"
+lxc_exec_live "$VMID" "sed -i '/sonarqube.*nofile/d' /etc/security/limits.conf 2>/dev/null || true"
+lxc_exec_live "$VMID" "sed -i '/sonarqube.*nproc/d' /etc/security/limits.conf 2>/dev/null || true"
+EOF
+}
+
+# Create nexus plugin
+create_plugin_nexus() {
+    local dir
+    dir=$(create_plugin_dir "nexus")
+
+    # plugin.conf
+    cat > "$dir/plugin.conf" << 'EOF'
+PLUGIN_ID="nexus"
+PLUGIN_NAME="Nexus Repository"
+PLUGIN_VERSION="latest"
+PLUGIN_CATEGORY="devtools"
+PLUGIN_DESCRIPTION="Artifact repository manager"
+PLUGIN_DOCKER_SUPPORT="true"
+PLUGIN_NATIVE_SUPPORT="false"
+PLUGIN_DOCKER_PORT="8081"
+PLUGIN_DOCKER_URL="http://{IP}:8081"
+PLUGIN_DOCKER_CREDENTIALS=""
+PLUGIN_DOCKER_CONTAINER="nexus"
+EOF
+
+    # compose.yml
+    cat > "$dir/compose.yml" << 'EOF'
+version: '3.8'
+services:
+  nexus:
+    image: sonatype/nexus3:latest
+    container_name: nexus
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    ports:
+      - "8081:8081"
+      - "8082:8082"
+      - "8083:8083"
+    volumes:
+      - nexus_data:/nexus-data
+
+volumes:
+  nexus_data:
+EOF
+}
+
+# Create gitea plugin
+create_plugin_gitea() {
+    local dir
+    dir=$(create_plugin_dir "gitea")
+
+    # plugin.conf
+    cat > "$dir/plugin.conf" << 'EOF'
+PLUGIN_ID="gitea"
+PLUGIN_NAME="Gitea"
+PLUGIN_VERSION="latest"
+PLUGIN_CATEGORY="devtools"
+PLUGIN_DESCRIPTION="Lightweight Git service"
+PLUGIN_DOCKER_SUPPORT="true"
+PLUGIN_NATIVE_SUPPORT="true"
+PLUGIN_NATIVE_OS="debian ubuntu"
+PLUGIN_DOCKER_PORT="3000"
+PLUGIN_DOCKER_URL="http://{IP}:3000"
+PLUGIN_DOCKER_CREDENTIALS=""
+PLUGIN_NATIVE_URL="http://{IP}:3000"
+PLUGIN_NATIVE_CREDENTIALS=""
+PLUGIN_SYSTEMD_SERVICE="gitea"
+PLUGIN_DOCKER_CONTAINER="gitea"
+EOF
+
+    # compose.yml
+    cat > "$dir/compose.yml" << 'EOF'
+version: '3.8'
+services:
+  gitea:
+    image: gitea/gitea:latest
+    container_name: gitea
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    ports:
+      - "3000:3000"
+      - "2222:22"
+    environment:
+      - USER_UID=1000
+      - USER_GID=1000
+      - GITEA__database__DB_TYPE=postgres
+      - GITEA__database__HOST=gitea-db:5432
+      - GITEA__database__NAME=gitea
+      - GITEA__database__USER=gitea
+      - GITEA__database__PASSWD=${GITEA_DB_PASSWORD:-gitea}
+    volumes:
+      - gitea_data:/data
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+    depends_on:
+      gitea-db:
+        condition: service_healthy
+
+  gitea-db:
+    image: postgres:15
+    container_name: gitea-db
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    environment:
+      - POSTGRES_USER=gitea
+      - POSTGRES_PASSWORD=${GITEA_DB_PASSWORD:-gitea}
+      - POSTGRES_DB=gitea
+    volumes:
+      - gitea_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "gitea", "-d", "gitea"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  gitea_data:
+  gitea_db:
+EOF
+
+    # install.sh
+    cat > "$dir/install.sh" << 'INSTALLEOF'
+#!/bin/bash
+# Native installation script for Gitea
+case "$OS_TYPE" in
+    debian|ubuntu)
+        lxc_exec_live "$VMID" "apt-get update"
+        lxc_exec_live "$VMID" "apt-get install -y git sqlite3"
+        lxc_exec_live "$VMID" "wget -O /usr/local/bin/gitea https://dl.gitea.com/gitea/1.21/gitea-1.21-linux-amd64"
+        lxc_exec_live "$VMID" "chmod +x /usr/local/bin/gitea"
+        lxc_exec_live "$VMID" "useradd -r -s /bin/bash -d /var/lib/gitea -m gitea 2>/dev/null || true"
+        lxc_exec_live "$VMID" "mkdir -p /var/lib/gitea/{custom,data,log} /etc/gitea"
+        lxc_exec_live "$VMID" "chown -R gitea:gitea /var/lib/gitea /etc/gitea"
+        lxc_exec_live "$VMID" "chmod 750 /var/lib/gitea/{custom,data,log} /etc/gitea"
+
+        # Create systemd service
+        lxc_exec "$VMID" "cat > /etc/systemd/system/gitea.service << 'GITEAEOF'
+[Unit]
+Description=Gitea
+After=network.target
+
+[Service]
+Type=simple
+User=gitea
+Group=gitea
+WorkingDirectory=/var/lib/gitea
+ExecStart=/usr/local/bin/gitea web -c /etc/gitea/app.ini
+Restart=always
+Environment=USER=gitea HOME=/var/lib/gitea GITEA_WORK_DIR=/var/lib/gitea
+
+[Install]
+WantedBy=multi-user.target
+GITEAEOF"
+
+        lxc_exec_live "$VMID" "systemctl daemon-reload"
+        lxc_exec_live "$VMID" "systemctl enable gitea"
+        lxc_exec_live "$VMID" "systemctl start gitea"
+        ;;
+    *)
+        echo "ERROR: Unsupported OS for native Gitea installation"
+        exit 1
+        ;;
+esac
+INSTALLEOF
+
+    # remove.sh
+    cat > "$dir/remove.sh" << 'EOF'
+#!/bin/bash
+# Removal script for Gitea
+lxc_exec_live "$VMID" "systemctl stop gitea 2>/dev/null || true"
+lxc_exec_live "$VMID" "systemctl disable gitea 2>/dev/null || true"
+lxc_exec_live "$VMID" "rm -f /etc/systemd/system/gitea.service"
+lxc_exec_live "$VMID" "rm -rf /var/lib/gitea"
+lxc_exec_live "$VMID" "rm -rf /etc/gitea"
+lxc_exec_live "$VMID" "rm -f /usr/local/bin/gitea"
+lxc_exec_live "$VMID" "userdel -r gitea 2>/dev/null || true"
+EOF
+}
+
+# Create jenkins plugin
+create_plugin_jenkins() {
+    local dir
+    dir=$(create_plugin_dir "jenkins")
+
+    # plugin.conf
+    cat > "$dir/plugin.conf" << 'EOF'
+PLUGIN_ID="jenkins"
+PLUGIN_NAME="Jenkins"
+PLUGIN_VERSION="lts"
+PLUGIN_CATEGORY="devtools"
+PLUGIN_DESCRIPTION="Automation server for CI/CD"
+PLUGIN_DOCKER_SUPPORT="true"
+PLUGIN_NATIVE_SUPPORT="true"
+PLUGIN_NATIVE_OS="debian ubuntu"
+PLUGIN_DOCKER_PORT="8080"
+PLUGIN_DOCKER_URL="http://{IP}:8080"
+PLUGIN_DOCKER_CREDENTIALS=""
+PLUGIN_NATIVE_URL="http://{IP}:8080"
+PLUGIN_NATIVE_CREDENTIALS="Initial password: cat /var/lib/jenkins/secrets/initialAdminPassword"
+PLUGIN_SYSTEMD_SERVICE="jenkins"
+PLUGIN_DOCKER_CONTAINER="jenkins"
+EOF
+
+    # compose.yml
+    cat > "$dir/compose.yml" << 'EOF'
+version: '3.8'
+services:
+  jenkins:
+    image: jenkins/jenkins:lts
+    container_name: jenkins
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    ports:
+      - "8080:8080"
+      - "50000:50000"
+    volumes:
+      - jenkins_home:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  jenkins_home:
+EOF
+
+    # install.sh
+    cat > "$dir/install.sh" << 'INSTALLEOF'
+#!/bin/bash
+# Native installation script for Jenkins
+case "$OS_TYPE" in
+    debian|ubuntu)
+        lxc_exec_live "$VMID" "apt-get update"
+        lxc_exec_live "$VMID" "apt-get install -y fontconfig openjdk-17-jre"
+        lxc_exec_live "$VMID" "wget -O /usr/share/keyrings/jenkins-keyring.asc https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key"
+        lxc_exec_live "$VMID" "echo 'deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable binary/' | tee /etc/apt/sources.list.d/jenkins.list"
+        lxc_exec_live "$VMID" "apt-get update"
+        lxc_exec_live "$VMID" "apt-get install -y jenkins"
+        lxc_exec_live "$VMID" "systemctl enable jenkins"
+        lxc_exec_live "$VMID" "systemctl start jenkins"
+        echo ""
+        echo "Getting initial admin password..."
+        sleep 10
+        lxc_exec_live "$VMID" "cat /var/lib/jenkins/secrets/initialAdminPassword 2>/dev/null || echo 'Password not ready yet'"
+        ;;
+    *)
+        echo "ERROR: Unsupported OS for native Jenkins installation"
+        exit 1
+        ;;
+esac
+INSTALLEOF
+
+    # remove.sh
+    cat > "$dir/remove.sh" << 'EOF'
+#!/bin/bash
+# Removal script for Jenkins
+lxc_exec_live "$VMID" "systemctl stop jenkins 2>/dev/null || true"
+lxc_exec_live "$VMID" "systemctl disable jenkins 2>/dev/null || true"
+lxc_exec_live "$VMID" "apt-get purge -y jenkins 2>/dev/null || true"
+lxc_exec_live "$VMID" "apt-get autoremove -y 2>/dev/null || true"
+lxc_exec_live "$VMID" "rm -rf /var/lib/jenkins"
+lxc_exec_live "$VMID" "rm -f /etc/apt/sources.list.d/jenkins.list"
+lxc_exec_live "$VMID" "rm -f /usr/share/keyrings/jenkins-keyring.asc"
+EOF
+}
+
+# Create harbor plugin
+create_plugin_harbor() {
+    local dir
+    dir=$(create_plugin_dir "harbor")
+
+    # plugin.conf
+    cat > "$dir/plugin.conf" << 'EOF'
+PLUGIN_ID="harbor"
+PLUGIN_NAME="Harbor"
+PLUGIN_VERSION="v2.10.0"
+PLUGIN_CATEGORY="devtools"
+PLUGIN_DESCRIPTION="Container registry with security scanning"
+PLUGIN_DOCKER_SUPPORT="true"
+PLUGIN_NATIVE_SUPPORT="false"
+PLUGIN_DOCKER_PORT="80"
+PLUGIN_DOCKER_URL="Portal: http://{IP}/ (admin/Harbor12345)\nRegistry: {IP}:5000"
+PLUGIN_DOCKER_CREDENTIALS="admin/Harbor12345"
+PLUGIN_DOCKER_CONTAINER="harbor-portal"
+EOF
+
+    # compose.yml
+    cat > "$dir/compose.yml" << 'EOF'
+version: '3.8'
+services:
+  harbor-core:
+    image: goharbor/harbor-core:v2.10.0
+    container_name: harbor-core
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    environment:
+      - CONFIG_PATH=/etc/harbor/app.conf
+    volumes:
+      - harbor_data:/data
+      - ./harbor.yml:/etc/harbor/app.conf:ro
+    depends_on:
+      - harbor-db
+      - harbor-redis
+
+  harbor-portal:
+    image: goharbor/harbor-portal:v2.10.0
+    container_name: harbor-portal
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    ports:
+      - "80:8080"
+    depends_on:
+      - harbor-core
+
+  harbor-db:
+    image: goharbor/harbor-db:v2.10.0
+    container_name: harbor-db
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=${HARBOR_DB_PASSWORD:-Harbor12345}
+    volumes:
+      - harbor_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  harbor-redis:
+    image: goharbor/redis-photon:v2.10.0
+    container_name: harbor-redis
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    volumes:
+      - harbor_redis:/var/lib/redis
+
+  harbor-registry:
+    image: goharbor/registry-photon:v2.10.0
+    container_name: harbor-registry
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    ports:
+      - "5000:5000"
+    volumes:
+      - harbor_registry:/storage
+    environment:
+      - REGISTRY_HTTP_SECRET=${HARBOR_SECRET:-harbor-secret-key}
+
+  harbor-jobservice:
+    image: goharbor/harbor-jobservice:v2.10.0
+    container_name: harbor-jobservice
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    depends_on:
+      - harbor-core
+      - harbor-redis
+
+volumes:
+  harbor_data:
+  harbor_db:
+  harbor_redis:
+  harbor_registry:
+EOF
+}
+
+# Create dependency-track plugin
+create_plugin_dependency_track() {
+    local dir
+    dir=$(create_plugin_dir "dependency-track")
+
+    # plugin.conf
+    cat > "$dir/plugin.conf" << 'EOF'
+PLUGIN_ID="dependency-track"
+PLUGIN_NAME="Dependency-Track"
+PLUGIN_VERSION="latest"
+PLUGIN_CATEGORY="devtools"
+PLUGIN_DESCRIPTION="Software composition analysis platform"
+PLUGIN_DOCKER_SUPPORT="true"
+PLUGIN_NATIVE_SUPPORT="false"
+PLUGIN_DOCKER_PORT="8080"
+PLUGIN_DOCKER_URL="Frontend: http://{IP}:8080\nAPI Server: http://{IP}:8081"
+PLUGIN_DOCKER_CREDENTIALS="admin/admin"
+PLUGIN_DOCKER_CONTAINER="dtrack-frontend"
+EOF
+
+    # compose.yml
+    cat > "$dir/compose.yml" << 'EOF'
+version: '3.8'
+services:
+  dtrack-apiserver:
+    image: dependencytrack/apiserver:latest
+    container_name: dtrack-apiserver
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    environment:
+      - ALPINE_DATABASE_MODE=external
+      - ALPINE_DATABASE_URL=jdbc:postgresql://dtrack-db:5432/dtrack
+      - ALPINE_DATABASE_DRIVER=org.postgresql.Driver
+      - ALPINE_DATABASE_USERNAME=dtrack
+      - ALPINE_DATABASE_PASSWORD=${DTRACK_DB_PASSWORD:-dtrack}
+      - ALPINE_SECRET_KEY_PATH=/data/.secret.key
+      - JAVA_OPTIONS=-Xmx4g -Xms2g
+    volumes:
+      - dtrack_data:/data
+    ports:
+      - "8081:8080"
+    depends_on:
+      dtrack-db:
+        condition: service_healthy
+
+  dtrack-frontend:
+    image: dependencytrack/frontend:latest
+    container_name: dtrack-frontend
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    environment:
+      - API_BASE_URL=http://localhost:8081
+    ports:
+      - "8080:8080"
+    depends_on:
+      - dtrack-apiserver
+
+  dtrack-db:
+    image: postgres:15-alpine
+    container_name: dtrack-db
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    environment:
+      - POSTGRES_USER=dtrack
+      - POSTGRES_PASSWORD=${DTRACK_DB_PASSWORD:-dtrack}
+      - POSTGRES_DB=dtrack
+    volumes:
+      - dtrack_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "dtrack", "-d", "dtrack"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  dtrack_data:
+  dtrack_db:
+EOF
+}
+
+#######################################
+# TESTING PLUGINS
+#######################################
+
+# Create kiwi-tcms plugin
+create_plugin_kiwi_tcms() {
+    local dir
+    dir=$(create_plugin_dir "kiwi-tcms")
+
+    # plugin.conf
+    cat > "$dir/plugin.conf" << 'EOF'
+PLUGIN_ID="kiwi-tcms"
+PLUGIN_NAME="Kiwi TCMS"
+PLUGIN_VERSION="latest"
+PLUGIN_CATEGORY="testing"
+PLUGIN_DESCRIPTION="Test case management system"
+PLUGIN_DOCKER_SUPPORT="true"
+PLUGIN_NATIVE_SUPPORT="true"
+PLUGIN_NATIVE_OS="debian ubuntu"
+PLUGIN_DOCKER_PORT="8443"
+PLUGIN_DOCKER_URL="https://{IP}:8443"
+PLUGIN_DOCKER_CREDENTIALS="(self-signed cert)"
+PLUGIN_NATIVE_URL="http://{IP}/"
+PLUGIN_NATIVE_CREDENTIALS="Create admin: /opt/kiwi/create_superuser.sh"
+PLUGIN_SYSTEMD_SERVICE="kiwi"
+PLUGIN_DOCKER_CONTAINER="kiwi-tcms"
+EOF
+
+    # compose.yml
+    cat > "$dir/compose.yml" << 'EOF'
+version: '3.8'
+services:
+  kiwi:
+    image: kiwitcms/kiwi:latest
+    container_name: kiwi-tcms
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    ports:
+      - "8080:8080"
+      - "8443:8443"
+    environment:
+      - KIWI_DB_ENGINE=django.db.backends.postgresql
+      - KIWI_DB_HOST=kiwi-db
+      - KIWI_DB_PORT=5432
+      - KIWI_DB_NAME=kiwi
+      - KIWI_DB_USER=kiwi
+      - KIWI_DB_PASSWORD=${KIWI_DB_PASSWORD:-kiwi}
+    volumes:
+      - kiwi_uploads:/Kiwi/uploads
+    depends_on:
+      kiwi-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-k", "-f", "https://localhost:8443/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  kiwi-db:
+    image: postgres:15
+    container_name: kiwi-db
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    environment:
+      - POSTGRES_USER=kiwi
+      - POSTGRES_PASSWORD=${KIWI_DB_PASSWORD:-kiwi}
+      - POSTGRES_DB=kiwi
+    volumes:
+      - kiwi_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "kiwi", "-d", "kiwi"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  kiwi_uploads:
+  kiwi_db:
+EOF
+
+    # install.sh - kiwi-tcms native is complex
+    cat > "$dir/install.sh" << 'INSTALLEOF'
+#!/bin/bash
+# Native installation script for Kiwi TCMS
+# NOTE: This is a complex installation that may take 10-15 minutes
+case "$OS_TYPE" in
+    debian|ubuntu)
+        echo "Setting up locales..."
+        lxc_exec_live "$VMID" "apt-get update"
+        lxc_exec_live "$VMID" "apt-get install -y locales"
+        lxc_exec_live "$VMID" "sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen"
+        lxc_exec_live "$VMID" "locale-gen en_US.UTF-8"
+        lxc_exec_live "$VMID" "update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8"
+
+        echo "Installing system dependencies..."
+        lxc_exec_live "$VMID" "DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-pip python3-venv python3-dev gcc libpq-dev postgresql postgresql-contrib nginx git libxml2-dev libxslt1-dev libffi-dev libssl-dev cargo pkg-config curl nodejs npm"
+
+        lxc_exec_live "$VMID" "systemctl enable postgresql"
+        lxc_exec_live "$VMID" "systemctl start postgresql"
+
+        echo "Setting up PostgreSQL database..."
+        lxc_exec_live "$VMID" "sudo -u postgres psql -c \"CREATE USER kiwi WITH PASSWORD 'kiwi';\""
+        lxc_exec_live "$VMID" "sudo -u postgres psql -c 'CREATE DATABASE kiwi OWNER kiwi;'"
+
+        echo "Creating kiwi user..."
+        lxc_exec_live "$VMID" "useradd -r -s /bin/bash -d /opt/kiwi -m kiwi 2>/dev/null || true"
+
+        echo "Setting up Python virtual environment..."
+        lxc_exec_live "$VMID" "python3 -m venv /opt/kiwi/venv"
+
+        echo "Installing Kiwi TCMS from PyPI..."
+        lxc_exec_live "$VMID" "/opt/kiwi/venv/bin/pip install --upgrade pip wheel setuptools"
+        lxc_exec_live "$VMID" "/opt/kiwi/venv/bin/pip install kiwitcms gunicorn psycopg2-binary"
+
+        echo "Configuring Kiwi TCMS..."
+        lxc_exec_live "$VMID" "mkdir -p /opt/kiwi/Kiwi /Kiwi/uploads /Kiwi/static"
+        lxc_exec_live "$VMID" "chown -R kiwi:kiwi /opt/kiwi /Kiwi"
+
+        # Create local settings
+        lxc_exec "$VMID" "cat > /opt/kiwi/Kiwi/tcms_local_settings.py << 'SETTINGSEOF'
+import os
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': 'kiwi',
+        'USER': 'kiwi',
+        'PASSWORD': 'kiwi',
+        'HOST': 'localhost',
+        'PORT': '5432',
+    }
+}
+SECRET_KEY = 'change-me-in-production'
+ALLOWED_HOSTS = ['*']
+STATIC_ROOT = '/Kiwi/static'
+MEDIA_ROOT = '/Kiwi/uploads'
+DEBUG = False
+SETTINGSEOF"
+
+        lxc_exec_live "$VMID" "export DJANGO_SETTINGS_MODULE=tcms.settings.local && export KIWI_SETTINGS_DIR=/opt/kiwi/Kiwi && /opt/kiwi/venv/bin/python -c 'import django; django.setup(); from django.core.management import call_command; call_command(\"migrate\")'"
+        lxc_exec_live "$VMID" "export DJANGO_SETTINGS_MODULE=tcms.settings.local && export KIWI_SETTINGS_DIR=/opt/kiwi/Kiwi && /opt/kiwi/venv/bin/python -c 'import django; django.setup(); from django.core.management import call_command; call_command(\"collectstatic\", \"--noinput\")'"
+
+        # Create systemd service
+        lxc_exec "$VMID" "cat > /etc/systemd/system/kiwi.service << 'SVCEOF'
+[Unit]
+Description=Kiwi TCMS
+After=network.target postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=kiwi
+Group=kiwi
+WorkingDirectory=/opt/kiwi/Kiwi
+Environment=DJANGO_SETTINGS_MODULE=tcms.settings.local
+Environment=KIWI_SETTINGS_DIR=/opt/kiwi/Kiwi
+ExecStart=/opt/kiwi/venv/bin/gunicorn --bind 127.0.0.1:8080 --workers 3 --timeout 120 tcms.wsgi:application
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF"
+
+        # Configure nginx
+        lxc_exec "$VMID" "cat > /etc/nginx/sites-available/kiwi << 'NGINXEOF'
+server {
+    listen 80 default_server;
+    server_name _;
+    client_max_body_size 100M;
+
+    location /static/ {
+        alias /Kiwi/static/;
+    }
+
+    location /uploads/ {
+        alias /Kiwi/uploads/;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
+}
+NGINXEOF"
+
+        lxc_exec_live "$VMID" "rm -f /etc/nginx/sites-enabled/default"
+        lxc_exec_live "$VMID" "ln -sf /etc/nginx/sites-available/kiwi /etc/nginx/sites-enabled/kiwi"
+
+        # Create superuser script
+        lxc_exec "$VMID" "cat > /opt/kiwi/create_superuser.sh << 'SUPEREOF'
+#!/bin/bash
+cd /opt/kiwi/Kiwi
+export DJANGO_SETTINGS_MODULE=tcms.settings.local
+export KIWI_SETTINGS_DIR=/opt/kiwi/Kiwi
+/opt/kiwi/venv/bin/python -c 'import django; django.setup(); from django.core.management import call_command; call_command(\"createsuperuser\")'
+SUPEREOF"
+        lxc_exec_live "$VMID" "chmod +x /opt/kiwi/create_superuser.sh"
+
+        lxc_exec_live "$VMID" "systemctl daemon-reload"
+        lxc_exec_live "$VMID" "systemctl enable kiwi nginx"
+        lxc_exec_live "$VMID" "systemctl restart kiwi"
+        lxc_exec_live "$VMID" "systemctl restart nginx"
+        ;;
+    *)
+        echo "ERROR: Unsupported OS for native Kiwi TCMS installation"
+        exit 1
+        ;;
+esac
+INSTALLEOF
+
+    # remove.sh
+    cat > "$dir/remove.sh" << 'EOF'
+#!/bin/bash
+# Removal script for Kiwi TCMS
+lxc_exec_live "$VMID" "systemctl stop kiwi 2>/dev/null || true"
+lxc_exec_live "$VMID" "systemctl stop nginx 2>/dev/null || true"
+lxc_exec_live "$VMID" "systemctl disable kiwi 2>/dev/null || true"
+lxc_exec_live "$VMID" "rm -f /etc/systemd/system/kiwi.service"
+lxc_exec_live "$VMID" "rm -f /etc/nginx/sites-enabled/kiwi"
+lxc_exec_live "$VMID" "rm -f /etc/nginx/sites-available/kiwi"
+lxc_exec_live "$VMID" "rm -rf /opt/kiwi"
+lxc_exec_live "$VMID" "rm -rf /Kiwi"
+lxc_exec_live "$VMID" "sudo -u postgres psql -c 'DROP DATABASE IF EXISTS kiwi;' 2>/dev/null || true"
+lxc_exec_live "$VMID" "sudo -u postgres psql -c 'DROP USER IF EXISTS kiwi;' 2>/dev/null || true"
+lxc_exec_live "$VMID" "userdel -r kiwi 2>/dev/null || true"
+lxc_exec_live "$VMID" "ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default 2>/dev/null || true"
+lxc_exec_live "$VMID" "systemctl restart nginx 2>/dev/null || true"
+EOF
+}
+
+# Create selenium-grid plugin
+create_plugin_selenium_grid() {
+    local dir
+    dir=$(create_plugin_dir "selenium-grid")
+
+    # plugin.conf
+    cat > "$dir/plugin.conf" << 'EOF'
+PLUGIN_ID="selenium-grid"
+PLUGIN_NAME="Selenium Grid"
+PLUGIN_VERSION="latest"
+PLUGIN_CATEGORY="testing"
+PLUGIN_DESCRIPTION="Browser automation grid"
+PLUGIN_DOCKER_SUPPORT="true"
+PLUGIN_NATIVE_SUPPORT="false"
+PLUGIN_DOCKER_PORT="4444"
+PLUGIN_DOCKER_URL="http://{IP}:4444"
+PLUGIN_DOCKER_CREDENTIALS=""
+PLUGIN_DOCKER_CONTAINER="selenium-hub"
+EOF
+
+    # compose.yml
+    cat > "$dir/compose.yml" << 'EOF'
+version: '3.8'
+services:
+  selenium-hub:
+    image: selenium/hub:latest
+    container_name: selenium-hub
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    ports:
+      - "4442:4442"
+      - "4443:4443"
+      - "4444:4444"
+
+  chrome:
+    image: selenium/node-chrome:latest
+    container_name: selenium-chrome
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    depends_on:
+      - selenium-hub
+    environment:
+      - SE_EVENT_BUS_HOST=selenium-hub
+      - SE_EVENT_BUS_PUBLISH_PORT=4442
+      - SE_EVENT_BUS_SUBSCRIBE_PORT=4443
+    shm_size: '2gb'
+
+  firefox:
+    image: selenium/node-firefox:latest
+    container_name: selenium-firefox
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    depends_on:
+      - selenium-hub
+    environment:
+      - SE_EVENT_BUS_HOST=selenium-hub
+      - SE_EVENT_BUS_PUBLISH_PORT=4442
+      - SE_EVENT_BUS_SUBSCRIBE_PORT=4443
+    shm_size: '2gb'
+EOF
+}
+
+# Create testlink plugin
+create_plugin_testlink() {
+    local dir
+    dir=$(create_plugin_dir "testlink")
+
+    # plugin.conf
+    cat > "$dir/plugin.conf" << 'EOF'
+PLUGIN_ID="testlink"
+PLUGIN_NAME="TestLink"
+PLUGIN_VERSION="latest"
+PLUGIN_CATEGORY="testing"
+PLUGIN_DESCRIPTION="Test management and requirements tracking"
+PLUGIN_DOCKER_SUPPORT="true"
+PLUGIN_NATIVE_SUPPORT="true"
+PLUGIN_NATIVE_OS="debian ubuntu"
+PLUGIN_DOCKER_PORT="80"
+PLUGIN_DOCKER_URL="http://{IP}/"
+PLUGIN_DOCKER_CREDENTIALS="admin/admin123"
+PLUGIN_NATIVE_URL="http://{IP}/"
+PLUGIN_NATIVE_CREDENTIALS="Complete setup at install/index.php"
+PLUGIN_SYSTEMD_SERVICE="nginx"
+PLUGIN_DOCKER_CONTAINER="testlink"
+EOF
+
+    # compose.yml
+    cat > "$dir/compose.yml" << 'EOF'
+version: '3.8'
+services:
+  testlink:
+    image: bitnami/testlink:latest
+    container_name: testlink
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    ports:
+      - "80:8080"
+      - "443:8443"
+    environment:
+      - TESTLINK_DATABASE_HOST=testlink-db
+      - TESTLINK_DATABASE_PORT_NUMBER=3306
+      - TESTLINK_DATABASE_NAME=testlink
+      - TESTLINK_DATABASE_USER=testlink
+      - TESTLINK_DATABASE_PASSWORD=${TESTLINK_DB_PASSWORD:-testlink123}
+      - TESTLINK_USERNAME=admin
+      - TESTLINK_PASSWORD=${TESTLINK_ADMIN_PASSWORD:-admin123}
+      - TESTLINK_EMAIL=admin@example.com
+      - ALLOW_EMPTY_PASSWORD=no
+    volumes:
+      - testlink_data:/bitnami/testlink
+    depends_on:
+      testlink-db:
+        condition: service_healthy
+
+  testlink-db:
+    image: mariadb:10.11
+    container_name: testlink-db
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    environment:
+      - MARIADB_ROOT_PASSWORD=${TESTLINK_ROOT_PASSWORD:-rootpassword}
+      - MARIADB_DATABASE=testlink
+      - MARIADB_USER=testlink
+      - MARIADB_PASSWORD=${TESTLINK_DB_PASSWORD:-testlink123}
+    volumes:
+      - testlink_db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+volumes:
+  testlink_data:
+  testlink_db:
+EOF
+
+    # install.sh - testlink native is complex
+    cat > "$dir/install.sh" << 'INSTALLEOF'
+#!/bin/bash
+# Native installation script for TestLink
+case "$OS_TYPE" in
+    debian|ubuntu)
+        echo "Installing TestLink dependencies..."
+        lxc_exec_live "$VMID" "apt-get update"
+        lxc_exec_live "$VMID" "apt-get install -y locales"
+        lxc_exec_live "$VMID" "sed -i 's/# en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen"
+        lxc_exec_live "$VMID" "locale-gen en_US.UTF-8"
+
+        echo "Installing MariaDB..."
+        lxc_exec_live "$VMID" "DEBIAN_FRONTEND=noninteractive apt-get install -y mariadb-server mariadb-client"
+        lxc_exec_live "$VMID" "systemctl start mariadb"
+        lxc_exec_live "$VMID" "systemctl enable mariadb"
+
+        echo "Setting up database..."
+        lxc_exec_live "$VMID" "mysql -e 'DROP DATABASE IF EXISTS testlink;' 2>/dev/null || true"
+        lxc_exec_live "$VMID" "mysql -e \"DROP USER IF EXISTS 'testlink'@'localhost';\" 2>/dev/null || true"
+        lxc_exec_live "$VMID" "mysql -e 'FLUSH PRIVILEGES;'"
+        lxc_exec_live "$VMID" "mysql -e \"CREATE DATABASE testlink DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\""
+        lxc_exec_live "$VMID" "mysql -e \"CREATE USER 'testlink'@'localhost' IDENTIFIED BY 'testlink123';\""
+        lxc_exec_live "$VMID" "mysql -e \"GRANT ALL PRIVILEGES ON testlink.* TO 'testlink'@'localhost' WITH GRANT OPTION;\""
+        lxc_exec_live "$VMID" "mysql -e 'FLUSH PRIVILEGES;'"
+
+        echo "Installing Nginx and PHP-FPM..."
+        lxc_exec_live "$VMID" "DEBIAN_FRONTEND=noninteractive apt-get install -y nginx php-fpm php-mysql php-gd php-xml php-mbstring php-ldap php-curl php-zip php-cli wget unzip"
+
+        echo "Downloading TestLink..."
+        lxc_exec_live "$VMID" "rm -rf /var/www/testlink"
+        lxc_exec_live "$VMID" "mkdir -p /var/www/testlink"
+        lxc_exec_live "$VMID" "wget -q -O /tmp/testlink.tar.gz https://github.com/TestLinkOpenSourceTRMS/testlink-code/archive/refs/tags/1.9.20.tar.gz"
+        lxc_exec_live "$VMID" "tar -xzf /tmp/testlink.tar.gz -C /var/www/testlink --strip-components=1"
+        lxc_exec_live "$VMID" "rm /tmp/testlink.tar.gz"
+
+        # Set permissions
+        lxc_exec_live "$VMID" "mkdir -p /var/testlink/logs /var/testlink/upload_area"
+        lxc_exec_live "$VMID" "chown -R www-data:www-data /var/www/testlink /var/testlink"
+        lxc_exec_live "$VMID" "chmod -R 755 /var/www/testlink /var/testlink"
+
+        # Get PHP version
+        local php_version
+        php_version=$(lxc_exec "$VMID" "php -r 'echo PHP_MAJOR_VERSION.\".\".PHP_MINOR_VERSION;' 2>/dev/null")
+        [[ -z "$php_version" ]] && php_version="8.2"
+
+        # Configure nginx
+        lxc_exec "$VMID" "cat > /etc/nginx/sites-available/testlink << 'NGINXEOF'
+server {
+    listen 80 default_server;
+    server_name _;
+    root /var/www/testlink;
+    index index.php index.html;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$args;
+    }
+
+    location ~ \\.php\$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/var/run/php/php${php_version}-fpm.sock;
+    }
+}
+NGINXEOF"
+
+        lxc_exec_live "$VMID" "rm -f /etc/nginx/sites-enabled/default"
+        lxc_exec_live "$VMID" "ln -sf /etc/nginx/sites-available/testlink /etc/nginx/sites-enabled/testlink"
+        lxc_exec_live "$VMID" "systemctl restart nginx"
+        lxc_exec_live "$VMID" "systemctl restart php${php_version}-fpm"
+
+        echo ""
+        echo "TestLink installed. Complete setup at http://<ip>/install/index.php"
+        echo "DB: testlink, User: testlink, Password: testlink123"
+        ;;
+    *)
+        echo "ERROR: Unsupported OS for native TestLink installation"
+        exit 1
+        ;;
+esac
+INSTALLEOF
+
+    # remove.sh
+    cat > "$dir/remove.sh" << 'EOF'
+#!/bin/bash
+# Removal script for TestLink
+lxc_exec_live "$VMID" "systemctl stop nginx 2>/dev/null || true"
+lxc_exec_live "$VMID" "rm -f /etc/nginx/sites-enabled/testlink"
+lxc_exec_live "$VMID" "rm -f /etc/nginx/sites-available/testlink"
+lxc_exec_live "$VMID" "rm -rf /var/www/testlink"
+lxc_exec_live "$VMID" "rm -rf /var/testlink"
+lxc_exec_live "$VMID" "mysql -e 'DROP DATABASE IF EXISTS testlink;' 2>/dev/null || true"
+lxc_exec_live "$VMID" "mysql -e \"DROP USER IF EXISTS 'testlink'@'localhost';\" 2>/dev/null || true"
+lxc_exec_live "$VMID" "mysql -e 'FLUSH PRIVILEGES;' 2>/dev/null || true"
+lxc_exec_live "$VMID" "ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default 2>/dev/null || true"
+lxc_exec_live "$VMID" "systemctl restart nginx 2>/dev/null || true"
+EOF
+}
+
+#######################################
+# INFRASTRUCTURE PLUGINS
+#######################################
+
+# Create pihole plugin
+create_plugin_pihole() {
+    local dir
+    dir=$(create_plugin_dir "pihole")
+
+    # plugin.conf
+    cat > "$dir/plugin.conf" << 'EOF'
+PLUGIN_ID="pihole"
+PLUGIN_NAME="Pi-hole"
+PLUGIN_VERSION="latest"
+PLUGIN_CATEGORY="infrastructure"
+PLUGIN_DESCRIPTION="Network-wide ad blocking"
+PLUGIN_DOCKER_SUPPORT="true"
+PLUGIN_NATIVE_SUPPORT="true"
+PLUGIN_NATIVE_OS="debian ubuntu"
+PLUGIN_DOCKER_PORT="80"
+PLUGIN_DOCKER_URL="Admin: http://{IP}/admin"
+PLUGIN_DOCKER_CREDENTIALS="admin"
+PLUGIN_NATIVE_URL="Admin: http://{IP}/admin"
+PLUGIN_NATIVE_CREDENTIALS="admin (change with: pihole -a -p)"
+PLUGIN_SYSTEMD_SERVICE="pihole-FTL"
+PLUGIN_DOCKER_CONTAINER="pihole"
+EOF
+
+    # compose.yml
+    cat > "$dir/compose.yml" << 'EOF'
+version: '3.8'
+services:
+  pihole:
+    image: pihole/pihole:latest
+    container_name: pihole
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    ports:
+      - "53:53/tcp"
+      - "53:53/udp"
+      - "80:80/tcp"
+    environment:
+      - TZ=${PIHOLE_TZ:-UTC}
+      - WEBPASSWORD=${PIHOLE_PASSWORD:-admin}
+      - FTLCONF_LOCAL_IPV4=${PIHOLE_IP:-}
+      - DNSMASQ_LISTENING=all
+    volumes:
+      - pihole_data:/etc/pihole
+      - pihole_dnsmasq:/etc/dnsmasq.d
+    cap_add:
+      - NET_ADMIN
+
+volumes:
+  pihole_data:
+  pihole_dnsmasq:
+EOF
+
+    # install.sh
+    cat > "$dir/install.sh" << 'INSTALLEOF'
+#!/bin/bash
+# Native installation script for Pi-hole
+case "$OS_TYPE" in
+    debian|ubuntu)
+        echo "Installing Pi-hole..."
+        lxc_exec_live "$VMID" "apt-get update"
+        lxc_exec_live "$VMID" "apt-get install -y curl"
+
+        # Create setup vars for unattended install
+        lxc_exec "$VMID" "mkdir -p /etc/pihole"
+        lxc_exec "$VMID" "cat > /etc/pihole/setupVars.conf << 'SETUPEOF'
+PIHOLE_INTERFACE=eth0
+IPV4_ADDRESS=0.0.0.0
+IPV6_ADDRESS=
+QUERY_LOGGING=true
+INSTALL_WEB_SERVER=true
+INSTALL_WEB_INTERFACE=true
+LIGHTTPD_ENABLED=true
+CACHE_SIZE=10000
+DNS_FQDN_REQUIRED=true
+DNS_BOGUS_PRIV=true
+DNSMASQ_LISTENING=all
+WEBPASSWORD=admin
+BLOCKING_ENABLED=true
+PIHOLE_DNS_1=8.8.8.8
+PIHOLE_DNS_2=8.8.4.4
+SETUPEOF"
+
+        # Run Pi-hole installer
+        lxc_exec_live "$VMID" "curl -sSL https://install.pi-hole.net | bash /dev/stdin --unattended"
+
+        echo ""
+        echo "Pi-hole installed. Admin password: admin"
+        echo "Change password with: pihole -a -p <newpassword>"
+        ;;
+    *)
+        echo "ERROR: Unsupported OS for native Pi-hole installation"
+        exit 1
+        ;;
+esac
+INSTALLEOF
+
+    # remove.sh
+    cat > "$dir/remove.sh" << 'EOF'
+#!/bin/bash
+# Removal script for Pi-hole
+if lxc_exec "$VMID" "test -f /etc/.pihole/automated\ install/uninstall.sh" 2>/dev/null; then
+    lxc_exec_live "$VMID" "pihole uninstall --unattended 2>/dev/null || true"
+else
+    lxc_exec_live "$VMID" "systemctl stop pihole-FTL 2>/dev/null || true"
+    lxc_exec_live "$VMID" "systemctl stop lighttpd 2>/dev/null || true"
+    lxc_exec_live "$VMID" "systemctl disable pihole-FTL 2>/dev/null || true"
+    lxc_exec_live "$VMID" "systemctl disable lighttpd 2>/dev/null || true"
+    lxc_exec_live "$VMID" "rm -rf /etc/pihole /etc/.pihole /opt/pihole /var/www/html/admin"
+    lxc_exec_live "$VMID" "rm -f /usr/local/bin/pihole"
+    lxc_exec_live "$VMID" "rm -rf /etc/lighttpd"
+    lxc_exec_live "$VMID" "apt-get purge -y pihole-FTL lighttpd 2>/dev/null || true"
+    lxc_exec_live "$VMID" "apt-get autoremove -y 2>/dev/null || true"
+fi
+lxc_exec_live "$VMID" "rm -f /etc/resolv.conf"
+lxc_exec_live "$VMID" "echo 'nameserver 8.8.8.8' > /etc/resolv.conf"
+EOF
+}
+
+# Create keycloak plugin
+create_plugin_keycloak() {
+    local dir
+    dir=$(create_plugin_dir "keycloak")
+
+    # plugin.conf
+    cat > "$dir/plugin.conf" << 'EOF'
+PLUGIN_ID="keycloak"
+PLUGIN_NAME="Keycloak"
+PLUGIN_VERSION="latest"
+PLUGIN_CATEGORY="infrastructure"
+PLUGIN_DESCRIPTION="Identity and access management"
+PLUGIN_DOCKER_SUPPORT="true"
+PLUGIN_NATIVE_SUPPORT="false"
+PLUGIN_DOCKER_PORT="8080"
+PLUGIN_DOCKER_URL="http://{IP}:8080"
+PLUGIN_DOCKER_CREDENTIALS="admin/admin"
+PLUGIN_DOCKER_CONTAINER="keycloak"
+EOF
+
+    # compose.yml
+    cat > "$dir/compose.yml" << 'EOF'
+version: '3.8'
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:latest
+    container_name: keycloak
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    environment:
+      - KEYCLOAK_ADMIN=admin
+      - KEYCLOAK_ADMIN_PASSWORD=${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      - KC_DB=postgres
+      - KC_DB_URL=jdbc:postgresql://keycloak-db:5432/keycloak
+      - KC_DB_USERNAME=keycloak
+      - KC_DB_PASSWORD=${KEYCLOAK_DB_PASSWORD:-keycloak}
+      - KC_HOSTNAME_STRICT=false
+      - KC_HTTP_ENABLED=true
+      - KC_PROXY=edge
+    command:
+      - start-dev
+    ports:
+      - "8080:8080"
+    depends_on:
+      keycloak-db:
+        condition: service_healthy
+
+  keycloak-db:
+    image: postgres:15-alpine
+    container_name: keycloak-db
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    environment:
+      - POSTGRES_USER=keycloak
+      - POSTGRES_PASSWORD=${KEYCLOAK_DB_PASSWORD:-keycloak}
+      - POSTGRES_DB=keycloak
+    volumes:
+      - keycloak_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "keycloak", "-d", "keycloak"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  keycloak_db:
+EOF
+}
+
+# Create freeipa plugin
+create_plugin_freeipa() {
+    local dir
+    dir=$(create_plugin_dir "freeipa")
+
+    # plugin.conf
+    cat > "$dir/plugin.conf" << 'EOF'
+PLUGIN_ID="freeipa"
+PLUGIN_NAME="FreeIPA"
+PLUGIN_VERSION="fedora-43-4.13.0"
+PLUGIN_CATEGORY="infrastructure"
+PLUGIN_DESCRIPTION="Identity management system"
+PLUGIN_DOCKER_SUPPORT="true"
+PLUGIN_NATIVE_SUPPORT="false"
+PLUGIN_DOCKER_PORT="443"
+PLUGIN_DOCKER_URL="Web UI: https://{IP}/\nLDAP: ldap://{IP}:389\nKerberos: {IP}:88\n\nDefault admin password: Admin123\nNote: First startup takes 5-10 minutes\nCheck logs: docker logs -f freeipa"
+PLUGIN_DOCKER_CREDENTIALS="admin / Admin123"
+PLUGIN_DOCKER_CONTAINER="freeipa"
+EOF
+
+    # compose.yml - FreeIPA requires special handling for LXC+Docker
+    cat > "$dir/compose.yml" << 'EOF'
+version: '3.8'
+services:
+  freeipa:
+    image: freeipa/freeipa-server:fedora-43-4.13.0
+    container_name: freeipa
+    hostname: ipa.local
+    restart: unless-stopped
+    privileged: true
+    stdin_open: true
+    tty: true
+    security_opt:
+      - seccomp:unconfined
+      - apparmor:unconfined
+    cgroup: host
+    environment:
+      - PASSWORD=Admin123
+    command:
+      - -U
+      - --realm=LOCAL
+      - --domain=local
+      - --ds-password=Admin123
+      - --admin-password=Admin123
+      - --no-ntp
+      - --no-host-dns
+      - --setup-dns
+      - --no-forwarders
+      - --allow-zone-overlap
+    ports:
+      - "80:80"
+      - "443:443"
+      - "389:389"
+      - "636:636"
+      - "88:88"
+      - "88:88/udp"
+      - "464:464"
+      - "464:464/udp"
+      - "53:53"
+      - "53:53/udp"
+    volumes:
+      - freeipa_data:/data
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    tmpfs:
+      - /run
+      - /tmp
+
+volumes:
+  freeipa_data:
+EOF
+
+    # Create a helper script for manual docker run (fallback if compose fails)
+    cat > "$dir/run.sh" << 'RUNEOF'
+#!/bin/bash
+# Manual FreeIPA run command - use if docker-compose fails
+# This provides more control over cgroup settings
+
+docker run -d \
+    --name freeipa \
+    --hostname ipa.local \
+    --privileged \
+    --security-opt seccomp=unconfined \
+    --security-opt apparmor=unconfined \
+    --cgroupns=host \
+    -e PASSWORD=Admin123 \
+    -p 80:80 -p 443:443 \
+    -p 389:389 -p 636:636 \
+    -p 88:88 -p 88:88/udp \
+    -p 464:464 -p 464:464/udp \
+    -p 53:53 -p 53:53/udp \
+    -v freeipa_data:/data \
+    -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+    --tmpfs /run --tmpfs /tmp \
+    freeipa/freeipa-server:fedora-43-4.13.0 \
+    -U --realm=LOCAL --domain=local \
+    --ds-password=Admin123 --admin-password=Admin123 \
+    --no-ntp --no-host-dns \
+    --setup-dns --no-forwarders --allow-zone-overlap
+
+echo "FreeIPA container started. Check logs with: docker logs -f freeipa"
+echo "First startup takes 5-10 minutes for initial configuration."
+RUNEOF
+    chmod +x "$dir/run.sh"
+}
+
+# Create postfix-relay plugin
+create_plugin_postfix_relay() {
+    local dir
+    dir=$(create_plugin_dir "postfix-relay")
+
+    # plugin.conf
+    cat > "$dir/plugin.conf" << 'EOF'
+PLUGIN_ID="postfix-relay"
+PLUGIN_NAME="Postfix Relay"
+PLUGIN_VERSION="latest"
+PLUGIN_CATEGORY="infrastructure"
+PLUGIN_DESCRIPTION="SMTP relay server"
+PLUGIN_DOCKER_SUPPORT="true"
+PLUGIN_NATIVE_SUPPORT="false"
+PLUGIN_DOCKER_PORT="25"
+PLUGIN_DOCKER_URL="SMTP: {IP}:25\nSubmission: {IP}:587"
+PLUGIN_DOCKER_CREDENTIALS=""
+PLUGIN_DOCKER_CONTAINER="postfix-relay"
+EOF
+
+    # compose.yml
+    cat > "$dir/compose.yml" << 'EOF'
+version: '3.8'
+services:
+  postfix:
+    image: boky/postfix:latest
+    container_name: postfix-relay
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    environment:
+      - ALLOWED_SENDER_DOMAINS=${POSTFIX_ALLOWED_DOMAINS:-example.com}
+      - HOSTNAME=${POSTFIX_HOSTNAME:-mail.example.com}
+      - RELAYHOST=${POSTFIX_RELAYHOST:-}
+      - RELAYHOST_USERNAME=${POSTFIX_RELAY_USER:-}
+      - RELAYHOST_PASSWORD=${POSTFIX_RELAY_PASS:-}
+      - SMTP_TLS_SECURITY_LEVEL=may
+      - MESSAGE_SIZE_LIMIT=52428800
+    ports:
+      - "25:25"
+      - "587:587"
+    volumes:
+      - postfix_spool:/var/spool/postfix
+      - postfix_logs:/var/log
+
+volumes:
+  postfix_spool:
+  postfix_logs:
+EOF
+}
+
+# Create traefik plugin
+create_plugin_traefik() {
+    local dir
+    dir=$(create_plugin_dir "traefik")
+
+    # plugin.conf
+    cat > "$dir/plugin.conf" << 'EOF'
+PLUGIN_ID="traefik"
+PLUGIN_NAME="Traefik"
+PLUGIN_VERSION="latest"
+PLUGIN_CATEGORY="infrastructure"
+PLUGIN_DESCRIPTION="Modern reverse proxy and load balancer"
+PLUGIN_DOCKER_SUPPORT="true"
+PLUGIN_NATIVE_SUPPORT="false"
+PLUGIN_DOCKER_PORT="8080"
+PLUGIN_DOCKER_URL="Dashboard: http://{IP}:8080\nHTTP: http://{IP}\nHTTPS: https://{IP}"
+PLUGIN_DOCKER_CREDENTIALS=""
+PLUGIN_DOCKER_CONTAINER="traefik"
+EOF
+
+    # compose.yml
+    cat > "$dir/compose.yml" << 'EOF'
+version: '3.8'
+services:
+  traefik:
+    image: traefik:latest
+    container_name: traefik
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./dynamic:/etc/traefik/dynamic:ro
+      - /etc/ssl/pve-manager:/etc/ssl/certs:ro
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--providers.file.directory=/etc/traefik/dynamic"
+EOF
+
+    # traefik.yml (extra config)
+    cat > "$dir/traefik.yml" << 'EOF'
+api:
+  dashboard: true
+  insecure: true
+
+entryPoints:
+  web:
+    address: ":80"
+  websecure:
+    address: ":443"
+
+providers:
+  docker:
+    endpoint: "unix:///var/run/docker.sock"
+    exposedByDefault: false
+  file:
+    directory: "/etc/traefik/dynamic"
+    watch: true
+EOF
+}
+
+#######################################
+# CONFIGURATION FUNCTIONS
+#######################################
 
 # Load configuration
 load_config() {
@@ -567,8 +2741,9 @@ pve_exec() {
     if [[ "$IS_LOCAL_PVE" == true ]]; then
         eval "$cmd"
     else
+        # Note: < /dev/null prevents consuming stdin (important in while loops)
         ssh -o ConnectTimeout=10 -p "$CURRENT_PVE_PORT" \
-            "${CURRENT_PVE_USER}@${CURRENT_PVE_HOST}" "$cmd"
+            "${CURRENT_PVE_USER}@${CURRENT_PVE_HOST}" "$cmd" < /dev/null
     fi
 }
 
@@ -579,8 +2754,9 @@ pve_exec_live() {
     if [[ "$IS_LOCAL_PVE" == true ]]; then
         eval "$cmd" 2>&1
     else
+        # Note: < /dev/null prevents consuming stdin (important in while loops)
         ssh -o ConnectTimeout=10 -p "$CURRENT_PVE_PORT" \
-            "${CURRENT_PVE_USER}@${CURRENT_PVE_HOST}" "$cmd" 2>&1
+            "${CURRENT_PVE_USER}@${CURRENT_PVE_HOST}" "$cmd" < /dev/null 2>&1
     fi
 }
 
@@ -1162,15 +3338,17 @@ lxc_exec() {
 
     if [[ "$IS_LOCAL_PVE" == true ]]; then
         # Local: use bash -c with proper quoting
-        pct exec "$vmid" -- /bin/bash -c "$cmd"
+        # Note: < /dev/null prevents consuming stdin (important in while loops)
+        pct exec "$vmid" -- /bin/bash -c "$cmd" < /dev/null
     else
         # Remote: use base64 encoding to avoid escaping issues
         local cmd_b64
         cmd_b64=$(echo -n "$cmd" | base64 -w0)
         # Pass base64 command and decode on remote
+        # Note: < /dev/null prevents consuming stdin (important in while loops)
         ssh -o ConnectTimeout=10 -p "$CURRENT_PVE_PORT" \
             "${CURRENT_PVE_USER}@${CURRENT_PVE_HOST}" \
-            "echo $cmd_b64 | base64 -d | pct exec $vmid -- /bin/bash -s"
+            "echo $cmd_b64 | base64 -d | pct exec $vmid -- /bin/bash -s" < /dev/null
     fi
 }
 
@@ -1182,13 +3360,15 @@ lxc_exec_timeout() {
     local cmd="$*"
 
     if [[ "$IS_LOCAL_PVE" == true ]]; then
-        timeout "$timeout_secs" pct exec "$vmid" -- /bin/bash -c "$cmd"
+        # Note: < /dev/null prevents consuming stdin (important in while loops)
+        timeout "$timeout_secs" pct exec "$vmid" -- /bin/bash -c "$cmd" < /dev/null
     else
         local cmd_b64
         cmd_b64=$(echo -n "$cmd" | base64 -w0)
+        # Note: < /dev/null prevents consuming stdin (important in while loops)
         timeout "$timeout_secs" ssh -o ConnectTimeout=5 -p "$CURRENT_PVE_PORT" \
             "${CURRENT_PVE_USER}@${CURRENT_PVE_HOST}" \
-            "echo $cmd_b64 | base64 -d | pct exec $vmid -- /bin/bash -s"
+            "echo $cmd_b64 | base64 -d | pct exec $vmid -- /bin/bash -s" < /dev/null
     fi
 }
 
@@ -1199,13 +3379,15 @@ lxc_exec_live() {
     local cmd="$*"
 
     if [[ "$IS_LOCAL_PVE" == true ]]; then
-        pct exec "$vmid" -- /bin/bash -c "$cmd" 2>&1
+        # Note: < /dev/null prevents consuming stdin (important in while loops)
+        pct exec "$vmid" -- /bin/bash -c "$cmd" < /dev/null 2>&1
     else
         local cmd_b64
         cmd_b64=$(echo -n "$cmd" | base64 -w0)
+        # Note: < /dev/null prevents consuming stdin (important in while loops)
         ssh -o ConnectTimeout=10 -p "$CURRENT_PVE_PORT" \
             "${CURRENT_PVE_USER}@${CURRENT_PVE_HOST}" \
-            "echo $cmd_b64 | base64 -d | pct exec $vmid -- /bin/bash -s" 2>&1
+            "echo $cmd_b64 | base64 -d | pct exec $vmid -- /bin/bash -s" < /dev/null 2>&1
     fi
 }
 
@@ -3535,824 +5717,15 @@ certificate_menu() {
 get_service_compose() {
     local service="$1"
 
-    case "$service" in
-        prometheus)
-            cat << 'EOF'
-version: '3.8'
-services:
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: prometheus
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    ports:
-      - "9090:9090"
-    volumes:
-      - prometheus_data:/prometheus
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--web.enable-lifecycle'
+    # Use plugin system
+    if is_plugin_service "$service" && plugin_supports_docker "$service"; then
+        get_plugin_compose "$service"
+        return
+    fi
 
-volumes:
-  prometheus_data:
-EOF
-            ;;
-        grafana)
-            cat << 'EOF'
-version: '3.8'
-services:
-  grafana:
-    image: grafana/grafana:latest
-    container_name: grafana
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    ports:
-      - "3000:3000"
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
-      - GF_SERVER_ROOT_URL=${GRAFANA_URL:-http://localhost:3000}
-    volumes:
-      - grafana_data:/var/lib/grafana
-
-volumes:
-  grafana_data:
-EOF
-            ;;
-        loki)
-            cat << 'EOF'
-version: '3.8'
-services:
-  loki:
-    image: grafana/loki:latest
-    container_name: loki
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    ports:
-      - "3100:3100"
-    volumes:
-      - loki_data:/loki
-    command: -config.file=/etc/loki/local-config.yaml
-
-volumes:
-  loki_data:
-EOF
-            ;;
-        alloy)
-            cat << 'EOF'
-version: '3.8'
-services:
-  alloy:
-    image: grafana/alloy:latest
-    container_name: alloy
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    ports:
-      - "12345:12345"
-    volumes:
-      - ./config.alloy:/etc/alloy/config.alloy:ro
-      - /var/log:/var/log:ro
-    command:
-      - run
-      - /etc/alloy/config.alloy
-      - --server.http.listen-addr=0.0.0.0:12345
-EOF
-            ;;
-        node-exporter)
-            cat << 'EOF'
-version: '3.8'
-services:
-  node-exporter:
-    image: prom/node-exporter:latest
-    container_name: node-exporter
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    ports:
-      - "9100:9100"
-    volumes:
-      - /proc:/host/proc:ro
-      - /sys:/host/sys:ro
-      - /:/rootfs:ro
-    command:
-      - '--path.procfs=/host/proc'
-      - '--path.sysfs=/host/sys'
-      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
-EOF
-            ;;
-        monitoring-stack)
-            cat << 'EOF'
-version: '3.8'
-services:
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: prometheus
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    ports:
-      - "9090:9090"
-    volumes:
-      - prometheus_data:/prometheus
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--web.enable-lifecycle'
-
-  grafana:
-    image: grafana/grafana:latest
-    container_name: grafana
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    ports:
-      - "3000:3000"
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
-    volumes:
-      - grafana_data:/var/lib/grafana
-    depends_on:
-      - prometheus
-
-  loki:
-    image: grafana/loki:latest
-    container_name: loki
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    ports:
-      - "3100:3100"
-    volumes:
-      - loki_data:/loki
-    command: -config.file=/etc/loki/local-config.yaml
-
-  node-exporter:
-    image: prom/node-exporter:latest
-    container_name: node-exporter
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    ports:
-      - "9100:9100"
-    volumes:
-      - /proc:/host/proc:ro
-      - /sys:/host/sys:ro
-      - /:/rootfs:ro
-    command:
-      - '--path.procfs=/host/proc'
-      - '--path.sysfs=/host/sys'
-      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
-
-volumes:
-  prometheus_data:
-  grafana_data:
-  loki_data:
-EOF
-            ;;
-        sonarqube)
-            cat << 'EOF'
-version: '3.8'
-services:
-  sonarqube:
-    image: sonarqube:community
-    container_name: sonarqube
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    ports:
-      - "9000:9000"
-    environment:
-      - SONAR_JDBC_URL=jdbc:postgresql://sonarqube-db:5432/sonar
-      - SONAR_JDBC_USERNAME=sonar
-      - SONAR_JDBC_PASSWORD=${SONAR_DB_PASSWORD:-sonar}
-    volumes:
-      - sonarqube_data:/opt/sonarqube/data
-      - sonarqube_extensions:/opt/sonarqube/extensions
-      - sonarqube_logs:/opt/sonarqube/logs
-    depends_on:
-      sonarqube-db:
-        condition: service_healthy
-
-  sonarqube-db:
-    image: postgres:15
-    container_name: sonarqube-db
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    environment:
-      - POSTGRES_USER=sonar
-      - POSTGRES_PASSWORD=${SONAR_DB_PASSWORD:-sonar}
-      - POSTGRES_DB=sonar
-    volumes:
-      - sonarqube_db:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD", "pg_isready", "-U", "sonar", "-d", "sonar"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
-
-volumes:
-  sonarqube_data:
-  sonarqube_extensions:
-  sonarqube_logs:
-  sonarqube_db:
-EOF
-            ;;
-        nexus)
-            cat << 'EOF'
-version: '3.8'
-services:
-  nexus:
-    image: sonatype/nexus3:latest
-    container_name: nexus
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    ports:
-      - "8081:8081"
-      - "8082:8082"
-      - "8083:8083"
-    volumes:
-      - nexus_data:/nexus-data
-
-volumes:
-  nexus_data:
-EOF
-            ;;
-        gitea)
-            cat << 'EOF'
-version: '3.8'
-services:
-  gitea:
-    image: gitea/gitea:latest
-    container_name: gitea
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    ports:
-      - "3000:3000"
-      - "2222:22"
-    environment:
-      - USER_UID=1000
-      - USER_GID=1000
-      - GITEA__database__DB_TYPE=postgres
-      - GITEA__database__HOST=gitea-db:5432
-      - GITEA__database__NAME=gitea
-      - GITEA__database__USER=gitea
-      - GITEA__database__PASSWD=${GITEA_DB_PASSWORD:-gitea}
-    volumes:
-      - gitea_data:/data
-      - /etc/timezone:/etc/timezone:ro
-      - /etc/localtime:/etc/localtime:ro
-    depends_on:
-      gitea-db:
-        condition: service_healthy
-
-  gitea-db:
-    image: postgres:15
-    container_name: gitea-db
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    environment:
-      - POSTGRES_USER=gitea
-      - POSTGRES_PASSWORD=${GITEA_DB_PASSWORD:-gitea}
-      - POSTGRES_DB=gitea
-    volumes:
-      - gitea_db:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD", "pg_isready", "-U", "gitea", "-d", "gitea"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
-
-volumes:
-  gitea_data:
-  gitea_db:
-EOF
-            ;;
-        jenkins)
-            cat << 'EOF'
-version: '3.8'
-services:
-  jenkins:
-    image: jenkins/jenkins:lts
-    container_name: jenkins
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    ports:
-      - "8080:8080"
-      - "50000:50000"
-    volumes:
-      - jenkins_home:/var/jenkins_home
-      - /var/run/docker.sock:/var/run/docker.sock
-
-volumes:
-  jenkins_home:
-EOF
-            ;;
-        kiwi-tcms)
-            cat << 'EOF'
-version: '3.8'
-services:
-  kiwi:
-    image: kiwitcms/kiwi:latest
-    container_name: kiwi-tcms
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    ports:
-      - "8080:8080"
-      - "8443:8443"
-    environment:
-      - KIWI_DB_ENGINE=django.db.backends.postgresql
-      - KIWI_DB_HOST=kiwi-db
-      - KIWI_DB_PORT=5432
-      - KIWI_DB_NAME=kiwi
-      - KIWI_DB_USER=kiwi
-      - KIWI_DB_PASSWORD=${KIWI_DB_PASSWORD:-kiwi}
-    volumes:
-      - kiwi_uploads:/Kiwi/uploads
-    depends_on:
-      kiwi-db:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-k", "-f", "https://localhost:8443/"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 120s
-
-  kiwi-db:
-    image: postgres:15
-    container_name: kiwi-db
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    environment:
-      - POSTGRES_USER=kiwi
-      - POSTGRES_PASSWORD=${KIWI_DB_PASSWORD:-kiwi}
-      - POSTGRES_DB=kiwi
-    volumes:
-      - kiwi_db:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD", "pg_isready", "-U", "kiwi", "-d", "kiwi"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
-
-volumes:
-  kiwi_uploads:
-  kiwi_db:
-EOF
-            ;;
-        selenium-grid)
-            cat << 'EOF'
-version: '3.8'
-services:
-  selenium-hub:
-    image: selenium/hub:latest
-    container_name: selenium-hub
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    ports:
-      - "4442:4442"
-      - "4443:4443"
-      - "4444:4444"
-
-  chrome:
-    image: selenium/node-chrome:latest
-    container_name: selenium-chrome
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    depends_on:
-      - selenium-hub
-    environment:
-      - SE_EVENT_BUS_HOST=selenium-hub
-      - SE_EVENT_BUS_PUBLISH_PORT=4442
-      - SE_EVENT_BUS_SUBSCRIBE_PORT=4443
-    shm_size: '2gb'
-
-  firefox:
-    image: selenium/node-firefox:latest
-    container_name: selenium-firefox
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    depends_on:
-      - selenium-hub
-    environment:
-      - SE_EVENT_BUS_HOST=selenium-hub
-      - SE_EVENT_BUS_PUBLISH_PORT=4442
-      - SE_EVENT_BUS_SUBSCRIBE_PORT=4443
-    shm_size: '2gb'
-EOF
-            ;;
-        testlink)
-            cat << 'EOF'
-version: '3.8'
-services:
-  testlink:
-    image: bitnami/testlink:latest
-    container_name: testlink
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    ports:
-      - "80:8080"
-      - "443:8443"
-    environment:
-      - TESTLINK_DATABASE_HOST=testlink-db
-      - TESTLINK_DATABASE_PORT_NUMBER=3306
-      - TESTLINK_DATABASE_NAME=testlink
-      - TESTLINK_DATABASE_USER=testlink
-      - TESTLINK_DATABASE_PASSWORD=${TESTLINK_DB_PASSWORD:-testlink123}
-      - TESTLINK_USERNAME=admin
-      - TESTLINK_PASSWORD=${TESTLINK_ADMIN_PASSWORD:-admin123}
-      - TESTLINK_EMAIL=admin@example.com
-      - ALLOW_EMPTY_PASSWORD=no
-    volumes:
-      - testlink_data:/bitnami/testlink
-    depends_on:
-      testlink-db:
-        condition: service_healthy
-
-  testlink-db:
-    image: mariadb:10.11
-    container_name: testlink-db
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    environment:
-      - MARIADB_ROOT_PASSWORD=${TESTLINK_ROOT_PASSWORD:-rootpassword}
-      - MARIADB_DATABASE=testlink
-      - MARIADB_USER=testlink
-      - MARIADB_PASSWORD=${TESTLINK_DB_PASSWORD:-testlink123}
-    volumes:
-      - testlink_db:/var/lib/mysql
-    healthcheck:
-      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 60s
-
-volumes:
-  testlink_data:
-  testlink_db:
-EOF
-            ;;
-        harbor)
-            cat << 'EOF'
-version: '3.8'
-services:
-  harbor-core:
-    image: goharbor/harbor-core:v2.10.0
-    container_name: harbor-core
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    environment:
-      - CONFIG_PATH=/etc/harbor/app.conf
-    volumes:
-      - harbor_data:/data
-      - ./harbor.yml:/etc/harbor/app.conf:ro
-    depends_on:
-      - harbor-db
-      - harbor-redis
-
-  harbor-portal:
-    image: goharbor/harbor-portal:v2.10.0
-    container_name: harbor-portal
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    ports:
-      - "80:8080"
-    depends_on:
-      - harbor-core
-
-  harbor-db:
-    image: goharbor/harbor-db:v2.10.0
-    container_name: harbor-db
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=${HARBOR_DB_PASSWORD:-Harbor12345}
-    volumes:
-      - harbor_db:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD", "pg_isready", "-U", "postgres"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-
-  harbor-redis:
-    image: goharbor/redis-photon:v2.10.0
-    container_name: harbor-redis
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    volumes:
-      - harbor_redis:/var/lib/redis
-
-  harbor-registry:
-    image: goharbor/registry-photon:v2.10.0
-    container_name: harbor-registry
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    ports:
-      - "5000:5000"
-    volumes:
-      - harbor_registry:/storage
-    environment:
-      - REGISTRY_HTTP_SECRET=${HARBOR_SECRET:-harbor-secret-key}
-
-  harbor-jobservice:
-    image: goharbor/harbor-jobservice:v2.10.0
-    container_name: harbor-jobservice
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    depends_on:
-      - harbor-core
-      - harbor-redis
-
-volumes:
-  harbor_data:
-  harbor_db:
-  harbor_redis:
-  harbor_registry:
-EOF
-            ;;
-        pihole)
-            cat << 'EOF'
-version: '3.8'
-services:
-  pihole:
-    image: pihole/pihole:latest
-    container_name: pihole
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    ports:
-      - "53:53/tcp"
-      - "53:53/udp"
-      - "80:80/tcp"
-    environment:
-      - TZ=${PIHOLE_TZ:-UTC}
-      - WEBPASSWORD=${PIHOLE_PASSWORD:-admin}
-      - FTLCONF_LOCAL_IPV4=${PIHOLE_IP:-}
-      - DNSMASQ_LISTENING=all
-    volumes:
-      - pihole_data:/etc/pihole
-      - pihole_dnsmasq:/etc/dnsmasq.d
-    cap_add:
-      - NET_ADMIN
-
-volumes:
-  pihole_data:
-  pihole_dnsmasq:
-EOF
-            ;;
-        dependency-track)
-            cat << 'EOF'
-version: '3.8'
-services:
-  dtrack-apiserver:
-    image: dependencytrack/apiserver:latest
-    container_name: dtrack-apiserver
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    environment:
-      - ALPINE_DATABASE_MODE=external
-      - ALPINE_DATABASE_URL=jdbc:postgresql://dtrack-db:5432/dtrack
-      - ALPINE_DATABASE_DRIVER=org.postgresql.Driver
-      - ALPINE_DATABASE_USERNAME=dtrack
-      - ALPINE_DATABASE_PASSWORD=${DTRACK_DB_PASSWORD:-dtrack}
-      - ALPINE_SECRET_KEY_PATH=/data/.secret.key
-      # Increase memory for larger BOMs
-      - JAVA_OPTIONS=-Xmx4g -Xms2g
-    volumes:
-      - dtrack_data:/data
-    ports:
-      - "8081:8080"
-    depends_on:
-      dtrack-db:
-        condition: service_healthy
-
-  dtrack-frontend:
-    image: dependencytrack/frontend:latest
-    container_name: dtrack-frontend
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    environment:
-      - API_BASE_URL=http://localhost:8081
-    ports:
-      - "8080:8080"
-    depends_on:
-      - dtrack-apiserver
-
-  dtrack-db:
-    image: postgres:15-alpine
-    container_name: dtrack-db
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    environment:
-      - POSTGRES_USER=dtrack
-      - POSTGRES_PASSWORD=${DTRACK_DB_PASSWORD:-dtrack}
-      - POSTGRES_DB=dtrack
-    volumes:
-      - dtrack_db:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD", "pg_isready", "-U", "dtrack", "-d", "dtrack"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
-
-volumes:
-  dtrack_data:
-  dtrack_db:
-EOF
-            ;;
-        keycloak)
-            cat << 'EOF'
-version: '3.8'
-services:
-  keycloak:
-    image: quay.io/keycloak/keycloak:latest
-    container_name: keycloak
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    environment:
-      - KEYCLOAK_ADMIN=admin
-      - KEYCLOAK_ADMIN_PASSWORD=${KEYCLOAK_ADMIN_PASSWORD:-admin}
-      - KC_DB=postgres
-      - KC_DB_URL=jdbc:postgresql://keycloak-db:5432/keycloak
-      - KC_DB_USERNAME=keycloak
-      - KC_DB_PASSWORD=${KEYCLOAK_DB_PASSWORD:-keycloak}
-      - KC_HOSTNAME_STRICT=false
-      - KC_HTTP_ENABLED=true
-      - KC_PROXY=edge
-    command:
-      - start-dev
-    ports:
-      - "8080:8080"
-    depends_on:
-      keycloak-db:
-        condition: service_healthy
-
-  keycloak-db:
-    image: postgres:15-alpine
-    container_name: keycloak-db
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    environment:
-      - POSTGRES_USER=keycloak
-      - POSTGRES_PASSWORD=${KEYCLOAK_DB_PASSWORD:-keycloak}
-      - POSTGRES_DB=keycloak
-    volumes:
-      - keycloak_db:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD", "pg_isready", "-U", "keycloak", "-d", "keycloak"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
-
-volumes:
-  keycloak_db:
-EOF
-            ;;
-        freeipa)
-            cat << 'EOF'
-version: '3.8'
-services:
-  freeipa:
-    image: freeipa/freeipa-server:fedora-39
-    container_name: freeipa
-    restart: unless-stopped
-    hostname: ipa.example.lan
-    security_opt:
-      - apparmor:unconfined
-    sysctls:
-      - net.ipv6.conf.all.disable_ipv6=0
-    environment:
-      - IPA_SERVER_HOSTNAME=ipa.example.lan
-      - IPA_SERVER_INSTALL_OPTS=-U -r EXAMPLE.LAN --no-ntp --no-host-dns
-    ports:
-      - "80:80"
-      - "443:443"
-      - "389:389"
-      - "636:636"
-      - "88:88"
-      - "88:88/udp"
-      - "464:464"
-      - "464:464/udp"
-      - "123:123/udp"
-    volumes:
-      - freeipa_data:/data
-      - /sys/fs/cgroup:/sys/fs/cgroup:ro
-    tmpfs:
-      - /run
-      - /tmp
-    read_only: true
-    # Note: First run will take several minutes for initial setup
-    # Check logs: docker logs -f freeipa
-
-volumes:
-  freeipa_data:
-EOF
-            ;;
-        postfix-relay)
-            cat << 'EOF'
-version: '3.8'
-services:
-  postfix:
-    image: boky/postfix:latest
-    container_name: postfix-relay
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    environment:
-      # Basic configuration
-      - ALLOWED_SENDER_DOMAINS=${POSTFIX_ALLOWED_DOMAINS:-example.com}
-      - HOSTNAME=${POSTFIX_HOSTNAME:-mail.example.com}
-      # Relay configuration (optional - for external SMTP)
-      - RELAYHOST=${POSTFIX_RELAYHOST:-}
-      - RELAYHOST_USERNAME=${POSTFIX_RELAY_USER:-}
-      - RELAYHOST_PASSWORD=${POSTFIX_RELAY_PASS:-}
-      # TLS settings
-      - SMTP_TLS_SECURITY_LEVEL=may
-      # Message size limit (50MB)
-      - MESSAGE_SIZE_LIMIT=52428800
-    ports:
-      - "25:25"
-      - "587:587"
-    volumes:
-      - postfix_spool:/var/spool/postfix
-      - postfix_logs:/var/log
-
-volumes:
-  postfix_spool:
-  postfix_logs:
-EOF
-            ;;
-        traefik)
-            cat << 'EOF'
-version: '3.8'
-services:
-  traefik:
-    image: traefik:latest
-    container_name: traefik
-    restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
-    ports:
-      - "80:80"
-      - "443:443"
-      - "8080:8080"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./traefik.yml:/etc/traefik/traefik.yml:ro
-      - ./dynamic:/etc/traefik/dynamic:ro
-      - /etc/ssl/pve-manager:/etc/ssl/certs:ro
-    command:
-      - "--api.insecure=true"
-      - "--providers.docker=true"
-      - "--providers.docker.exposedbydefault=false"
-      - "--entrypoints.web.address=:80"
-      - "--entrypoints.websecure.address=:443"
-      - "--providers.file.directory=/etc/traefik/dynamic"
-EOF
-            ;;
-        *)
-            echo ""
-            return 1
-            ;;
-    esac
+    # Service not found
+    log_error "Unknown service: $service"
+    return 1
 }
 
 # Get prometheus config for monitoring
@@ -4414,6 +5787,18 @@ deploy_service_native() {
 
     log_info "Deploying $service natively to container $vmid"
 
+    # Check if plugin supports native installation
+    if ! is_plugin_service "$service" || ! plugin_supports_native "$service"; then
+        log_error "Native installation not available for $service"
+        return 1
+    fi
+
+    local install_script="${PLUGINS[$service]}/install.sh"
+    if [[ ! -f "$install_script" ]]; then
+        log_error "Install script not found for $service"
+        return 1
+    fi
+
     # Initialize result file
     echo "0" > "$deploy_result_file"
 
@@ -4427,991 +5812,36 @@ deploy_service_native() {
         echo "OS: $os_type"
         echo ""
 
-        case "$service" in
-            grafana)
-                echo "Installing Grafana..."
-                case "$os_type" in
-                    debian|ubuntu)
-                        lxc_exec_live "$vmid" "apt-get update"
-                        lxc_exec_live "$vmid" "apt-get install -y apt-transport-https software-properties-common wget"
-                        lxc_exec_live "$vmid" "wget -q -O /usr/share/keyrings/grafana.key https://apt.grafana.com/gpg.key"
-                        lxc_exec_live "$vmid" "echo 'deb [signed-by=/usr/share/keyrings/grafana.key] https://apt.grafana.com stable main' | tee /etc/apt/sources.list.d/grafana.list"
-                        lxc_exec_live "$vmid" "apt-get update"
-                        lxc_exec_live "$vmid" "apt-get install -y grafana"
-                        lxc_exec_live "$vmid" "systemctl daemon-reload"
-                        lxc_exec_live "$vmid" "systemctl enable grafana-server"
-                        lxc_exec_live "$vmid" "systemctl start grafana-server"
-                        ;;
-                    alpine)
-                        lxc_exec_live "$vmid" "apk add --no-cache grafana"
-                        lxc_exec_live "$vmid" "rc-update add grafana"
-                        lxc_exec_live "$vmid" "rc-service grafana start"
-                        ;;
-                    *)
-                        echo "ERROR: Unsupported OS for native Grafana installation"
-                        echo "1" > "$deploy_result_file"
-                        exit 1
-                        ;;
-                esac
-                ;;
-
-            prometheus)
-                echo "Installing Prometheus..."
-                case "$os_type" in
-                    debian|ubuntu)
-                        lxc_exec_live "$vmid" "apt-get update"
-                        lxc_exec_live "$vmid" "apt-get install -y prometheus"
-                        lxc_exec_live "$vmid" "systemctl enable prometheus"
-                        lxc_exec_live "$vmid" "systemctl start prometheus"
-                        ;;
-                    alpine)
-                        lxc_exec_live "$vmid" "apk add --no-cache prometheus"
-                        lxc_exec_live "$vmid" "rc-update add prometheus"
-                        lxc_exec_live "$vmid" "rc-service prometheus start"
-                        ;;
-                    *)
-                        echo "ERROR: Unsupported OS for native Prometheus installation"
-                        echo "1" > "$deploy_result_file"
-                        exit 1
-                        ;;
-                esac
-                ;;
-
-            gitea)
-                echo "Installing Gitea..."
-                case "$os_type" in
-                    debian|ubuntu)
-                        lxc_exec_live "$vmid" "apt-get update"
-                        lxc_exec_live "$vmid" "apt-get install -y git sqlite3"
-                        lxc_exec_live "$vmid" "wget -O /usr/local/bin/gitea https://dl.gitea.com/gitea/1.21/gitea-1.21-linux-amd64"
-                        lxc_exec_live "$vmid" "chmod +x /usr/local/bin/gitea"
-                        lxc_exec_live "$vmid" "useradd -r -s /bin/bash -d /var/lib/gitea -m gitea 2>/dev/null || true"
-                        lxc_exec_live "$vmid" "mkdir -p /var/lib/gitea/{custom,data,log} /etc/gitea"
-                        lxc_exec_live "$vmid" "chown -R gitea:gitea /var/lib/gitea /etc/gitea"
-                        lxc_exec_live "$vmid" "chmod 750 /var/lib/gitea/{custom,data,log} /etc/gitea"
-                        # Create systemd service
-                        lxc_exec "$vmid" "cat > /etc/systemd/system/gitea.service << 'GITEAEOF'
-[Unit]
-Description=Gitea
-After=network.target
-
-[Service]
-Type=simple
-User=gitea
-Group=gitea
-WorkingDirectory=/var/lib/gitea
-ExecStart=/usr/local/bin/gitea web -c /etc/gitea/app.ini
-Restart=always
-Environment=USER=gitea HOME=/var/lib/gitea GITEA_WORK_DIR=/var/lib/gitea
-
-[Install]
-WantedBy=multi-user.target
-GITEAEOF"
-                        lxc_exec_live "$vmid" "systemctl daemon-reload"
-                        lxc_exec_live "$vmid" "systemctl enable gitea"
-                        lxc_exec_live "$vmid" "systemctl start gitea"
-                        ;;
-                    *)
-                        echo "ERROR: Unsupported OS for native Gitea installation"
-                        echo "1" > "$deploy_result_file"
-                        exit 1
-                        ;;
-                esac
-                ;;
-
-            jenkins)
-                echo "Installing Jenkins..."
-                case "$os_type" in
-                    debian|ubuntu)
-                        lxc_exec_live "$vmid" "apt-get update"
-                        lxc_exec_live "$vmid" "apt-get install -y fontconfig openjdk-17-jre"
-                        lxc_exec_live "$vmid" "wget -O /usr/share/keyrings/jenkins-keyring.asc https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key"
-                        lxc_exec_live "$vmid" "echo 'deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable binary/' | tee /etc/apt/sources.list.d/jenkins.list"
-                        lxc_exec_live "$vmid" "apt-get update"
-                        lxc_exec_live "$vmid" "apt-get install -y jenkins"
-                        lxc_exec_live "$vmid" "systemctl enable jenkins"
-                        lxc_exec_live "$vmid" "systemctl start jenkins"
-                        echo ""
-                        echo "Getting initial admin password..."
-                        sleep 10
-                        lxc_exec_live "$vmid" "cat /var/lib/jenkins/secrets/initialAdminPassword 2>/dev/null || echo 'Password not ready yet'"
-                        ;;
-                    *)
-                        echo "ERROR: Unsupported OS for native Jenkins installation"
-                        echo "1" > "$deploy_result_file"
-                        exit 1
-                        ;;
-                esac
-                ;;
-
-            kiwi-tcms)
-                echo "Installing Kiwi TCMS..."
-                echo "NOTE: Kiwi TCMS requires many dependencies. This may take 10-15 minutes."
-                case "$os_type" in
-                    debian|ubuntu)
-                        # Setup locales first (required for PostgreSQL)
-                        echo "Setting up locales..."
-                        lxc_exec_live "$vmid" "apt-get update"
-                        lxc_exec_live "$vmid" "apt-get install -y locales"
-                        lxc_exec_live "$vmid" "sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen"
-                        lxc_exec_live "$vmid" "locale-gen en_US.UTF-8"
-                        lxc_exec_live "$vmid" "update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8"
-
-                        # Install system dependencies including Node.js for frontend
-                        echo "Installing system dependencies..."
-                        lxc_exec_live "$vmid" "DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-pip python3-venv python3-dev gcc libpq-dev postgresql postgresql-contrib nginx git libxml2-dev libxslt1-dev libffi-dev libssl-dev cargo pkg-config curl nodejs npm"
-
-                        # Start PostgreSQL
-                        lxc_exec_live "$vmid" "systemctl enable postgresql"
-                        lxc_exec_live "$vmid" "systemctl start postgresql"
-
-                        # Wait for PostgreSQL to be ready
-                        echo "Waiting for PostgreSQL..."
-                        sleep 5
-
-                        # Verify PostgreSQL is running
-                        lxc_exec_live "$vmid" "systemctl status postgresql --no-pager || true"
-
-                        # Create database
-                        lxc_exec_live "$vmid" "sudo -u postgres psql -c \"CREATE USER kiwi WITH PASSWORD 'kiwi';\" 2>/dev/null || true"
-                        lxc_exec_live "$vmid" "sudo -u postgres psql -c \"CREATE DATABASE kiwi OWNER kiwi ENCODING 'UTF8' LC_COLLATE='en_US.UTF-8' LC_CTYPE='en_US.UTF-8' TEMPLATE template0;\" 2>/dev/null || true"
-                        lxc_exec_live "$vmid" "sudo -u postgres psql -c \"ALTER USER kiwi CREATEDB;\" 2>/dev/null || true"
-
-                        # Create kiwi user and directories
-                        lxc_exec_live "$vmid" "useradd -r -m -d /opt/kiwi -s /bin/bash kiwi 2>/dev/null || true"
-                        lxc_exec_live "$vmid" "mkdir -p /opt/kiwi /var/log/kiwi /Kiwi/static /Kiwi/uploads"
-
-                        # Clone Kiwi TCMS from GitHub
-                        echo "Cloning Kiwi TCMS from GitHub..."
-                        lxc_exec_live "$vmid" "rm -rf /opt/kiwi/Kiwi"
-                        lxc_exec_live "$vmid" "git clone --depth 1 https://github.com/kiwitcms/Kiwi.git /opt/kiwi/Kiwi"
-
-                        # Install Node.js frontend dependencies
-                        echo "Installing frontend dependencies (node_modules)..."
-                        lxc_exec_live "$vmid" "cd /opt/kiwi/Kiwi/tcms && npm install 2>/dev/null || true"
-
-                        # Create venv and install dependencies
-                        echo "Creating virtual environment and installing dependencies..."
-                        lxc_exec_live "$vmid" "python3 -m venv /opt/kiwi/venv"
-                        lxc_exec_live "$vmid" "/opt/kiwi/venv/bin/pip install --upgrade pip setuptools wheel"
-                        lxc_exec_live "$vmid" "/opt/kiwi/venv/bin/pip install psycopg2-binary gunicorn factory_boy"
-
-                        # Install Kiwi TCMS requirements
-                        echo "Installing Kiwi TCMS requirements (this may take a while)..."
-                        lxc_exec_live "$vmid" "/opt/kiwi/venv/bin/pip install -r /opt/kiwi/Kiwi/requirements/base.txt"
-
-                        # Create local settings file (uses /Kiwi/static which is Django's default)
-                        lxc_exec "$vmid" "cat > /opt/kiwi/Kiwi/tcms/settings/local.py << 'SETTINGSEOF'
-from tcms.settings.product import *
-
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': 'kiwi',
-        'USER': 'kiwi',
-        'PASSWORD': 'kiwi',
-        'HOST': 'localhost',
-        'PORT': '5432',
-    }
-}
-
-SECRET_KEY = 'change-me-to-something-secret-in-production-use-long-random-string'
-ALLOWED_HOSTS = ['*']
-DEBUG = False
-
-# Use default Kiwi static paths
-STATIC_ROOT = '/Kiwi/static'
-MEDIA_ROOT = '/Kiwi/uploads'
-
-# Disable HTTPS redirect for HTTP-only setup
-SECURE_SSL_REDIRECT = False
-SESSION_COOKIE_SECURE = False
-CSRF_COOKIE_SECURE = False
-SECURE_PROXY_SSL_HEADER = None
-SETTINGSEOF"
-
-                        # Run migrations
-                        echo "Running database migrations..."
-                        lxc_exec_live "$vmid" "cd /opt/kiwi/Kiwi && /opt/kiwi/venv/bin/python manage.py migrate --settings=tcms.settings.local"
-
-                        # Collect static files
-                        echo "Collecting static files..."
-                        lxc_exec_live "$vmid" "cd /opt/kiwi/Kiwi && /opt/kiwi/venv/bin/python manage.py collectstatic --noinput --settings=tcms.settings.local"
-
-                        # Set permissions
-                        lxc_exec_live "$vmid" "chown -R kiwi:kiwi /opt/kiwi"
-                        lxc_exec_live "$vmid" "chown -R www-data:www-data /Kiwi/static /Kiwi/uploads"
-                        lxc_exec_live "$vmid" "chmod -R 755 /Kiwi/static /Kiwi/uploads"
-
-                        # Create systemd service
-                        lxc_exec "$vmid" "cat > /etc/systemd/system/kiwi.service << 'KIWIEOF'
-[Unit]
-Description=Kiwi TCMS
-After=network.target postgresql.service
-Requires=postgresql.service
-
-[Service]
-Type=simple
-User=kiwi
-Group=kiwi
-WorkingDirectory=/opt/kiwi/Kiwi
-Environment=DJANGO_SETTINGS_MODULE=tcms.settings.local
-ExecStart=/opt/kiwi/venv/bin/gunicorn --bind 127.0.0.1:8080 --workers 3 --timeout 120 tcms.wsgi:application
-ExecReload=/bin/kill -s HUP \$MAINPID
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-KIWIEOF"
-
-                        # Configure nginx as reverse proxy
-                        lxc_exec "$vmid" "cat > /etc/nginx/sites-available/kiwi << 'NGINXEOF'
-server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
-    server_name _;
-
-    client_max_body_size 100M;
-
-    location /static/ {
-        alias /Kiwi/static/;
-        expires 30d;
-        add_header Cache-Control \"public, immutable\";
-    }
-
-    location /uploads/ {
-        alias /Kiwi/uploads/;
-    }
-
-    location / {
-        proxy_pass http://127.0.0.1:8080;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_connect_timeout 300s;
-        proxy_read_timeout 300s;
-    }
-}
-NGINXEOF"
-                        # Remove default site and enable kiwi
-                        lxc_exec_live "$vmid" "rm -f /etc/nginx/sites-enabled/default"
-                        lxc_exec_live "$vmid" "ln -sf /etc/nginx/sites-available/kiwi /etc/nginx/sites-enabled/kiwi"
-
-                        # Test nginx configuration
-                        echo "Testing nginx configuration..."
-                        lxc_exec_live "$vmid" "nginx -t"
-
-                        # Create superuser script
-                        lxc_exec "$vmid" "cat > /opt/kiwi/create_superuser.sh << 'SUPEREOF'
-#!/bin/bash
-cd /opt/kiwi/Kiwi
-export DJANGO_SETTINGS_MODULE=tcms.settings.local
-/opt/kiwi/venv/bin/python manage.py createsuperuser
-SUPEREOF"
-                        lxc_exec_live "$vmid" "chmod +x /opt/kiwi/create_superuser.sh"
-
-                        # Start services
-                        echo "Starting services..."
-                        lxc_exec_live "$vmid" "systemctl daemon-reload"
-                        lxc_exec_live "$vmid" "systemctl enable kiwi nginx postgresql"
-                        lxc_exec_live "$vmid" "systemctl restart postgresql"
-                        lxc_exec_live "$vmid" "systemctl restart kiwi"
-                        lxc_exec_live "$vmid" "systemctl restart nginx"
-
-                        # Wait for services to start
-                        echo "Waiting for services to start..."
-                        sleep 5
-
-                        # Verify services are running
-                        echo ""
-                        echo "=== Service Status ==="
-                        lxc_exec_live "$vmid" "systemctl is-active postgresql && echo 'PostgreSQL: OK' || echo 'PostgreSQL: FAILED'"
-                        lxc_exec_live "$vmid" "systemctl is-active kiwi && echo 'Kiwi: OK' || echo 'Kiwi: FAILED'"
-                        lxc_exec_live "$vmid" "systemctl is-active nginx && echo 'Nginx: OK' || echo 'Nginx: FAILED'"
-
-                        # Test local access
-                        echo ""
-                        echo "Testing local access..."
-                        lxc_exec_live "$vmid" "curl -s -o /dev/null -w 'HTTP Status: %{http_code}\n' http://127.0.0.1/ || echo 'Local access test failed'"
-
-                        # Show listening ports
-                        echo ""
-                        echo "Listening ports:"
-                        lxc_exec_live "$vmid" "ss -tlnp | grep -E ':80|:8080' || netstat -tlnp 2>/dev/null | grep -E ':80|:8080'"
-
-                        echo ""
-                        echo "=== Kiwi TCMS Installation Complete ==="
-                        echo "NOTE: Create admin user by running: /opt/kiwi/create_superuser.sh"
-                        echo "Access Kiwi TCMS at http://<container-ip>/"
-                        ;;
-                    *)
-                        echo "ERROR: Unsupported OS for native Kiwi TCMS installation"
-                        echo "1" > "$deploy_result_file"
-                        exit 1
-                        ;;
-                esac
-                ;;
-
-            testlink)
-                # TestLink native installation (using Nginx + PHP-FPM)
-                case "$os_type" in
-                    debian|ubuntu)
-                        echo "Installing TestLink natively on Debian/Ubuntu..."
-                        echo ""
-
-                        # Update packages
-                        echo "Updating package lists..."
-                        lxc_exec_live "$vmid" "apt-get update"
-
-                        # Setup locale for MariaDB
-                        echo "Setting up locale..."
-                        lxc_exec_live "$vmid" "apt-get install -y locales"
-                        lxc_exec_live "$vmid" "sed -i 's/# en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen"
-                        lxc_exec_live "$vmid" "locale-gen en_US.UTF-8"
-
-                        # Install MariaDB
-                        echo "Installing MariaDB..."
-                        lxc_exec_live "$vmid" "DEBIAN_FRONTEND=noninteractive apt-get install -y mariadb-server mariadb-client"
-
-                        # Start MariaDB
-                        echo "Starting MariaDB..."
-                        lxc_exec_live "$vmid" "systemctl start mariadb"
-                        lxc_exec_live "$vmid" "systemctl enable mariadb"
-                        sleep 2
-
-                        # Clean up any existing database/user (for reinstallation)
-                        echo "Setting up database..."
-                        lxc_exec_live "$vmid" "mysql -e 'DROP DATABASE IF EXISTS testlink;' 2>/dev/null || true"
-                        lxc_exec_live "$vmid" "mysql -e \"DROP USER IF EXISTS 'testlink'@'localhost';\" 2>/dev/null || true"
-                        lxc_exec_live "$vmid" "mysql -e 'FLUSH PRIVILEGES;'"
-
-                        # Create fresh database and user with full privileges
-                        echo "Creating database..."
-                        lxc_exec_live "$vmid" "mysql -e \"CREATE DATABASE testlink DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\""
-                        lxc_exec_live "$vmid" "mysql -e \"CREATE USER 'testlink'@'localhost' IDENTIFIED BY 'testlink123';\""
-                        # Grant all privileges including ability to create/drop tables and manage users
-                        lxc_exec_live "$vmid" "mysql -e \"GRANT ALL PRIVILEGES ON testlink.* TO 'testlink'@'localhost' WITH GRANT OPTION;\""
-                        # Also grant SELECT on mysql.user for user existence checks (needed by TestLink installer)
-                        lxc_exec_live "$vmid" "mysql -e \"GRANT SELECT ON mysql.* TO 'testlink'@'localhost';\" 2>/dev/null || true"
-                        lxc_exec_live "$vmid" "mysql -e 'FLUSH PRIVILEGES;'"
-
-                        # Install Nginx and PHP-FPM
-                        echo "Installing Nginx and PHP-FPM..."
-                        # Purge existing nginx to ensure clean state
-                        lxc_exec_live "$vmid" "apt-get purge -y nginx nginx-common nginx-core 2>/dev/null || true"
-                        lxc_exec_live "$vmid" "apt-get autoremove -y 2>/dev/null || true"
-
-                        # Install nginx and PHP with all required extensions (including composer for adodb update)
-                        lxc_exec_live "$vmid" "DEBIAN_FRONTEND=noninteractive apt-get install -y nginx php-fpm php-mysql php-gd php-xml php-mbstring php-ldap php-curl php-zip php-cli php-common git unzip wget curl file composer"
-
-                        # Verify nginx.conf exists
-                        if ! lxc_exec "$vmid" "test -f /etc/nginx/nginx.conf" 2>/dev/null; then
-                            echo "ERROR: nginx.conf not found, reinstalling nginx..."
-                            lxc_exec_live "$vmid" "apt-get purge -y nginx nginx-common nginx-core"
-                            lxc_exec_live "$vmid" "apt-get install -y nginx"
-                        fi
-
-                        # Get PHP version for config paths
-                        local php_version
-                        php_version=$(lxc_exec "$vmid" "php -r 'echo PHP_MAJOR_VERSION.\".\".PHP_MINOR_VERSION;' 2>/dev/null")
-                        [[ -z "$php_version" ]] && php_version="8.2"
-                        echo "Detected PHP version: $php_version"
-
-                        # Download TestLink (using latest from GitHub for PHP 8 compatibility)
-                        echo "Downloading TestLink..."
-                        lxc_exec_live "$vmid" "rm -rf /var/www/testlink /tmp/testlink-code"
-                        lxc_exec_live "$vmid" "mkdir -p /var/www/testlink"
-
-                        # Clone latest TestLink from GitHub (has PHP 8 fixes)
-                        echo "Cloning TestLink from GitHub (latest version with PHP 8 support)..."
-                        lxc_exec_live "$vmid" "git clone --depth 1 https://github.com/TestLinkOpenSourceTRMS/testlink-code.git /tmp/testlink-code"
-
-                        # Verify clone
-                        if ! lxc_exec "$vmid" "test -f /tmp/testlink-code/index.php" 2>/dev/null; then
-                            echo "ERROR: Failed to clone TestLink from GitHub"
-                            echo "1" > "$deploy_result_file"
-                            exit 1
-                        fi
-
-                        # Move files to final location
-                        echo "Installing TestLink files..."
-                        lxc_exec_live "$vmid" "cp -r /tmp/testlink-code/* /var/www/testlink/"
-                        lxc_exec_live "$vmid" "rm -rf /tmp/testlink-code"
-
-                        # Apply PHP 8 compatibility patches if needed
-                        echo "Applying PHP 8 compatibility patches..."
-
-                        # Create a PHP script to properly fix curly braces array/string access
-                        # This is more reliable than sed for complex PHP syntax
-                        local php_fixer='<?php
-// PHP 8 Compatibility Fixer - converts curly braces array/string access to square brackets
-// Usage: php fixer.php <directory>
-
-function fixCurlyBraces($content) {
-    // Pattern to match $variable{...} but not ${variable} or anonymous functions
-    // We need to be careful not to match curly braces in other contexts
-    $result = "";
-    $len = strlen($content);
-    $i = 0;
-
-    while ($i < $len) {
-        // Look for $ followed by variable name followed by {
-        if ($content[$i] === "\$" && $i + 1 < $len) {
-            // Check if this is ${var} syntax (variable variable) - skip it
-            if ($content[$i + 1] === "{") {
-                $result .= $content[$i];
-                $i++;
-                continue;
-            }
-
-            // Match variable name
-            $varStart = $i;
-            $i++; // skip $
-            $varName = "";
-
-            // Match variable name characters
-            while ($i < $len && (ctype_alnum($content[$i]) || $content[$i] === "_")) {
-                $varName .= $content[$i];
-                $i++;
-            }
-
-            // Check if followed by { for array/string access
-            if ($i < $len && $content[$i] === "{" && !empty($varName)) {
-                // Find matching closing brace
-                $braceDepth = 1;
-                $exprStart = $i + 1;
-                $j = $i + 1;
-
-                while ($j < $len && $braceDepth > 0) {
-                    if ($content[$j] === "{") $braceDepth++;
-                    elseif ($content[$j] === "}") $braceDepth--;
-                    $j++;
-                }
-
-                if ($braceDepth === 0) {
-                    // Extract the expression inside braces
-                    $expr = substr($content, $exprStart, $j - $exprStart - 1);
-                    // Recursively fix the expression inside
-                    $expr = fixCurlyBraces($expr);
-                    // Output with square brackets
-                    $result .= "\$" . $varName . "[" . $expr . "]";
-                    $i = $j;
-                    continue;
-                }
-            }
-
-            // Not a curly brace access, output what we have
-            $result .= "\$" . $varName;
-            continue;
-        }
-
-        $result .= $content[$i];
-        $i++;
-    }
-
-    return $result;
-}
-
-function processFile($file) {
-    $content = file_get_contents($file);
-    $original = $content;
-    $fixed = fixCurlyBraces($content);
-
-    if ($fixed !== $original) {
-        file_put_contents($file, $fixed);
-        echo "Fixed: $file\n";
-        return true;
-    }
-    return false;
-}
-
-function processDirectory($dir) {
-    $count = 0;
-    $iterator = new RecursiveIteratorIterator(
-        new RecursiveDirectoryIterator($dir, RecursiveDirectoryIterator::SKIP_DOTS)
-    );
-
-    foreach ($iterator as $file) {
-        if ($file->isFile() && $file->getExtension() === "php") {
-            if (processFile($file->getPathname())) {
-                $count++;
-            }
-        }
-    }
-    return $count;
-}
-
-if ($argc < 2) {
-    echo "Usage: php fixer.php <directory>\n";
-    exit(1);
-}
-
-$dir = $argv[1];
-if (!is_dir($dir)) {
-    echo "Error: $dir is not a directory\n";
-    exit(1);
-}
-
-$count = processDirectory($dir);
-echo "Fixed $count files\n";
-'
-                        local fixer_b64
-                        fixer_b64=$(echo "$php_fixer" | base64 -w0)
-                        lxc_exec "$vmid" "echo '$fixer_b64' | base64 -d > /tmp/php8_fixer.php"
-
-                        echo "Running PHP 8 compatibility fixer..."
-                        lxc_exec_live "$vmid" "php /tmp/php8_fixer.php /var/www/testlink"
-                        lxc_exec_live "$vmid" "rm -f /tmp/php8_fixer.php"
-
-                        # Fix strftime deprecation - replace with date() where possible
-                        lxc_exec_live "$vmid" "sed -i \"s/strftime('%Y%m%d'/date('Ymd'/g\" /var/www/testlink/config.inc.php 2>/dev/null || true"
-
-                        # Update adodb library to PHP 8 compatible version
-                        echo "Updating adodb library for PHP 8 compatibility..."
-                        lxc_exec_live "$vmid" "rm -rf /var/www/testlink/vendor/adodb/adodb-php"
-                        lxc_exec_live "$vmid" "git clone --depth 1 --branch v5.22.8 https://github.com/ADOdb/ADOdb.git /var/www/testlink/vendor/adodb/adodb-php 2>&1 || git clone --depth 1 https://github.com/ADOdb/ADOdb.git /var/www/testlink/vendor/adodb/adodb-php"
-
-                        # Update Smarty library to PHP 8 compatible version (v4.x or v5.x)
-                        echo "Updating Smarty library for PHP 8 compatibility..."
-                        lxc_exec_live "$vmid" "rm -rf /var/www/testlink/vendor/smarty/smarty"
-                        lxc_exec_live "$vmid" "mkdir -p /var/www/testlink/vendor/smarty"
-                        lxc_exec_live "$vmid" "git clone --depth 1 --branch v4.5.3 https://github.com/smarty-php/smarty.git /var/www/testlink/vendor/smarty/smarty 2>&1 || git clone --depth 1 https://github.com/smarty-php/smarty.git /var/www/testlink/vendor/smarty/smarty"
-                        lxc_exec_live "$vmid" "chown -R www-data:www-data /var/www/testlink/vendor/smarty"
-
-                        # Apply additional mysqli driver fix for PHP 8
-                        echo "Applying mysqli driver fix..."
-                        local mysqli_fix='<?php
-// PHP 8 compatibility fix for mysqli driver
-if (!function_exists("adodb_mysqli_fix_applied")) {
-    function adodb_mysqli_fix_applied() { return true; }
-    // Ensure error reporting does not break on type errors
-    set_error_handler(function($errno, $errstr, $errfile, $errline) {
-        if (strpos($errstr, "mysqli") !== false && strpos($errstr, "must be of type") !== false) {
-            return true; // Suppress mysqli type errors
-        }
-        return false;
-    }, E_ALL);
-}
-'
-                        local fix_b64
-                        fix_b64=$(echo "$mysqli_fix" | base64 -w0)
-                        lxc_exec "$vmid" "echo '$fix_b64' | base64 -d > /var/www/testlink/lib/functions/adodb_fix.php"
-                        # Include the fix in the main config
-                        lxc_exec_live "$vmid" "grep -q 'adodb_fix.php' /var/www/testlink/config.inc.php || sed -i '1a\\require_once(dirname(__FILE__).\"/lib/functions/adodb_fix.php\");' /var/www/testlink/config.inc.php 2>/dev/null || true"
-
-                        # Final verification
-                        if ! lxc_exec "$vmid" "test -f /var/www/testlink/index.php" 2>/dev/null; then
-                            echo "ERROR: TestLink installation failed - index.php not found"
-                            lxc_exec_live "$vmid" "ls -la /var/www/testlink/"
-                            echo "1" > "$deploy_result_file"
-                            exit 1
-                        fi
-                        echo "TestLink files installed successfully"
-
-                        # Create directories that TestLink needs
-                        lxc_exec_live "$vmid" "mkdir -p /var/testlink/logs /var/testlink/upload_area"
-                        lxc_exec_live "$vmid" "mkdir -p /var/www/testlink/gui/templates_c"
-
-                        # Set permissions - TestLink installer needs write access to several directories
-                        echo "Setting permissions..."
-                        lxc_exec_live "$vmid" "chown -R www-data:www-data /var/www/testlink"
-                        lxc_exec_live "$vmid" "chown -R www-data:www-data /var/testlink"
-                        lxc_exec_live "$vmid" "chmod -R 755 /var/www/testlink"
-                        lxc_exec_live "$vmid" "chmod -R 777 /var/testlink"
-                        # Make specific directories writable for installer
-                        lxc_exec_live "$vmid" "chmod -R 777 /var/www/testlink/gui/templates_c 2>/dev/null || true"
-                        lxc_exec_live "$vmid" "chmod 666 /var/www/testlink/config_db.inc.php 2>/dev/null || touch /var/www/testlink/config_db.inc.php && chmod 666 /var/www/testlink/config_db.inc.php"
-                        lxc_exec_live "$vmid" "chown www-data:www-data /var/www/testlink/config_db.inc.php"
-
-                        # Create custom_config.inc.php with correct TestLink format
-                        echo "Creating configuration..."
-                        local config_content='<?php
-// Suppress deprecation warnings for older TestLink version (PHP 8.1+)
-error_reporting(E_ALL & ~E_DEPRECATED & ~E_STRICT);
-
-// Paths - these are required for TestLink
-$tlCfg->log_path = "/var/testlink/logs/";
-$g_repositoryPath = "/var/testlink/upload_area/";
-
-// Language
-$tlCfg->default_language = "en_US";
-
-// Security - disable config check warnings
-$tlCfg->config_check_warning_mode = "SILENT";
-'
-                        local config_b64
-                        config_b64=$(echo "$config_content" | base64 -w0)
-                        lxc_exec "$vmid" "echo '$config_b64' | base64 -d > /var/www/testlink/custom_config.inc.php"
-                        lxc_exec_live "$vmid" "chown www-data:www-data /var/www/testlink/custom_config.inc.php"
-
-                        # Pre-configure database connection to avoid installer issues
-                        echo "Pre-configuring database connection..."
-                        local db_config='<?php
-// Database connection configuration
-// Auto-generated by PVE Manager
-define("DB_TYPE", "mysql");
-define("DB_USER", "testlink");
-define("DB_PASS", "testlink123");
-define("DB_HOST", "localhost");
-define("DB_NAME", "testlink");
-define("DB_TABLE_PREFIX", "");
-
-// Disable mysqli strict error reporting for PHP 8 compatibility
-mysqli_report(MYSQLI_REPORT_OFF);
-'
-                        local db_config_b64
-                        db_config_b64=$(echo "$db_config" | base64 -w0)
-                        lxc_exec "$vmid" "echo '$db_config_b64' | base64 -d > /var/www/testlink/config_db.inc.php"
-                        lxc_exec_live "$vmid" "chown www-data:www-data /var/www/testlink/config_db.inc.php"
-                        lxc_exec_live "$vmid" "chmod 644 /var/www/testlink/config_db.inc.php"
-
-                        # Add mysqli_report to the main config.inc.php to suppress strict errors
-                        lxc_exec_live "$vmid" "grep -q 'mysqli_report' /var/www/testlink/config.inc.php || sed -i '2a\\mysqli_report(MYSQLI_REPORT_OFF);' /var/www/testlink/config.inc.php 2>/dev/null || true"
-
-                        # Configure PHP-FPM
-                        echo "Configuring PHP-FPM..."
-                        # Find php.ini location
-                        local php_ini="/etc/php/${php_version}/fpm/php.ini"
-                        if ! lxc_exec "$vmid" "test -f $php_ini" 2>/dev/null; then
-                            php_ini=$(lxc_exec "$vmid" "find /etc/php -name 'php.ini' -path '*/fpm/*' 2>/dev/null | head -1")
-                        fi
-                        echo "Using PHP config: $php_ini"
-
-                        # Apply PHP settings
-                        lxc_exec_live "$vmid" "sed -i 's/max_execution_time = 30/max_execution_time = 120/' $php_ini 2>/dev/null || true"
-                        lxc_exec_live "$vmid" "sed -i 's/session.gc_maxlifetime = 1440/session.gc_maxlifetime = 60000/' $php_ini 2>/dev/null || true"
-                        lxc_exec_live "$vmid" "sed -i 's/post_max_size = 8M/post_max_size = 64M/' $php_ini 2>/dev/null || true"
-                        lxc_exec_live "$vmid" "sed -i 's/upload_max_filesize = 2M/upload_max_filesize = 64M/' $php_ini 2>/dev/null || true"
-                        lxc_exec_live "$vmid" "sed -i 's/memory_limit = 128M/memory_limit = 256M/' $php_ini 2>/dev/null || true"
-                        # Enable error display for debugging (can be disabled later)
-                        lxc_exec_live "$vmid" "sed -i 's/display_errors = Off/display_errors = On/' $php_ini 2>/dev/null || true"
-                        lxc_exec_live "$vmid" "sed -i 's/display_startup_errors = Off/display_startup_errors = On/' $php_ini 2>/dev/null || true"
-
-                        # Start PHP-FPM first so socket is created
-                        echo "Starting PHP-FPM..."
-                        lxc_exec_live "$vmid" "systemctl restart php${php_version}-fpm 2>/dev/null || systemctl restart php-fpm 2>/dev/null || systemctl restart php*-fpm"
-                        lxc_exec_live "$vmid" "systemctl enable php${php_version}-fpm 2>/dev/null || systemctl enable php-fpm 2>/dev/null || true"
-                        sleep 2
-
-                        # Find the actual PHP-FPM socket path (now that PHP-FPM is running)
-                        local php_sock
-                        php_sock=$(lxc_exec "$vmid" "ls /run/php/php*-fpm.sock 2>/dev/null | head -1")
-                        if [[ -z "$php_sock" ]]; then
-                            php_sock="/run/php/php${php_version}-fpm.sock"
-                        fi
-                        echo "Using PHP-FPM socket: $php_sock"
-
-                        # Configure Nginx virtual host
-                        echo "Configuring Nginx..."
-                        lxc_exec "$vmid" "cat > /etc/nginx/sites-available/testlink << NGINXEOF
-server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
-    server_name _;
-
-    root /var/www/testlink;
-    index index.php index.html;
-
-    client_max_body_size 64M;
-
-    location / {
-        try_files \\\$uri \\\$uri/ =404;
-    }
-
-    location ~ \\.php\\\$ {
-        fastcgi_split_path_info ^(.+\\.php)(/.+)\\\$;
-        fastcgi_pass unix:${php_sock};
-        fastcgi_index index.php;
-        fastcgi_param SCRIPT_FILENAME \\\$document_root\\\$fastcgi_script_name;
-        fastcgi_param PATH_INFO \\\$fastcgi_path_info;
-        include fastcgi_params;
-    }
-
-    location ~ /\\\\. {
-        deny all;
-    }
-}
-NGINXEOF"
-
-                        # Enable site
-                        lxc_exec_live "$vmid" "rm -f /etc/nginx/sites-enabled/default"
-                        lxc_exec_live "$vmid" "ln -sf /etc/nginx/sites-available/testlink /etc/nginx/sites-enabled/testlink"
-
-                        # Test nginx configuration
-                        echo "Testing nginx configuration..."
-                        lxc_exec_live "$vmid" "nginx -t"
-
-                        # Start nginx
-                        echo "Starting Nginx..."
-                        lxc_exec_live "$vmid" "systemctl restart nginx"
-                        lxc_exec_live "$vmid" "systemctl enable nginx"
-
-                        # Wait for services to start
-                        sleep 3
-
-                        # Verify services are running
-                        echo ""
-                        echo "=== Service Status ==="
-                        lxc_exec_live "$vmid" "systemctl is-active mariadb && echo 'MariaDB: OK' || echo 'MariaDB: FAILED'"
-                        lxc_exec_live "$vmid" "systemctl is-active nginx && echo 'Nginx: OK' || echo 'Nginx: FAILED'"
-                        lxc_exec_live "$vmid" "systemctl is-active php${php_version}-fpm 2>/dev/null && echo 'PHP-FPM: OK' || systemctl is-active php*-fpm 2>/dev/null && echo 'PHP-FPM: OK' || echo 'PHP-FPM: FAILED'"
-
-                        # Test local access
-                        echo ""
-                        echo "Testing local access..."
-                        lxc_exec_live "$vmid" "curl -s -o /dev/null -w 'HTTP Status: %{http_code}\n' http://127.0.0.1/ || echo 'Local access test failed'"
-
-                        echo ""
-                        echo "=== TestLink Installation Complete ==="
-                        echo "IMPORTANT: Complete installation via web browser:"
-                        echo "  1. Go to http://<container-ip>/install/index.php"
-                        echo "  2. Click 'New installation'"
-                        echo "  3. Database is pre-configured (testlink/testlink123)"
-                        echo "  4. When asked for DB details, use:"
-                        echo "     - Database type: MySQL/MariaDB"
-                        echo "     - Database host: localhost"
-                        echo "     - Database name: testlink"
-                        echo "     - Database user: testlink"
-                        echo "     - Database password: testlink123"
-                        echo "  5. After installation, delete /var/www/testlink/install directory"
-                        echo ""
-                        echo "If you see database errors, the DB is already configured."
-                        echo "Skip to: http://<container-ip>/ after first login setup."
-                        ;;
-                    *)
-                        echo "ERROR: Unsupported OS for native TestLink installation"
-                        echo "1" > "$deploy_result_file"
-                        exit 1
-                        ;;
-                esac
-                ;;
-
-            sonarqube)
-                # SonarQube native installation
-                case "$os_type" in
-                    debian|ubuntu)
-                        echo "Installing SonarQube natively on Debian/Ubuntu..."
-                        echo ""
-
-                        # System requirements check and configuration
-                        echo "Configuring system settings..."
-                        lxc_exec_live "$vmid" "sysctl -w vm.max_map_count=524288"
-                        lxc_exec_live "$vmid" "sysctl -w fs.file-max=131072"
-                        lxc_exec_live "$vmid" "echo 'vm.max_map_count=524288' >> /etc/sysctl.conf"
-                        lxc_exec_live "$vmid" "echo 'fs.file-max=131072' >> /etc/sysctl.conf"
-
-                        # Install dependencies
-                        echo "Installing dependencies..."
-                        lxc_exec_live "$vmid" "apt-get update"
-                        lxc_exec_live "$vmid" "DEBIAN_FRONTEND=noninteractive apt-get install -y openjdk-17-jdk wget unzip postgresql postgresql-contrib"
-
-                        # Start PostgreSQL
-                        echo "Configuring PostgreSQL..."
-                        lxc_exec_live "$vmid" "systemctl enable postgresql"
-                        lxc_exec_live "$vmid" "systemctl start postgresql"
-                        sleep 3
-
-                        # Create database and user
-                        lxc_exec_live "$vmid" "sudo -u postgres psql -c \"DROP DATABASE IF EXISTS sonarqube;\" 2>/dev/null || true"
-                        lxc_exec_live "$vmid" "sudo -u postgres psql -c \"DROP USER IF EXISTS sonar;\" 2>/dev/null || true"
-                        lxc_exec_live "$vmid" "sudo -u postgres psql -c \"CREATE USER sonar WITH ENCRYPTED PASSWORD 'sonar';\""
-                        lxc_exec_live "$vmid" "sudo -u postgres psql -c \"CREATE DATABASE sonarqube OWNER sonar;\""
-                        lxc_exec_live "$vmid" "sudo -u postgres psql -c \"GRANT ALL PRIVILEGES ON DATABASE sonarqube TO sonar;\""
-
-                        # Create sonarqube user
-                        echo "Creating SonarQube user..."
-                        lxc_exec_live "$vmid" "useradd -r -m -d /opt/sonarqube -s /bin/bash sonarqube 2>/dev/null || true"
-
-                        # Download and install SonarQube
-                        echo "Downloading SonarQube..."
-                        local sonar_version="10.4.1.88267"
-                        lxc_exec_live "$vmid" "wget -q -O /tmp/sonarqube.zip https://binaries.sonarsource.com/Distribution/sonarqube/sonarqube-${sonar_version}.zip"
-
-                        echo "Installing SonarQube..."
-                        lxc_exec_live "$vmid" "rm -rf /opt/sonarqube"
-                        lxc_exec_live "$vmid" "unzip -q /tmp/sonarqube.zip -d /opt/"
-                        lxc_exec_live "$vmid" "mv /opt/sonarqube-${sonar_version} /opt/sonarqube"
-                        lxc_exec_live "$vmid" "rm /tmp/sonarqube.zip"
-
-                        # Configure SonarQube
-                        echo "Configuring SonarQube..."
-                        lxc_exec "$vmid" "cat >> /opt/sonarqube/conf/sonar.properties << 'SONAREOF'
-# Database configuration
-sonar.jdbc.username=sonar
-sonar.jdbc.password=sonar
-sonar.jdbc.url=jdbc:postgresql://localhost:5432/sonarqube
-
-# Web server configuration
-sonar.web.host=0.0.0.0
-sonar.web.port=9000
-
-# Elasticsearch configuration
-sonar.search.javaOpts=-Xmx512m -Xms512m -XX:MaxDirectMemorySize=256m -XX:+HeapDumpOnOutOfMemoryError
-SONAREOF"
-
-                        # Set ownership
-                        lxc_exec_live "$vmid" "chown -R sonarqube:sonarqube /opt/sonarqube"
-
-                        # Set limits for sonarqube user
-                        lxc_exec "$vmid" "cat >> /etc/security/limits.conf << 'LIMITSEOF'
-sonarqube   -   nofile   131072
-sonarqube   -   nproc    8192
-LIMITSEOF"
-
-                        # Create systemd service
-                        lxc_exec "$vmid" "cat > /etc/systemd/system/sonarqube.service << 'SERVICEEOF'
-[Unit]
-Description=SonarQube service
-After=syslog.target network.target postgresql.service
-
-[Service]
-Type=forking
-ExecStart=/opt/sonarqube/bin/linux-x86-64/sonar.sh start
-ExecStop=/opt/sonarqube/bin/linux-x86-64/sonar.sh stop
-User=sonarqube
-Group=sonarqube
-Restart=always
-LimitNOFILE=131072
-LimitNPROC=8192
-
-[Install]
-WantedBy=multi-user.target
-SERVICEEOF"
-
-                        # Start SonarQube
-                        echo "Starting SonarQube..."
-                        lxc_exec_live "$vmid" "systemctl daemon-reload"
-                        lxc_exec_live "$vmid" "systemctl enable sonarqube"
-                        lxc_exec_live "$vmid" "systemctl start sonarqube"
-
-                        # Wait for startup
-                        echo "Waiting for SonarQube to start (this may take 1-2 minutes)..."
-                        sleep 30
-
-                        echo ""
-                        echo "=== SonarQube Installation Complete ==="
-                        echo "Access: http://<container-ip>:9000"
-                        echo "Default credentials: admin / admin"
-                        echo "NOTE: First startup may take up to 2 minutes"
-                        ;;
-                    *)
-                        echo "ERROR: Unsupported OS for native SonarQube installation"
-                        echo "1" > "$deploy_result_file"
-                        exit 1
-                        ;;
-                esac
-                ;;
-
-            pihole)
-                # Pi-hole native installation
-                case "$os_type" in
-                    debian|ubuntu)
-                        echo "Installing Pi-hole natively on Debian/Ubuntu..."
-                        echo ""
-
-                        # Install dependencies
-                        echo "Installing dependencies..."
-                        lxc_exec_live "$vmid" "apt-get update"
-                        lxc_exec_live "$vmid" "DEBIAN_FRONTEND=noninteractive apt-get install -y curl git"
-
-                        # Disable systemd-resolved if present (conflicts with Pi-hole)
-                        echo "Configuring DNS settings..."
-                        lxc_exec_live "$vmid" "systemctl disable systemd-resolved 2>/dev/null || true"
-                        lxc_exec_live "$vmid" "systemctl stop systemd-resolved 2>/dev/null || true"
-                        lxc_exec_live "$vmid" "rm -f /etc/resolv.conf"
-                        lxc_exec_live "$vmid" "echo 'nameserver 8.8.8.8' > /etc/resolv.conf"
-
-                        # Create Pi-hole config directory
-                        lxc_exec_live "$vmid" "mkdir -p /etc/pihole"
-
-                        # Get container IP for setupVars
-                        local container_ip
-                        container_ip=$(get_container_ip "$vmid")
-
-                        # Create setupVars.conf for unattended installation
-                        lxc_exec "$vmid" "cat > /etc/pihole/setupVars.conf << SETUPEOF
-PIHOLE_INTERFACE=eth0
-QUERY_LOGGING=true
-INSTALL_WEB_SERVER=true
-INSTALL_WEB_INTERFACE=true
-LIGHTTPD_ENABLED=true
-CACHE_SIZE=10000
-DNS_FQDN_REQUIRED=true
-DNS_BOGUS_PRIV=true
-DNSMASQ_LISTENING=all
-WEBPASSWORD=
-PIHOLE_DNS_1=8.8.8.8
-PIHOLE_DNS_2=8.8.4.4
-BLOCKING_ENABLED=true
-SETUPEOF"
-
-                        # Install Pi-hole using official installer
-                        echo "Running Pi-hole installer (this may take several minutes)..."
-                        lxc_exec_live "$vmid" "curl -sSL https://install.pi-hole.net | bash /dev/stdin --unattended"
-
-                        # Set web password
-                        echo "Setting admin password..."
-                        lxc_exec_live "$vmid" "pihole -a -p admin"
-
-                        # Verify installation
-                        echo ""
-                        echo "=== Service Status ==="
-                        lxc_exec_live "$vmid" "systemctl is-active pihole-FTL && echo 'Pi-hole FTL: OK' || echo 'Pi-hole FTL: FAILED'"
-                        lxc_exec_live "$vmid" "systemctl is-active lighttpd && echo 'Lighttpd: OK' || echo 'Lighttpd: FAILED'"
-
-                        echo ""
-                        echo "=== Pi-hole Installation Complete ==="
-                        echo "Admin interface: http://<container-ip>/admin"
-                        echo "Password: admin"
-                        echo "DNS Server: <container-ip>:53"
-                        echo ""
-                        echo "To change password: pihole -a -p <newpassword>"
-                        ;;
-                    alpine)
-                        echo "Installing Pi-hole on Alpine..."
-                        echo "NOTE: Using gravity-sync compatible setup"
-
-                        lxc_exec_live "$vmid" "apk update"
-                        lxc_exec_live "$vmid" "apk add curl bash git sudo"
-
-                        # Alpine requires special handling - use docker method instead
-                        echo "WARNING: Native Pi-hole on Alpine is complex."
-                        echo "Recommend using Docker deployment for Alpine."
-                        echo "1" > "$deploy_result_file"
-                        exit 1
-                        ;;
-                    *)
-                        echo "ERROR: Unsupported OS for native Pi-hole installation"
-                        echo "1" > "$deploy_result_file"
-                        exit 1
-                        ;;
-                esac
-                ;;
-
-            *)
-                echo "ERROR: Native installation not available for $service"
-                echo "Please use Docker-based deployment instead."
-                echo "1" > "$deploy_result_file"
-                exit 1
-                ;;
-        esac
+        # Run plugin installer
+        echo "Using plugin installer for $service..."
+        export VMID="$vmid"
+        export OS_TYPE="$os_type"
+        source "$install_script"
+        local result=$?
+        if [[ $result -ne 0 ]]; then
+            echo "1" > "$deploy_result_file"
+            exit $result
+        fi
 
         echo ""
         echo "Verifying installation..."
         sleep 3
 
         # Check service status
+        local conf="${PLUGINS[$service]}/plugin.conf"
+        local systemd_service
+        systemd_service=$(grep "^PLUGIN_SYSTEMD_SERVICE=" "$conf" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
+        [[ -z "$systemd_service" ]] && systemd_service="$service"
+
         service_running=false
         case "$os_type" in
             debian|ubuntu)
-                if lxc_exec "$vmid" "systemctl is-active --quiet $service 2>/dev/null"; then
+                if lxc_exec "$vmid" "systemctl is-active --quiet $systemd_service 2>/dev/null"; then
                     service_running=true
                 fi
                 ;;
             alpine)
-                if lxc_exec "$vmid" "rc-service $service status 2>/dev/null | grep -q started"; then
+                if lxc_exec "$vmid" "rc-service $systemd_service status 2>/dev/null | grep -q started"; then
                     service_running=true
                 fi
                 ;;
@@ -5440,7 +5870,6 @@ SETUPEOF"
     fi
     return 0
 }
-
 # Deploy service to container with progress (Docker-based)
 deploy_service_with_progress() {
     local vmid="$1"
@@ -6000,227 +6429,33 @@ remove_native_service() {
     local vmid="$1"
     local service="$2"
 
+    # Verify plugin exists and supports native
+    if ! is_plugin_service "$service" || ! plugin_supports_native "$service"; then
+        show_msg "Error" "Native removal not available for $service"
+        return 1
+    fi
+
+    local remove_script="${PLUGINS[$service]}/remove.sh"
+    if [[ ! -f "$remove_script" ]]; then
+        show_msg "Error" "Remove script not found for $service"
+        return 1
+    fi
+
     (
         echo "=== Removing Native Service: $service ==="
         echo ""
+        echo "Using plugin remover for $service..."
 
-        # Stop and disable the service
-        echo "Stopping and disabling $service service..."
-        lxc_exec_live "$vmid" "systemctl stop $service 2>/dev/null || true"
-        lxc_exec_live "$vmid" "systemctl disable $service 2>/dev/null || true"
-        echo ""
+        # Detect OS for plugin script
+        local os_type
+        os_type=$(lxc_exec "$vmid" "cat /etc/os-release 2>/dev/null | grep '^ID=' | cut -d= -f2 | tr -d '\"'")
+        export VMID="$vmid"
+        export OS_TYPE="$os_type"
 
-        case "$service" in
-            kiwi)
-                echo "Removing Kiwi TCMS..."
+        # Source the remove script
+        source "$remove_script"
 
-                # Stop related services
-                lxc_exec_live "$vmid" "systemctl stop nginx 2>/dev/null || true"
-
-                # Remove systemd service file
-                lxc_exec_live "$vmid" "rm -f /etc/systemd/system/kiwi.service"
-
-                # Remove nginx config
-                lxc_exec_live "$vmid" "rm -f /etc/nginx/sites-enabled/kiwi"
-                lxc_exec_live "$vmid" "rm -f /etc/nginx/sites-available/kiwi"
-
-                # Remove application files
-                lxc_exec_live "$vmid" "rm -rf /opt/kiwi"
-                lxc_exec_live "$vmid" "rm -rf /Kiwi"
-
-                # Remove database
-                echo "Removing PostgreSQL database..."
-                lxc_exec_live "$vmid" "sudo -u postgres psql -c 'DROP DATABASE IF EXISTS kiwi;' 2>/dev/null || true"
-                lxc_exec_live "$vmid" "sudo -u postgres psql -c 'DROP USER IF EXISTS kiwi;' 2>/dev/null || true"
-
-                # Remove user
-                lxc_exec_live "$vmid" "userdel -r kiwi 2>/dev/null || true"
-
-                # Restart nginx with default config
-                lxc_exec_live "$vmid" "ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default 2>/dev/null || true"
-                lxc_exec_live "$vmid" "systemctl restart nginx 2>/dev/null || true"
-                ;;
-
-            gitea)
-                echo "Removing Gitea..."
-
-                # Remove systemd service file
-                lxc_exec_live "$vmid" "rm -f /etc/systemd/system/gitea.service"
-
-                # Remove application files
-                lxc_exec_live "$vmid" "rm -rf /var/lib/gitea"
-                lxc_exec_live "$vmid" "rm -rf /etc/gitea"
-                lxc_exec_live "$vmid" "rm -f /usr/local/bin/gitea"
-
-                # Remove user
-                lxc_exec_live "$vmid" "userdel -r gitea 2>/dev/null || true"
-                ;;
-
-            jenkins)
-                echo "Removing Jenkins..."
-
-                # Remove systemd service (installed by package)
-                lxc_exec_live "$vmid" "apt-get purge -y jenkins 2>/dev/null || true"
-                lxc_exec_live "$vmid" "apt-get autoremove -y 2>/dev/null || true"
-
-                # Remove data directory
-                lxc_exec_live "$vmid" "rm -rf /var/lib/jenkins"
-
-                # Remove apt source
-                lxc_exec_live "$vmid" "rm -f /etc/apt/sources.list.d/jenkins.list"
-                lxc_exec_live "$vmid" "rm -f /usr/share/keyrings/jenkins-keyring.asc"
-                ;;
-
-            grafana)
-                echo "Removing Grafana..."
-
-                # Remove via package manager
-                lxc_exec_live "$vmid" "apt-get purge -y grafana 2>/dev/null || true"
-                lxc_exec_live "$vmid" "apt-get autoremove -y 2>/dev/null || true"
-
-                # Remove data
-                lxc_exec_live "$vmid" "rm -rf /var/lib/grafana"
-                lxc_exec_live "$vmid" "rm -rf /etc/grafana"
-
-                # Remove apt source
-                lxc_exec_live "$vmid" "rm -f /etc/apt/sources.list.d/grafana.list"
-                lxc_exec_live "$vmid" "rm -f /usr/share/keyrings/grafana.key"
-                ;;
-
-            prometheus)
-                echo "Removing Prometheus..."
-
-                # Remove via package manager
-                lxc_exec_live "$vmid" "apt-get purge -y prometheus 2>/dev/null || true"
-                lxc_exec_live "$vmid" "apt-get autoremove -y 2>/dev/null || true"
-
-                # Remove data
-                lxc_exec_live "$vmid" "rm -rf /var/lib/prometheus"
-                lxc_exec_live "$vmid" "rm -rf /etc/prometheus"
-                ;;
-
-            testlink)
-                echo "Removing TestLink..."
-
-                # Stop Nginx
-                lxc_exec_live "$vmid" "systemctl stop nginx 2>/dev/null || true"
-
-                # Remove Nginx site config (but keep main nginx.conf)
-                lxc_exec_live "$vmid" "rm -f /etc/nginx/sites-enabled/testlink"
-                lxc_exec_live "$vmid" "rm -f /etc/nginx/sites-available/testlink"
-
-                # Remove application files
-                echo "Removing application files..."
-                lxc_exec_live "$vmid" "rm -rf /var/www/testlink"
-                lxc_exec_live "$vmid" "rm -rf /var/testlink"
-
-                # Remove database and user completely
-                echo "Removing MariaDB database..."
-                lxc_exec_live "$vmid" "mysql -e 'DROP DATABASE IF EXISTS testlink;' 2>/dev/null || true"
-                lxc_exec_live "$vmid" "mysql -e \"DROP USER IF EXISTS 'testlink'@'localhost';\" 2>/dev/null || true"
-                lxc_exec_live "$vmid" "mysql -e 'FLUSH PRIVILEGES;' 2>/dev/null || true"
-
-                # Ensure nginx.conf exists (reinstall if missing)
-                echo "Restoring Nginx configuration..."
-                if ! lxc_exec "$vmid" "test -f /etc/nginx/nginx.conf" 2>/dev/null; then
-                    echo "nginx.conf missing, reinstalling nginx..."
-                    lxc_exec_live "$vmid" "apt-get purge -y nginx nginx-common nginx-core 2>/dev/null || true"
-                    lxc_exec_live "$vmid" "apt-get install -y nginx"
-                fi
-
-                # Restore default Nginx site
-                lxc_exec_live "$vmid" "ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default 2>/dev/null || true"
-                lxc_exec_live "$vmid" "systemctl restart nginx 2>/dev/null || true"
-                ;;
-
-            sonarqube)
-                echo "Removing SonarQube..."
-
-                # Stop service
-                lxc_exec_live "$vmid" "systemctl stop sonarqube 2>/dev/null || true"
-                lxc_exec_live "$vmid" "systemctl disable sonarqube 2>/dev/null || true"
-
-                # Remove systemd service file
-                lxc_exec_live "$vmid" "rm -f /etc/systemd/system/sonarqube.service"
-
-                # Remove application files
-                echo "Removing application files..."
-                lxc_exec_live "$vmid" "rm -rf /opt/sonarqube"
-
-                # Remove database
-                echo "Removing PostgreSQL database..."
-                lxc_exec_live "$vmid" "sudo -u postgres psql -c 'DROP DATABASE IF EXISTS sonarqube;' 2>/dev/null || true"
-                lxc_exec_live "$vmid" "sudo -u postgres psql -c 'DROP USER IF EXISTS sonar;' 2>/dev/null || true"
-
-                # Remove user
-                lxc_exec_live "$vmid" "userdel -r sonarqube 2>/dev/null || true"
-
-                # Remove sysctl settings
-                lxc_exec_live "$vmid" "sed -i '/vm.max_map_count=524288/d' /etc/sysctl.conf 2>/dev/null || true"
-                lxc_exec_live "$vmid" "sed -i '/fs.file-max=131072/d' /etc/sysctl.conf 2>/dev/null || true"
-
-                # Remove limits
-                lxc_exec_live "$vmid" "sed -i '/sonarqube.*nofile/d' /etc/security/limits.conf 2>/dev/null || true"
-                lxc_exec_live "$vmid" "sed -i '/sonarqube.*nproc/d' /etc/security/limits.conf 2>/dev/null || true"
-                ;;
-
-            pihole)
-                echo "Removing Pi-hole..."
-
-                # Use Pi-hole's uninstall script if available
-                if lxc_exec "$vmid" "test -f /etc/.pihole/automated\ install/uninstall.sh" 2>/dev/null; then
-                    echo "Running Pi-hole uninstaller..."
-                    lxc_exec_live "$vmid" "pihole uninstall --unattended 2>/dev/null || true"
-                else
-                    # Manual removal
-                    echo "Manual Pi-hole removal..."
-
-                    # Stop services
-                    lxc_exec_live "$vmid" "systemctl stop pihole-FTL 2>/dev/null || true"
-                    lxc_exec_live "$vmid" "systemctl stop lighttpd 2>/dev/null || true"
-                    lxc_exec_live "$vmid" "systemctl disable pihole-FTL 2>/dev/null || true"
-                    lxc_exec_live "$vmid" "systemctl disable lighttpd 2>/dev/null || true"
-
-                    # Remove Pi-hole directories
-                    lxc_exec_live "$vmid" "rm -rf /etc/pihole"
-                    lxc_exec_live "$vmid" "rm -rf /etc/.pihole"
-                    lxc_exec_live "$vmid" "rm -rf /opt/pihole"
-                    lxc_exec_live "$vmid" "rm -rf /var/www/html/admin"
-                    lxc_exec_live "$vmid" "rm -f /usr/local/bin/pihole"
-
-                    # Remove lighttpd config
-                    lxc_exec_live "$vmid" "rm -rf /etc/lighttpd"
-
-                    # Remove packages
-                    lxc_exec_live "$vmid" "apt-get purge -y pihole-FTL lighttpd 2>/dev/null || true"
-                    lxc_exec_live "$vmid" "apt-get autoremove -y 2>/dev/null || true"
-                fi
-
-                # Restore DNS
-                echo "Restoring DNS configuration..."
-                lxc_exec_live "$vmid" "rm -f /etc/resolv.conf"
-                lxc_exec_live "$vmid" "echo 'nameserver 8.8.8.8' > /etc/resolv.conf"
-                lxc_exec_live "$vmid" "systemctl enable systemd-resolved 2>/dev/null || true"
-                lxc_exec_live "$vmid" "systemctl start systemd-resolved 2>/dev/null || true"
-                ;;
-
-            *)
-                echo "Generic removal for $service..."
-
-                # Remove systemd service file
-                lxc_exec_live "$vmid" "rm -f /etc/systemd/system/${service}.service"
-
-                # Try to find and remove common paths
-                lxc_exec_live "$vmid" "rm -rf /opt/$service 2>/dev/null || true"
-                lxc_exec_live "$vmid" "rm -rf /var/lib/$service 2>/dev/null || true"
-                lxc_exec_live "$vmid" "rm -rf /etc/$service 2>/dev/null || true"
-
-                # Try to remove user
-                lxc_exec_live "$vmid" "userdel -r $service 2>/dev/null || true"
-                ;;
-        esac
-
-        # Reload systemd
+        # Reload systemd after removal
         echo ""
         echo "Reloading systemd..."
         lxc_exec_live "$vmid" "systemctl daemon-reload"
@@ -7449,17 +7684,12 @@ deploy_service_wizard() {
                 ip=$(get_container_ip "$selected")
 
                 local native_access_info=""
-                case "$service" in
-                    prometheus) native_access_info="http://${ip}:9090" ;;
-                    grafana) native_access_info="http://${ip}:3000 (admin/admin)" ;;
-                    gitea) native_access_info="http://${ip}:3000" ;;
-                    jenkins) native_access_info="http://${ip}:8080\n\nInitial password: cat /var/lib/jenkins/secrets/initialAdminPassword" ;;
-                    kiwi-tcms) native_access_info="http://${ip}/\n\nCreate admin user:\n  Run: /opt/kiwi/create_superuser.sh" ;;
-                    testlink) native_access_info="http://${ip}/\n\nComplete setup at: http://${ip}/install/index.php\nDB: testlink, User: testlink, Password: testlink123\n\nAfter setup, delete: /var/www/testlink/install" ;;
-                    sonarqube) native_access_info="http://${ip}:9000 (admin/admin)\n\nNote: First startup may take 1-2 minutes" ;;
-                    pihole) native_access_info="Admin: http://${ip}/admin\nPassword: admin\nDNS Server: ${ip}:53\n\nTo change password: pihole -a -p <newpassword>" ;;
-                    *) native_access_info="http://${ip}/" ;;
-                esac
+                # Get access info from plugin
+                if is_plugin_service "$service"; then
+                    native_access_info=$(get_plugin_native_access_info "$service" "$ip")
+                fi
+                # Generic fallback for unknown services
+                [[ -z "$native_access_info" ]] && native_access_info="http://${ip}/"
 
                 show_msg "Deployment Complete" "$service_name installed natively!\n\nContainer: $selected\nAccess: $native_access_info"
             else
@@ -7496,26 +7726,12 @@ deploy_service_wizard() {
                 ip=$(get_container_ip "$selected")
 
                 local access_info=""
-                case "$service" in
-                    prometheus) access_info="http://${ip}:9090" ;;
-                    grafana) access_info="http://${ip}:3000 (admin/admin)" ;;
-                    loki) access_info="http://${ip}:3100" ;;
-                    monitoring-stack) access_info="Grafana: http://${ip}:3000\nPrometheus: http://${ip}:9090" ;;
-                    sonarqube) access_info="http://${ip}:9000 (admin/admin)" ;;
-                    nexus) access_info="http://${ip}:8081" ;;
-                    gitea) access_info="http://${ip}:3000" ;;
-                    jenkins) access_info="http://${ip}:8080" ;;
-                    kiwi-tcms) access_info="https://${ip}:8443 (self-signed cert)\nNote: First startup takes 2-3 minutes for DB migrations" ;;
-                    selenium-grid) access_info="http://${ip}:4444" ;;
-                    testlink) access_info="http://${ip}/ (admin/admin123)\nNote: First startup takes 1-2 minutes for DB initialization" ;;
-                    harbor) access_info="Portal: http://${ip}/ (admin/Harbor12345)\nRegistry: ${ip}:5000\nNote: First startup takes 2-3 minutes" ;;
-                    traefik) access_info="Dashboard: http://${ip}:8080\nHTTP: http://${ip}\nHTTPS: https://${ip}" ;;
-                    pihole) access_info="Admin: http://${ip}/admin (admin)\nDNS Server: ${ip}:53\n\nSet as DNS on clients to block ads" ;;
-                    dependency-track) access_info="Frontend: http://${ip}:8080\nAPI Server: http://${ip}:8081\nDefault: admin/admin\n\nNote: First startup takes 2-3 minutes for DB init" ;;
-                    keycloak) access_info="Admin Console: http://${ip}:8080\nDefault: admin/admin\n\nNote: First startup takes 1-2 minutes" ;;
-                    freeipa) access_info="Web UI: https://${ip}/\nLDAP: ldap://${ip}:389\nLDAPS: ldaps://${ip}:636\nKerberos: ${ip}:88\n\nNote: First startup takes 5-10 minutes for setup\nCheck logs: docker logs -f freeipa" ;;
-                    postfix-relay) access_info="SMTP: ${ip}:25\nSubmission: ${ip}:587\n\nConfigure apps to use this as SMTP relay\nSet POSTFIX_ALLOWED_DOMAINS env var for allowed senders" ;;
-                esac
+                # Get access info from plugin
+                if is_plugin_service "$service"; then
+                    access_info=$(get_plugin_docker_access_info "$service" "$ip")
+                fi
+                # Generic fallback for unknown services
+                [[ -z "$access_info" ]] && access_info="http://${ip}/"
 
                 show_msg "Deployment Complete" "$service_name deployed successfully!\n\nAccess:\n$access_info"
             else
@@ -7787,6 +8003,10 @@ main() {
     detect_dialog
     init_config
     load_config
+
+    # Initialize and load plugins
+    init_builtin_plugins
+    load_plugins
 
     # Auto-connect to local PVE if running on PVE host
     if is_pve_host; then
