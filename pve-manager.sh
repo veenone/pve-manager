@@ -1337,17 +1337,36 @@ PLUGIN_VERSION="v2.10.0"
 PLUGIN_CATEGORY="devtools"
 PLUGIN_DESCRIPTION="Container registry with security scanning"
 PLUGIN_DOCKER_SUPPORT="true"
-PLUGIN_NATIVE_SUPPORT="false"
-PLUGIN_DOCKER_PORT="80"
-PLUGIN_DOCKER_URL="Portal: http://{IP}/ (admin/Harbor12345)\nRegistry: {IP}:5000"
+PLUGIN_NATIVE_SUPPORT="true"
+PLUGIN_DOCKER_PORT="443"
+PLUGIN_DOCKER_URL="Portal: https://{IP}/ (admin/Harbor12345)\nRegistry: docker login {IP}"
 PLUGIN_DOCKER_CREDENTIALS="admin/Harbor12345"
-PLUGIN_DOCKER_CONTAINER="harbor-portal"
+PLUGIN_DOCKER_CONTAINER="harbor-nginx"
 EOF
 
-    # compose.yml
+    # compose.yml with nginx for HTTPS
     cat > "$dir/compose.yml" << 'EOF'
 version: '3.8'
 services:
+  harbor-nginx:
+    image: nginx:alpine
+    container_name: harbor-nginx
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    depends_on:
+      - harbor-portal
+      - harbor-core
+      - harbor-registry
+
   harbor-core:
     image: goharbor/harbor-core:v2.10.0
     container_name: harbor-core
@@ -1356,9 +1375,16 @@ services:
       - apparmor:unconfined
     environment:
       - CONFIG_PATH=/etc/harbor/app.conf
+      - EXT_ENDPOINT=https://${HARBOR_HOSTNAME:-localhost}
+      - CORE_SECRET=${HARBOR_SECRET:-harbor-secret-key}
+      - JOBSERVICE_SECRET=${HARBOR_SECRET:-harbor-secret-key}
+      - REGISTRY_CREDENTIAL_USERNAME=harbor_registry_user
+      - REGISTRY_CREDENTIAL_PASSWORD=${HARBOR_SECRET:-harbor-secret-key}
     volumes:
       - harbor_data:/data
       - ./harbor.yml:/etc/harbor/app.conf:ro
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     depends_on:
       - harbor-db
       - harbor-redis
@@ -1369,8 +1395,9 @@ services:
     restart: unless-stopped
     security_opt:
       - apparmor:unconfined
-    ports:
-      - "80:8080"
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     depends_on:
       - harbor-core
 
@@ -1385,6 +1412,8 @@ services:
       - POSTGRES_PASSWORD=${HARBOR_DB_PASSWORD:-Harbor12345}
     volumes:
       - harbor_db:/var/lib/postgresql/data
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "postgres"]
       interval: 10s
@@ -1400,6 +1429,8 @@ services:
       - apparmor:unconfined
     volumes:
       - harbor_redis:/var/lib/redis
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
 
   harbor-registry:
     image: goharbor/registry-photon:v2.10.0
@@ -1407,10 +1438,10 @@ services:
     restart: unless-stopped
     security_opt:
       - apparmor:unconfined
-    ports:
-      - "5000:5000"
     volumes:
       - harbor_registry:/storage
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     environment:
       - REGISTRY_HTTP_SECRET=${HARBOR_SECRET:-harbor-secret-key}
 
@@ -1420,6 +1451,9 @@ services:
     restart: unless-stopped
     security_opt:
       - apparmor:unconfined
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     depends_on:
       - harbor-core
       - harbor-redis
@@ -1429,6 +1463,113 @@ volumes:
   harbor_db:
   harbor_redis:
   harbor_registry:
+EOF
+
+    # install.sh - Native Harbor installation using official installer
+    cat > "$dir/install.sh" << 'INSTALLEOF'
+#!/bin/bash
+# Native installation script for Harbor using official installer
+HARBOR_VERSION="v2.10.0"
+
+case "$OS_TYPE" in
+    debian|ubuntu)
+        echo "Installing Harbor dependencies..."
+        lxc_exec_live "$VMID" "apt-get update"
+        lxc_exec_live "$VMID" "apt-get install -y curl wget openssl tar"
+
+        # Install Docker if not present (Harbor requires Docker)
+        if ! lxc_exec "$VMID" "command -v docker" > /dev/null 2>&1; then
+            echo "Installing Docker for Harbor..."
+            lxc_exec_live "$VMID" "curl -fsSL https://get.docker.com | sh"
+            lxc_exec_live "$VMID" "systemctl enable docker"
+            lxc_exec_live "$VMID" "systemctl start docker"
+        fi
+
+        # Install docker-compose if not present
+        if ! lxc_exec "$VMID" "command -v docker-compose" > /dev/null 2>&1; then
+            echo "Installing docker-compose..."
+            lxc_exec_live "$VMID" "curl -L 'https://github.com/docker/compose/releases/latest/download/docker-compose-linux-\$(uname -m)' -o /usr/local/bin/docker-compose"
+            lxc_exec_live "$VMID" "chmod +x /usr/local/bin/docker-compose"
+        fi
+
+        # Download Harbor offline installer
+        echo "Downloading Harbor ${HARBOR_VERSION}..."
+        lxc_exec_live "$VMID" "mkdir -p /opt/harbor-installer"
+        lxc_exec_live "$VMID" "cd /opt/harbor-installer && wget -q https://github.com/goharbor/harbor/releases/download/${HARBOR_VERSION}/harbor-offline-installer-${HARBOR_VERSION}.tgz"
+        lxc_exec_live "$VMID" "cd /opt/harbor-installer && tar xzf harbor-offline-installer-${HARBOR_VERSION}.tgz"
+
+        # Get container IP for configuration
+        CONTAINER_IP=$(lxc_exec "$VMID" "hostname -I | awk '{print \$1}'" | tr -d '[:space:]')
+
+        # Generate SSL certificates
+        echo "Generating SSL certificates..."
+        lxc_exec_live "$VMID" "mkdir -p /opt/harbor-installer/harbor/ssl"
+        lxc_exec "$VMID" "openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+            -keyout /opt/harbor-installer/harbor/ssl/server.key \
+            -out /opt/harbor-installer/harbor/ssl/server.crt \
+            -subj '/C=US/ST=State/L=City/O=Harbor/CN=${CONTAINER_IP:-localhost}' \
+            -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1,IP:${CONTAINER_IP:-127.0.0.1}' 2>/dev/null"
+
+        # Create harbor.yml configuration
+        echo "Configuring Harbor..."
+        lxc_exec "$VMID" "cat > /opt/harbor-installer/harbor/harbor.yml << 'HARBORYCFG'
+hostname: ${CONTAINER_IP:-localhost}
+http:
+  port: 80
+https:
+  port: 443
+  certificate: /opt/harbor-installer/harbor/ssl/server.crt
+  private_key: /opt/harbor-installer/harbor/ssl/server.key
+harbor_admin_password: Harbor12345
+database:
+  password: Harbor12345
+  max_idle_conns: 50
+  max_open_conns: 100
+data_volume: /data/harbor
+trivy:
+  ignore_unfixed: false
+  skip_update: false
+  insecure: false
+jobservice:
+  max_job_workers: 10
+notification:
+  webhook_job_max_retry: 10
+log:
+  level: info
+  local:
+    rotate_count: 50
+    rotate_size: 200M
+    location: /var/log/harbor
+_version: 2.10.0
+HARBORYCFG"
+
+        # Prepare data directory
+        lxc_exec_live "$VMID" "mkdir -p /data/harbor"
+
+        # Run Harbor installer
+        echo "Installing Harbor..."
+        lxc_exec_live "$VMID" "cd /opt/harbor-installer/harbor && ./install.sh --with-trivy"
+
+        echo "Harbor installation complete!"
+        echo "Access Harbor at https://${CONTAINER_IP}/"
+        echo "Default credentials: admin / Harbor12345"
+        ;;
+    *)
+        echo "ERROR: Native Harbor installation only supported on Debian/Ubuntu"
+        exit 1
+        ;;
+esac
+INSTALLEOF
+
+    # remove.sh
+    cat > "$dir/remove.sh" << 'EOF'
+#!/bin/bash
+# Removal script for Harbor
+echo "Stopping Harbor services..."
+lxc_exec_live "$VMID" "cd /opt/harbor-installer/harbor && docker-compose down -v 2>/dev/null || true"
+lxc_exec_live "$VMID" "rm -rf /opt/harbor-installer"
+lxc_exec_live "$VMID" "rm -rf /data/harbor"
+echo "Harbor removed."
 EOF
 }
 
@@ -6179,6 +6320,18 @@ write_nginx_monitoring_config() {
     lxc_exec "$vmid" "echo '$nginx_config_b64' | base64 -d > ${service_dir}/nginx.conf"
 }
 
+# Write nginx config for Harbor HTTPS proxy
+# Uses base64 encoding to avoid variable substitution issues with heredocs
+write_nginx_harbor_config() {
+    local vmid="$1"
+    local service_dir="$2"
+
+    # Base64-encoded nginx config for Harbor (Portal at root, Registry at /v2/)
+    local nginx_config_b64="d29ya2VyX3Byb2Nlc3NlcyBhdXRvOwplcnJvcl9sb2cgL3Zhci9sb2cvbmdpbngvZXJyb3IubG9nIHdhcm47CnBpZCAvdmFyL3J1bi9uZ2lueC5waWQ7CgpldmVudHMgewogICAgd29ya2VyX2Nvbm5lY3Rpb25zIDEwMjQ7Cn0KCmh0dHAgewogICAgaW5jbHVkZSAvZXRjL25naW54L21pbWUudHlwZXM7CiAgICBkZWZhdWx0X3R5cGUgYXBwbGljYXRpb24vb2N0ZXQtc3RyZWFtOwogICAgc2VuZGZpbGUgb247CiAgICBrZWVwYWxpdmVfdGltZW91dCA2NTsKICAgIGNsaWVudF9tYXhfYm9keV9zaXplIDA7CgogICAgdXBzdHJlYW0gaGFyYm9yLXBvcnRhbCB7CiAgICAgICAgc2VydmVyIGhhcmJvci1wb3J0YWw6ODA4MDsKICAgIH0KCiAgICB1cHN0cmVhbSBoYXJib3ItY29yZSB7CiAgICAgICAgc2VydmVyIGhhcmJvci1jb3JlOjgwODA7CiAgICB9CgogICAgdXBzdHJlYW0gaGFyYm9yLXJlZ2lzdHJ5IHsKICAgICAgICBzZXJ2ZXIgaGFyYm9yLXJlZ2lzdHJ5OjUwMDA7CiAgICB9CgogICAgc2VydmVyIHsKICAgICAgICBsaXN0ZW4gODA7CiAgICAgICAgc2VydmVyX25hbWUgXzsKICAgICAgICByZXR1cm4gMzAxIGh0dHBzOi8vJGhvc3QkcmVxdWVzdF91cmk7CiAgICB9CgogICAgc2VydmVyIHsKICAgICAgICBsaXN0ZW4gNDQzIHNzbDsKICAgICAgICBzZXJ2ZXJfbmFtZSBfOwoKICAgICAgICBzc2xfY2VydGlmaWNhdGUgL2V0Yy9uZ2lueC9zc2wvc2VydmVyLmNydDsKICAgICAgICBzc2xfY2VydGlmaWNhdGVfa2V5IC9ldGMvbmdpbngvc3NsL3NlcnZlci5rZXk7CiAgICAgICAgc3NsX3Byb3RvY29scyBUTFN2MS4yIFRMU3YxLjM7CiAgICAgICAgc3NsX2NpcGhlcnMgSElHSDohYU5VTEw6IU1ENTsKCiAgICAgICAgY2xpZW50X21heF9ib2R5X3NpemUgMDsKICAgICAgICBjaHVua2VkX3RyYW5zZmVyX2VuY29kaW5nIG9uOwoKICAgICAgICBsb2NhdGlvbiAvIHsKICAgICAgICAgICAgcHJveHlfcGFzcyBodHRwOi8vaGFyYm9yLXBvcnRhbDsKICAgICAgICAgICAgcHJveHlfaHR0cF92ZXJzaW9uIDEuMTsKICAgICAgICAgICAgcHJveHlfc2V0X2hlYWRlciBIb3N0ICRob3N0OwogICAgICAgICAgICBwcm94eV9zZXRfaGVhZGVyIFgtUmVhbC1JUCAkcmVtb3RlX2FkZHI7CiAgICAgICAgICAgIHByb3h5X3NldF9oZWFkZXIgWC1Gb3J3YXJkZWQtRm9yICRwcm94eV9hZGRfeF9mb3J3YXJkZWRfZm9yOwogICAgICAgICAgICBwcm94eV9zZXRfaGVhZGVyIFgtRm9yd2FyZGVkLVByb3RvIGh0dHBzOwogICAgICAgIH0KCiAgICAgICAgbG9jYXRpb24gL2FwaS8gewogICAgICAgICAgICBwcm94eV9wYXNzIGh0dHA6Ly9oYXJib3ItY29yZS9hcGkvOwogICAgICAgICAgICBwcm94eV9odHRwX3ZlcnNpb24gMS4xOwogICAgICAgICAgICBwcm94eV9zZXRfaGVhZGVyIEhvc3QgJGhvc3Q7CiAgICAgICAgICAgIHByb3h5X3NldF9oZWFkZXIgWC1SZWFsLUlQICRyZW1vdGVfYWRkcjsKICAgICAgICAgICAgcHJveHlfc2V0X2hlYWRlciBYLUZvcndhcmRlZC1Gb3IgJHByb3h5X2FkZF94X2ZvcndhcmRlZF9mb3I7CiAgICAgICAgICAgIHByb3h5X3NldF9oZWFkZXIgWC1Gb3J3YXJkZWQtUHJvdG8gaHR0cHM7CiAgICAgICAgfQoKICAgICAgICBsb2NhdGlvbiAvc2VydmljZS8gewogICAgICAgICAgICBwcm94eV9wYXNzIGh0dHA6Ly9oYXJib3ItY29yZS9zZXJ2aWNlLzsKICAgICAgICAgICAgcHJveHlfaHR0cF92ZXJzaW9uIDEuMTsKICAgICAgICAgICAgcHJveHlfc2V0X2hlYWRlciBIb3N0ICRob3N0OwogICAgICAgICAgICBwcm94eV9zZXRfaGVhZGVyIFgtUmVhbC1JUCAkcmVtb3RlX2FkZHI7CiAgICAgICAgICAgIHByb3h5X3NldF9oZWFkZXIgWC1Gb3J3YXJkZWQtRm9yICRwcm94eV9hZGRfeF9mb3J3YXJkZWRfZm9yOwogICAgICAgICAgICBwcm94eV9zZXRfaGVhZGVyIFgtRm9yd2FyZGVkLVByb3RvIGh0dHBzOwogICAgICAgIH0KCiAgICAgICAgbG9jYXRpb24gL3YyLyB7CiAgICAgICAgICAgIHByb3h5X3Bhc3MgaHR0cDovL2hhcmJvci1yZWdpc3RyeS92Mi87CiAgICAgICAgICAgIHByb3h5X2h0dHBfdmVyc2lvbiAxLjE7CiAgICAgICAgICAgIHByb3h5X3NldF9oZWFkZXIgSG9zdCAkaG9zdDsKICAgICAgICAgICAgcHJveHlfc2V0X2hlYWRlciBYLVJlYWwtSVAgJHJlbW90ZV9hZGRyOwogICAgICAgICAgICBwcm94eV9zZXRfaGVhZGVyIFgtRm9yd2FyZGVkLUZvciAkcHJveHlfYWRkX3hfZm9yd2FyZGVkX2ZvcjsKICAgICAgICAgICAgcHJveHlfc2V0X2hlYWRlciBYLUZvcndhcmRlZC1Qcm90byBodHRwczsKICAgICAgICAgICAgcHJveHlfYnVmZmVyaW5nIG9mZjsKICAgICAgICAgICAgcHJveHlfcmVxdWVzdF9idWZmZXJpbmcgb2ZmOwogICAgICAgIH0KCiAgICAgICAgbG9jYXRpb24gL2MvIHsKICAgICAgICAgICAgcHJveHlfcGFzcyBodHRwOi8vaGFyYm9yLWNvcmUvYy87CiAgICAgICAgICAgIHByb3h5X2h0dHBfdmVyc2lvbiAxLjE7CiAgICAgICAgICAgIHByb3h5X3NldF9oZWFkZXIgSG9zdCAkaG9zdDsKICAgICAgICAgICAgcHJveHlfc2V0X2hlYWRlciBYLVJlYWwtSVAgJHJlbW90ZV9hZGRyOwogICAgICAgICAgICBwcm94eV9zZXRfaGVhZGVyIFgtRm9yd2FyZGVkLUZvciAkcHJveHlfYWRkX3hfZm9yd2FyZGVkX2ZvcjsKICAgICAgICAgICAgcHJveHlfc2V0X2hlYWRlciBYLUZvcndhcmRlZC1Qcm90byBodHRwczsKICAgICAgICB9CgogICAgICAgIGxvY2F0aW9uIC9jaGFydHJlcG8vIHsKICAgICAgICAgICAgcHJveHlfcGFzcyBodHRwOi8vaGFyYm9yLWNvcmUvY2hhcnRyZXBvLzsKICAgICAgICAgICAgcHJveHlfaHR0cF92ZXJzaW9uIDEuMTsKICAgICAgICAgICAgcHJveHlfc2V0X2hlYWRlciBIb3N0ICRob3N0OwogICAgICAgICAgICBwcm94eV9zZXRfaGVhZGVyIFgtUmVhbC1JUCAkcmVtb3RlX2FkZHI7CiAgICAgICAgICAgIHByb3h5X3NldF9oZWFkZXIgWC1Gb3J3YXJkZWQtRm9yICRwcm94eV9hZGRfeF9mb3J3YXJkZWRfZm9yOwogICAgICAgICAgICBwcm94eV9zZXRfaGVhZGVyIFgtRm9yd2FyZGVkLVByb3RvIGh0dHBzOwogICAgICAgIH0KICAgIH0KfQo="
+
+    lxc_exec "$vmid" "echo '$nginx_config_b64' | base64 -d > ${service_dir}/nginx.conf"
+}
+
 # Provision Grafana datasources and dashboards for monitoring stack
 provision_grafana_dashboards() {
     local vmid="$1"
@@ -6435,6 +6588,49 @@ ALLOYEOF"
                 echo "Configuring system settings for Dependency-Track..."
                 # Dependency-Track API server needs more memory for processing large SBOMs
                 lxc_exec_live "$vmid" "sysctl -w vm.max_map_count=262144 2>/dev/null || true"
+                echo ""
+                ;;
+            harbor)
+                echo "Setting up SSL certificates for Harbor..."
+                # Get container IP for certificate
+                container_ip=$(lxc_exec "$vmid" "hostname -I | awk '{print \$1}'" 2>/dev/null | tr -d '[:space:]')
+                lxc_exec_live "$vmid" "mkdir -p ${service_dir}/ssl"
+                # Generate self-signed SSL certificate
+                lxc_exec "$vmid" "openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+                    -keyout ${service_dir}/ssl/server.key \
+                    -out ${service_dir}/ssl/server.crt \
+                    -subj '/C=US/ST=State/L=City/O=Harbor/CN=${container_ip:-localhost}' \
+                    -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1,IP:${container_ip:-127.0.0.1}' 2>/dev/null"
+                lxc_exec_live "$vmid" "chmod 600 ${service_dir}/ssl/server.key"
+                echo "SSL certificates generated."
+
+                echo "Writing nginx.conf..."
+                write_nginx_harbor_config "$vmid" "$service_dir"
+                echo "Done."
+
+                # Create minimal harbor.yml for core service config
+                echo "Writing harbor.yml configuration..."
+                lxc_exec "$vmid" "cat > ${service_dir}/harbor.yml << 'HARBOREOF'
+hostname: ${container_ip:-localhost}
+http:
+  port: 80
+https:
+  port: 443
+harbor_admin_password: Harbor12345
+database:
+  password: Harbor12345
+  max_idle_conns: 50
+  max_open_conns: 100
+data_volume: /data
+log:
+  level: info
+  local:
+    rotate_count: 50
+    rotate_size: 200M
+    location: /var/log/harbor
+_version: 2.10.0
+HARBOREOF"
+                echo "Done."
                 echo ""
                 ;;
         esac
