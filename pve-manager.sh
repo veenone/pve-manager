@@ -1463,9 +1463,40 @@ HARBORYCFG"
         # Prepare data directory
         lxc_exec_live "$VMID" "mkdir -p /data/harbor"
 
+        # Configure Docker to work in LXC environment
+        echo "Configuring Docker for LXC environment..."
+        lxc_exec "$VMID" 'mkdir -p /etc/docker && cat > /etc/docker/daemon.json << DAEMONJSON
+{
+  "storage-driver": "overlay2",
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  }
+}
+DAEMONJSON'
+        lxc_exec_live "$VMID" "systemctl restart docker"
+        sleep 2
+
         # Run Harbor installer
         echo "Installing Harbor (this may take several minutes)..."
         lxc_exec_live "$VMID" "cd /opt/harbor && ./install.sh --with-trivy"
+
+        # Fix AppArmor issues for LXC by adding security_opt to all services
+        echo "Applying LXC compatibility fixes..."
+        # Install PyYAML if not present, then add security_opt to disable AppArmor
+        lxc_exec "$VMID" "apt-get install -y python3-yaml >/dev/null 2>&1 || pip3 install pyyaml >/dev/null 2>&1 || true"
+        lxc_exec "$VMID" "cd /opt/harbor && python3 -c \"
+import yaml
+with open('docker-compose.yml', 'r') as f:
+    data = yaml.safe_load(f)
+for svc in data.get('services', {}).values():
+    svc['security_opt'] = ['apparmor:unconfined']
+with open('docker-compose.yml', 'w') as f:
+    yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+\""
+        # Restart with fixed config
+        lxc_exec_live "$VMID" "cd /opt/harbor && docker-compose down && docker-compose up -d"
 
         # Create symlink for service directory compatibility
         lxc_exec_live "$VMID" "ln -sf /opt/harbor /opt/services/harbor 2>/dev/null || true"
@@ -6603,10 +6634,43 @@ HARBOREOF"
                 # Prepare data directory
                 lxc_exec_live "$vmid" "mkdir -p /data/harbor"
 
+                # Configure Docker to skip AppArmor (required for LXC containers)
+                echo "Configuring Docker for LXC environment..."
+                lxc_exec "$vmid" 'mkdir -p /etc/docker && cat > /etc/docker/daemon.json << DAEMONJSON
+{
+  "storage-driver": "overlay2",
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  },
+  "no-new-privileges": false
+}
+DAEMONJSON'
+                # Restart Docker to apply settings
+                lxc_exec_live "$vmid" "systemctl restart docker"
+                sleep 2
+
                 # Run Harbor installer (this pulls images and starts containers)
                 echo ""
                 echo "Running Harbor installer (this may take several minutes)..."
                 lxc_exec_live "$vmid" "cd /opt/harbor && ./install.sh --with-trivy"
+
+                # Fix AppArmor issues for LXC by adding security_opt to all services
+                echo "Applying LXC compatibility fixes..."
+                # Install PyYAML if not present, then add security_opt to disable AppArmor
+                lxc_exec "$vmid" "apt-get install -y python3-yaml >/dev/null 2>&1 || pip3 install pyyaml >/dev/null 2>&1 || true"
+                lxc_exec "$vmid" "cd /opt/harbor && python3 -c \"
+import yaml
+with open('docker-compose.yml', 'r') as f:
+    data = yaml.safe_load(f)
+for svc in data.get('services', {}).values():
+    svc['security_opt'] = ['apparmor:unconfined']
+with open('docker-compose.yml', 'w') as f:
+    yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+\""
+                # Restart with fixed config
+                lxc_exec_live "$vmid" "cd /opt/harbor && docker-compose down && docker-compose up -d"
 
                 # Create symlink for service directory compatibility
                 lxc_exec_live "$vmid" "ln -sf /opt/harbor ${service_dir} 2>/dev/null || true"
