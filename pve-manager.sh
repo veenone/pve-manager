@@ -3889,6 +3889,416 @@ get_next_vmid() {
     fi
 }
 
+# ============================================================================
+# VM (QEMU) Helper Functions
+# ============================================================================
+
+# List all VMs
+pve_list_vms() {
+    pve_exec "qm list 2>/dev/null | tail -n +2 | awk '{printf \"%-10s %-12s %-6s %s\\n\", \$1, \$3, \$2, \$4}'"
+}
+
+# Get VM status
+vm_status() {
+    local vmid="$1"
+    pve_exec "qm status $vmid 2>/dev/null | awk '{print \$2}'"
+}
+
+# Check if QEMU Guest Agent is available
+vm_has_guest_agent() {
+    local vmid="$1"
+    local result
+    result=$(pve_exec "qm agent $vmid ping 2>/dev/null && echo 'ok'" 2>/dev/null)
+    [[ "$result" == *"ok"* ]]
+}
+
+# Execute command in VM via QEMU Guest Agent
+vm_exec() {
+    local vmid="$1"
+    shift
+    local cmd="$*"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+
+    # Log command being executed (debug level)
+    [[ "${LOG_LEVEL:-INFO}" == "DEBUG" ]] && echo "[$timestamp] [VM-EXEC] vmid=$vmid cmd=$cmd" >> "$OPERATIONS_LOG" 2>/dev/null
+
+    if [[ "$IS_LOCAL_PVE" == true ]]; then
+        # Use qm guest exec - output is JSON, extract out-data
+        local result
+        result=$(qm guest exec "$vmid" -- /bin/bash -c "$cmd" 2>/dev/null)
+        # Extract output from JSON response
+        echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('out-data','').rstrip())" 2>/dev/null || echo "$result"
+    else
+        local cmd_b64
+        cmd_b64=$(echo -n "$cmd" | base64 -w0)
+        ssh -o ConnectTimeout=10 -p "$CURRENT_PVE_PORT" \
+            "${CURRENT_PVE_USER}@${CURRENT_PVE_HOST}" \
+            "result=\$(qm guest exec $vmid -- /bin/bash -c \"\$(echo $cmd_b64 | base64 -d)\" 2>/dev/null); echo \"\$result\" | python3 -c \"import sys,json; d=json.load(sys.stdin); print(d.get('out-data','').rstrip())\" 2>/dev/null || echo \"\$result\"" < /dev/null
+    fi
+}
+
+# Execute command in VM with live output
+vm_exec_live() {
+    local vmid="$1"
+    shift
+    local cmd="$*"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+
+    # Log command being executed
+    echo "[$timestamp] [VM-EXEC] vmid=$vmid cmd=$cmd" >> "$OPERATIONS_LOG" 2>/dev/null
+
+    if [[ "$IS_LOCAL_PVE" == true ]]; then
+        local result
+        result=$(qm guest exec "$vmid" -- /bin/bash -c "$cmd" 2>&1)
+        echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('out-data','').rstrip())" 2>/dev/null | tee -a "$OPERATIONS_LOG" || echo "$result" | tee -a "$OPERATIONS_LOG"
+    else
+        local cmd_b64
+        cmd_b64=$(echo -n "$cmd" | base64 -w0)
+        ssh -o ConnectTimeout=10 -p "$CURRENT_PVE_PORT" \
+            "${CURRENT_PVE_USER}@${CURRENT_PVE_HOST}" \
+            "result=\$(qm guest exec $vmid -- /bin/bash -c \"\$(echo $cmd_b64 | base64 -d)\" 2>&1); echo \"\$result\" | python3 -c \"import sys,json; d=json.load(sys.stdin); print(d.get('out-data','').rstrip())\" 2>/dev/null || echo \"\$result\"" < /dev/null 2>&1 | tee -a "$OPERATIONS_LOG"
+    fi
+}
+
+# Write file to VM via QEMU Guest Agent
+vm_write_file() {
+    local vmid="$1"
+    local dest_path="$2"
+    local content="$3"
+
+    # Encode content as base64
+    local content_b64
+    content_b64=$(echo -n "$content" | base64 -w0)
+
+    # Use guest-file-write via qm guest exec
+    vm_exec "$vmid" "echo '$content_b64' | base64 -d > '$dest_path'"
+}
+
+# Copy file to VM via QEMU Guest Agent
+vm_push_file() {
+    local vmid="$1"
+    local src_path="$2"
+    local dest_path="$3"
+
+    if [[ ! -f "$src_path" ]]; then
+        log_error "Source file not found: $src_path"
+        return 1
+    fi
+
+    # Read and encode file
+    local content_b64
+    content_b64=$(base64 -w0 "$src_path")
+
+    # Write to VM
+    vm_exec "$vmid" "echo '$content_b64' | base64 -d > '$dest_path'"
+}
+
+# Get VM hostname
+vm_get_hostname() {
+    local vmid="$1"
+    vm_exec "$vmid" "hostname" 2>/dev/null | tr -d '[:space:]'
+}
+
+# Get VM IP address
+vm_get_ip() {
+    local vmid="$1"
+    # Try to get IP from guest agent
+    local ip
+    ip=$(pve_exec "qm guest cmd $vmid network-get-interfaces 2>/dev/null | python3 -c \"
+import sys, json
+data = json.load(sys.stdin)
+for iface in data:
+    if iface.get('name') not in ['lo', 'docker0']:
+        for addr in iface.get('ip-addresses', []):
+            if addr.get('ip-address-type') == 'ipv4':
+                print(addr.get('ip-address'))
+                sys.exit(0)
+\" 2>/dev/null")
+    echo "$ip"
+}
+
+# Detect VM OS type
+detect_vm_os() {
+    local vmid="$1"
+    local os_info
+    os_info=$(vm_exec "$vmid" "cat /etc/os-release 2>/dev/null | grep ^ID= | cut -d= -f2 | tr -d '\"'")
+    echo "$os_info"
+}
+
+# Deploy certificate to VM
+vm_deploy_cert() {
+    local vmid="$1"
+    local hostname="$2"
+    local cert_dir="$CERTS_DIR/$hostname"
+
+    if [[ ! -d "$cert_dir" ]]; then
+        log_error "Certificate directory not found: $cert_dir"
+        return 1
+    fi
+
+    # Check guest agent
+    if ! vm_has_guest_agent "$vmid"; then
+        log_error "QEMU Guest Agent not available on VM $vmid"
+        return 1
+    fi
+
+    log_info "Deploying certificate to VM $vmid"
+
+    # Create directory in VM
+    vm_exec "$vmid" "mkdir -p /etc/ssl/pve-manager"
+
+    # Copy files
+    local key_file="$cert_dir/${hostname}.key"
+    local crt_file="$cert_dir/${hostname}.crt"
+    local chain_file="$cert_dir/${hostname}-chain.pem"
+    local ca_crt="$CA_DIR/ca.crt"
+
+    # Push files using base64 encoding
+    vm_push_file "$vmid" "$key_file" "/etc/ssl/pve-manager/${hostname}.key"
+    vm_push_file "$vmid" "$crt_file" "/etc/ssl/pve-manager/${hostname}.crt"
+    vm_push_file "$vmid" "$chain_file" "/etc/ssl/pve-manager/${hostname}-chain.pem"
+    vm_push_file "$vmid" "$ca_crt" "/etc/ssl/pve-manager/ca.crt"
+
+    # Set permissions
+    vm_exec "$vmid" "chmod 600 /etc/ssl/pve-manager/*.key"
+    vm_exec "$vmid" "chmod 644 /etc/ssl/pve-manager/*.crt /etc/ssl/pve-manager/*.pem"
+
+    # Install CA cert to system trust store
+    local os_type
+    os_type=$(detect_vm_os "$vmid")
+
+    case "$os_type" in
+        debian|ubuntu)
+            vm_exec "$vmid" "cp /etc/ssl/pve-manager/ca.crt /usr/local/share/ca-certificates/pve-manager-ca.crt"
+            vm_exec "$vmid" "update-ca-certificates"
+            ;;
+        centos|rhel|rocky|almalinux|fedora)
+            vm_exec "$vmid" "cp /etc/ssl/pve-manager/ca.crt /etc/pki/ca-trust/source/anchors/pve-manager-ca.crt"
+            vm_exec "$vmid" "update-ca-trust"
+            ;;
+        alpine)
+            vm_exec "$vmid" "cp /etc/ssl/pve-manager/ca.crt /usr/local/share/ca-certificates/pve-manager-ca.crt"
+            vm_exec "$vmid" "update-ca-certificates"
+            ;;
+    esac
+
+    log_info "Certificate deployed to VM $vmid"
+    return 0
+}
+
+# ============================================================================
+# VM Management Menu
+# ============================================================================
+
+vm_management_menu() {
+    while true; do
+        if [[ -z "$CURRENT_PVE" ]]; then
+            show_msg "Not Connected" "Please connect to a PVE server first."
+            return
+        fi
+
+        local choice
+        choice=$(show_menu "VM Management" "Select an operation:" \
+            "1" "List VMs" \
+            "2" "VM details" \
+            "3" "Deploy certificate to VM" \
+            "4" "Execute command in VM" \
+            "0" "Back to main menu")
+
+        case "$choice" in
+            1)
+                show_info "Loading..." "Fetching VM list..."
+                local vms
+                vms=$(pve_list_vms)
+
+                if [[ -z "$vms" ]]; then
+                    show_msg "No VMs" "No virtual machines found on this PVE host."
+                else
+                    local tmpfile="/tmp/pve-vms-$$.txt"
+                    echo "VMID       Status       Mem    Name" > "$tmpfile"
+                    echo "----------------------------------------" >> "$tmpfile"
+                    echo "$vms" >> "$tmpfile"
+                    show_textbox "Virtual Machines" "$tmpfile"
+                    rm -f "$tmpfile"
+                fi
+                ;;
+            2)
+                local vms
+                vms=$(pve_list_vms)
+                if [[ -z "$vms" ]]; then
+                    show_msg "No VMs" "No virtual machines found."
+                    continue
+                fi
+
+                local vm_array=()
+                while read -r vmid status mem name; do
+                    [[ -z "$vmid" ]] && continue
+                    vm_array+=("$vmid" "$name ($status)")
+                done <<< "$vms"
+
+                local selected
+                selected=$(show_menu "VM Details" "Select VM:" "${vm_array[@]}")
+
+                if [[ -n "$selected" ]]; then
+                    show_info "Loading..." "Fetching VM details..."
+                    local details
+                    details=$(pve_exec "qm config $selected 2>/dev/null")
+
+                    # Add guest agent status
+                    local ga_status="Not available"
+                    if vm_has_guest_agent "$selected"; then
+                        ga_status="Available"
+                        local vm_ip
+                        vm_ip=$(vm_get_ip "$selected")
+                        [[ -n "$vm_ip" ]] && ga_status="Available (IP: $vm_ip)"
+                    fi
+
+                    local tmpfile="/tmp/pve-vm-details-$$.txt"
+                    echo "=== VM $selected Configuration ===" > "$tmpfile"
+                    echo "" >> "$tmpfile"
+                    echo "Guest Agent: $ga_status" >> "$tmpfile"
+                    echo "" >> "$tmpfile"
+                    echo "$details" >> "$tmpfile"
+                    show_textbox "VM $selected Details" "$tmpfile"
+                    rm -f "$tmpfile"
+                fi
+                ;;
+            3)
+                # Deploy certificate to VM
+                if [[ ! -f "$CA_DIR/ca.key" ]]; then
+                    show_msg "No CA" "CA not initialized. Please initialize CA first in Certificate Management."
+                    continue
+                fi
+
+                local vms
+                vms=$(pve_list_vms)
+                if [[ -z "$vms" ]]; then
+                    show_msg "No VMs" "No virtual machines found."
+                    continue
+                fi
+
+                # Filter running VMs only
+                local vm_array=()
+                while read -r vmid status mem name; do
+                    [[ -z "$vmid" ]] && continue
+                    [[ "$status" != "running" ]] && continue
+                    vm_array+=("$vmid" "$name ($status)")
+                done <<< "$vms"
+
+                if [[ ${#vm_array[@]} -eq 0 ]]; then
+                    show_msg "No Running VMs" "No running VMs found. VMs must be running with QEMU Guest Agent for certificate deployment."
+                    continue
+                fi
+
+                local selected
+                selected=$(show_menu "Deploy Certificate" "Select VM (must have QEMU Guest Agent):" "${vm_array[@]}")
+
+                if [[ -n "$selected" ]]; then
+                    # Check guest agent
+                    show_info "Checking..." "Verifying QEMU Guest Agent..."
+                    if ! vm_has_guest_agent "$selected"; then
+                        show_msg "Guest Agent Required" "QEMU Guest Agent is not available on VM $selected.\n\nPlease ensure:\n1. qemu-guest-agent is installed in the VM\n2. Guest Agent is enabled in VM options\n3. VM is running"
+                        continue
+                    fi
+
+                    # Get hostname
+                    local hostname
+                    hostname=$(vm_get_hostname "$selected")
+                    if [[ -z "$hostname" ]]; then
+                        hostname=$(show_input "VM Hostname" "Enter hostname for certificate:" "vm-$selected")
+                        [[ -z "$hostname" ]] && continue
+                    fi
+
+                    # Check if certificate exists
+                    if [[ ! -f "$CERTS_DIR/$hostname/$hostname.crt" ]]; then
+                        if show_yesno "Generate Certificate" "No certificate found for '$hostname'.\n\nGenerate a new certificate?"; then
+                            (
+                                echo "Generating certificate for $hostname..."
+                                ca_generate_cert "$hostname"
+                                echo "Certificate generated."
+                            ) | show_progress_box "Generate Certificate"
+                        else
+                            continue
+                        fi
+                    fi
+
+                    # Deploy
+                    (
+                        echo "=== Deploying Certificate to VM $selected ==="
+                        echo ""
+                        echo "Hostname: $hostname"
+                        echo ""
+                        echo "Copying certificate files..."
+                        vm_deploy_cert "$selected" "$hostname"
+                        echo ""
+                        echo "Certificate deployed successfully!"
+                        echo ""
+                        echo "Files deployed to /etc/ssl/pve-manager/:"
+                        echo "  - ${hostname}.key (private key)"
+                        echo "  - ${hostname}.crt (certificate)"
+                        echo "  - ${hostname}-chain.pem (full chain)"
+                        echo "  - ca.crt (CA certificate)"
+                    ) | show_progress_box "Deploy Certificate to VM"
+                fi
+                ;;
+            4)
+                # Execute command in VM
+                local vms
+                vms=$(pve_list_vms)
+                if [[ -z "$vms" ]]; then
+                    show_msg "No VMs" "No virtual machines found."
+                    continue
+                fi
+
+                # Filter running VMs only
+                local vm_array=()
+                while read -r vmid status mem name; do
+                    [[ -z "$vmid" ]] && continue
+                    [[ "$status" != "running" ]] && continue
+                    vm_array+=("$vmid" "$name ($status)")
+                done <<< "$vms"
+
+                if [[ ${#vm_array[@]} -eq 0 ]]; then
+                    show_msg "No Running VMs" "No running VMs found."
+                    continue
+                fi
+
+                local selected
+                selected=$(show_menu "Execute Command" "Select VM:" "${vm_array[@]}")
+
+                if [[ -n "$selected" ]]; then
+                    # Check guest agent
+                    if ! vm_has_guest_agent "$selected"; then
+                        show_msg "Guest Agent Required" "QEMU Guest Agent is not available on VM $selected."
+                        continue
+                    fi
+
+                    local cmd
+                    cmd=$(show_input "Command" "Enter command to execute in VM $selected:" "")
+                    if [[ -n "$cmd" ]]; then
+                        (
+                            echo "=== Executing Command in VM $selected ==="
+                            echo "Command: $cmd"
+                            echo ""
+                            echo "Output:"
+                            echo "----------------------------------------"
+                            vm_exec_live "$selected" "$cmd"
+                            echo "----------------------------------------"
+                            echo ""
+                            echo "Command completed."
+                        ) | show_progress_box "Execute Command"
+                    fi
+                fi
+                ;;
+            0|"")
+                return
+                ;;
+        esac
+    done
+}
+
 # LXC Creation Wizard
 lxc_create_wizard() {
     # Check connection
@@ -8658,21 +9068,23 @@ main_menu() {
         choice=$(show_menu "PVE Manager v$VERSION" "Status: $connection_status\n\nSelect an option:" \
             "1" "Connect to PVE Server" \
             "2" "LXC Container Management" \
-            "3" "Docker Setup" \
-            "4" "SSH Key Management" \
-            "5" "Service Deployment" \
-            "6" "Certificate Management" \
-            "7" "Settings" \
+            "3" "VM Management" \
+            "4" "Docker Setup" \
+            "5" "SSH Key Management" \
+            "6" "Service Deployment" \
+            "7" "Certificate Management" \
+            "8" "Settings" \
             "0" "Exit")
 
         case "$choice" in
             1) pve_connection_menu ;;
             2) lxc_management_menu ;;
-            3) docker_setup_menu ;;
-            4) ssh_management_menu ;;
-            5) service_deployment_menu ;;
-            6) certificate_menu ;;
-            7) settings_menu ;;
+            3) vm_management_menu ;;
+            4) docker_setup_menu ;;
+            5) ssh_management_menu ;;
+            6) service_deployment_menu ;;
+            7) certificate_menu ;;
+            8) settings_menu ;;
             0|"")
                 if show_yesno "Exit" "Are you sure you want to exit?"; then
                     clear
@@ -8699,6 +9111,7 @@ Options:
 
 Features:
   - LXC container creation and management
+  - VM management with QEMU Guest Agent support
   - Docker installation and configuration
   - SSH key management and distribution
   - Self-signed CA and certificate management
