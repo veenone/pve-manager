@@ -3995,6 +3995,31 @@ vm_push_file() {
     vm_exec "$vmid" "echo '$content_b64' | base64 -d > '$dest_path'"
 }
 
+# Execute command in VM with timeout (returns exit code, captures output)
+vm_exec_timeout() {
+    local vmid="$1"
+    local timeout_secs="${2:-10}"
+    shift 2
+    local cmd="$*"
+
+    if [[ "$IS_LOCAL_PVE" == true ]]; then
+        local result
+        result=$(timeout "$timeout_secs" qm guest exec "$vmid" -- /bin/bash -c "$cmd" 2>/dev/null)
+        local rc=$?
+        if [[ $rc -eq 124 ]]; then
+            return 124
+        fi
+        echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('out-data','').rstrip())" 2>/dev/null || echo "$result"
+        return $rc
+    else
+        local cmd_b64
+        cmd_b64=$(echo -n "$cmd" | base64 -w0)
+        timeout "$timeout_secs" ssh -o ConnectTimeout=5 -p "$CURRENT_PVE_PORT" \
+            "${CURRENT_PVE_USER}@${CURRENT_PVE_HOST}" \
+            "result=\$(qm guest exec $vmid -- /bin/bash -c \"\$(echo $cmd_b64 | base64 -d)\" 2>/dev/null); echo \"\$result\" | python3 -c \"import sys,json; d=json.load(sys.stdin); print(d.get('out-data','').rstrip())\" 2>/dev/null || echo \"\$result\"" < /dev/null
+    fi
+}
+
 # Get VM hostname
 vm_get_hostname() {
     local vmid="$1"
@@ -4088,6 +4113,906 @@ vm_deploy_cert() {
     return 0
 }
 
+# Enable HTTPS wizard for VMs (mirrors enable_https_wizard for LXC)
+vm_enable_https_wizard() {
+    # Check if CA is initialized
+    if [[ ! -f "$CA_DIR/ca.key" ]]; then
+        show_msg "CA Not Initialized" "Certificate Authority is not initialized.\n\nPlease go to Certificate Management and initialize the CA first."
+        return
+    fi
+
+    local vms
+    vms=$(pve_list_vms)
+    if [[ -z "$vms" ]]; then
+        show_msg "No VMs" "No virtual machines found."
+        return
+    fi
+
+    # Filter running VMs only
+    local vm_array=()
+    while read -r vmid status mem name; do
+        [[ -z "$vmid" ]] && continue
+        [[ "$status" != "running" ]] && continue
+        vm_array+=("$vmid" "$name ($status)")
+    done <<< "$vms"
+
+    if [[ ${#vm_array[@]} -eq 0 ]]; then
+        show_msg "No Running VMs" "No running VMs found. VMs must be running with QEMU Guest Agent."
+        return
+    fi
+
+    local selected
+    selected=$(show_menu "Enable HTTPS" "Select VM (must have QEMU Guest Agent):" "${vm_array[@]}")
+    [[ -z "$selected" ]] && return
+
+    # Check guest agent
+    show_info "Checking..." "Verifying QEMU Guest Agent..."
+    if ! vm_has_guest_agent "$selected"; then
+        show_msg "Guest Agent Required" "QEMU Guest Agent is not available on VM $selected.\n\nPlease ensure:\n1. qemu-guest-agent is installed in the VM\n2. Guest Agent is enabled in VM options\n3. VM is running"
+        return
+    fi
+
+    # Check for nginx or Docker
+    local has_nginx is_docker_mode="false"
+    has_nginx=$(vm_exec "$selected" "which nginx 2>/dev/null")
+
+    if [[ -z "$has_nginx" ]]; then
+        # No native nginx — check if Docker is available as fallback
+        local has_docker
+        has_docker=$(vm_exec "$selected" "which docker 2>/dev/null")
+        if [[ -z "$has_docker" ]]; then
+            show_msg "No Nginx or Docker" "Neither nginx nor Docker is installed in VM $selected.\n\nHTTPS enablement requires nginx (native) or Docker to add an nginx container."
+            return
+        fi
+        is_docker_mode="true"
+    fi
+
+    # Find services that can be HTTPS-enabled
+    show_info "Detecting..." "Scanning for HTTPS-compatible services..."
+    local svc_array=()
+
+    if [[ "$is_docker_mode" == "true" ]]; then
+        # Docker mode: detect services via /opt/services/<svc>/docker-compose.yml
+        if vm_exec "$selected" "test -f /opt/services/jenkins/docker-compose.yml" 2>/dev/null; then
+            svc_array+=("docker:jenkins" "Jenkins (Docker)")
+        fi
+        if vm_exec "$selected" "test -f /opt/services/gitea/docker-compose.yml" 2>/dev/null; then
+            svc_array+=("docker:gitea" "Gitea (Docker)")
+        fi
+        if vm_exec "$selected" "test -f /opt/services/kiwi-tcms/docker-compose.yml" 2>/dev/null; then
+            svc_array+=("docker:kiwi-tcms" "Kiwi TCMS (Docker)")
+        fi
+        if vm_exec "$selected" "test -f /opt/services/testlink/docker-compose.yml" 2>/dev/null; then
+            svc_array+=("docker:testlink" "TestLink (Docker)")
+        fi
+    else
+        # Native mode: detect services via nginx site-configs + systemctl
+        if vm_exec "$selected" "test -f /etc/nginx/sites-available/jenkins" 2>/dev/null; then
+            svc_array+=("jenkins" "Jenkins")
+        elif vm_exec "$selected" "systemctl is-active --quiet jenkins" 2>/dev/null; then
+            svc_array+=("jenkins" "Jenkins")
+        fi
+
+        if vm_exec "$selected" "test -f /etc/nginx/sites-available/kiwi" 2>/dev/null; then
+            svc_array+=("kiwi" "Kiwi TCMS")
+        fi
+
+        if vm_exec "$selected" "test -f /etc/nginx/sites-available/gitea" 2>/dev/null; then
+            svc_array+=("gitea" "Gitea")
+        fi
+
+        if vm_exec "$selected" "test -f /etc/nginx/sites-available/testlink" 2>/dev/null; then
+            svc_array+=("testlink" "TestLink")
+        fi
+
+        if vm_exec "$selected" "test -f /etc/nginx/sites-available/default" 2>/dev/null; then
+            svc_array+=("default" "Default Site")
+        fi
+    fi
+
+    if [[ ${#svc_array[@]} -eq 0 ]]; then
+        if [[ "$is_docker_mode" == "true" ]]; then
+            show_msg "No Services" "No Docker-deployed services found in VM $selected.\n\nSearched in /opt/services/ for: Jenkins, Gitea, Kiwi TCMS, TestLink"
+        else
+            show_msg "No Services" "No HTTPS-compatible services found in VM $selected.\n\nSupported services: Jenkins, Kiwi TCMS, Gitea, TestLink"
+        fi
+        return
+    fi
+
+    local selected_svc
+    selected_svc=$(show_menu "Select Service" "Choose service to enable HTTPS:" "${svc_array[@]}")
+    [[ -z "$selected_svc" ]] && return
+
+    # Get VM hostname and IP
+    local hostname ip
+    hostname=$(vm_get_hostname "$selected")
+    if [[ -z "$hostname" ]]; then
+        hostname=$(show_input "VM Hostname" "Enter hostname for certificate:" "vm-$selected")
+        [[ -z "$hostname" ]] && return
+    fi
+
+    ip=$(vm_get_ip "$selected")
+    if [[ -z "$ip" ]]; then
+        show_msg "Error" "Could not get IP address for VM $selected."
+        return
+    fi
+
+    if [[ "$selected_svc" == docker:* ]]; then
+        # Docker mode: strip prefix and call Docker handler
+        local docker_svc="${selected_svc#docker:}"
+        if show_yesno "Enable HTTPS (Docker)" "This will:\n1. Generate SSL certificate for $hostname ($ip)\n2. Deploy certificate to VM\n3. Add nginx container to Docker Compose stack\n4. Restart Docker services with HTTPS\n\nEnable HTTPS for $docker_svc?"; then
+            vm_enable_https_for_docker_service "$selected" "$docker_svc" "$hostname" "$ip"
+        fi
+    else
+        # Native mode: existing path
+        if show_yesno "Enable HTTPS" "This will:\n1. Generate SSL certificate for $hostname ($ip)\n2. Deploy certificate to VM\n3. Update nginx to use HTTPS (port 443)\n4. Redirect HTTP to HTTPS\n\nEnable HTTPS for $selected_svc?"; then
+            vm_enable_https_for_service "$selected" "$selected_svc" "$hostname" "$ip"
+        fi
+    fi
+}
+
+# Enable HTTPS for a specific service in a VM (mirrors enable_https_for_service for LXC)
+vm_enable_https_for_service() {
+    local vmid="$1"
+    local service="$2"
+    local hostname="$3"
+    local ip="$4"
+
+    (
+        echo "=== Enabling HTTPS for $service in VM $vmid ==="
+        echo ""
+
+        # Step 1: Generate certificate
+        echo "Step 1: Generating SSL certificate..."
+        local cert_dir="$CERTS_DIR/$hostname"
+
+        if [[ -f "$cert_dir/${hostname}.crt" ]]; then
+            echo "Certificate already exists for $hostname"
+        else
+            ca_generate_cert "$hostname" "$ip"
+            echo "Certificate generated."
+        fi
+        echo ""
+
+        # Step 2: Deploy certificate to VM
+        echo "Step 2: Deploying certificate to VM..."
+        vm_deploy_cert "$vmid" "$hostname"
+        echo "Certificate deployed to /etc/ssl/pve-manager/"
+        echo ""
+
+        # Step 3: Update nginx configuration
+        echo "Step 3: Updating nginx configuration..."
+
+        case "$service" in
+            jenkins)
+                local nginx_conf
+                nginx_conf="server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    # Redirect HTTP to HTTPS
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
+    server_name _;
+
+    # SSL Configuration
+    ssl_certificate /etc/ssl/pve-manager/${hostname}-chain.pem;
+    ssl_certificate_key /etc/ssl/pve-manager/${hostname}.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    client_max_body_size 100M;
+
+    proxy_request_buffering off;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \"upgrade\";
+        proxy_connect_timeout 300s;
+        proxy_read_timeout 300s;
+    }
+}"
+                vm_write_file "$vmid" "/etc/nginx/sites-available/jenkins" "$nginx_conf"
+                vm_exec "$vmid" "ln -sf /etc/nginx/sites-available/jenkins /etc/nginx/sites-enabled/jenkins"
+                vm_exec "$vmid" "rm -f /etc/nginx/sites-enabled/default"
+                ;;
+
+            kiwi)
+                local nginx_conf
+                nginx_conf="server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    # Redirect HTTP to HTTPS
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
+    server_name _;
+
+    # SSL Configuration
+    ssl_certificate /etc/ssl/pve-manager/${hostname}-chain.pem;
+    ssl_certificate_key /etc/ssl/pve-manager/${hostname}.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    client_max_body_size 100M;
+
+    # Serve static files directly
+    location /static/ {
+        alias /Kiwi/static/;
+        autoindex off;
+        expires 30d;
+        add_header Cache-Control public;
+
+        # Ensure correct MIME types
+        types {
+            text/css css;
+            application/javascript js;
+            application/json json;
+            image/svg+xml svg svgz;
+            font/woff woff;
+            font/woff2 woff2;
+            application/vnd.ms-fontobject eot;
+            font/ttf ttf;
+            font/otf otf;
+        }
+    }
+
+    # Media/uploads files
+    location /uploads/ {
+        alias /Kiwi/uploads/;
+        autoindex off;
+        expires 7d;
+    }
+
+    # Favicon
+    location = /favicon.ico {
+        alias /Kiwi/static/images/favicon.ico;
+        expires 30d;
+        access_log off;
+        log_not_found off;
+    }
+
+    # Proxy to gunicorn
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_connect_timeout 300s;
+        proxy_read_timeout 300s;
+    }
+}"
+                vm_write_file "$vmid" "/etc/nginx/sites-available/kiwi" "$nginx_conf"
+                ;;
+
+            gitea)
+                local nginx_conf
+                nginx_conf="server {
+    listen 80;
+    listen [::]:80;
+    server_name _;
+
+    # Redirect HTTP to HTTPS
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name _;
+
+    # SSL Configuration
+    ssl_certificate /etc/ssl/pve-manager/${hostname}-chain.pem;
+    ssl_certificate_key /etc/ssl/pve-manager/${hostname}.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    client_max_body_size 100M;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_connect_timeout 300s;
+        proxy_read_timeout 300s;
+    }
+}"
+                vm_write_file "$vmid" "/etc/nginx/sites-available/gitea" "$nginx_conf"
+                ;;
+
+            testlink)
+                # TestLink uses Nginx + PHP-FPM - find the actual socket path
+                local php_sock
+                php_sock=$(vm_exec "$vmid" "ls /run/php/php*-fpm.sock 2>/dev/null | head -1")
+                [[ -z "$php_sock" ]] && php_sock="/run/php/php8.2-fpm.sock"
+
+                local nginx_conf
+                nginx_conf="server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    # Redirect HTTP to HTTPS
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
+    server_name _;
+
+    # SSL Configuration
+    ssl_certificate /etc/ssl/pve-manager/${hostname}-chain.pem;
+    ssl_certificate_key /etc/ssl/pve-manager/${hostname}.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    root /var/www/testlink;
+    index index.php index.html;
+
+    client_max_body_size 64M;
+
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+
+    location ~ \\.php\$ {
+        fastcgi_split_path_info ^(.+\\.php)(/.+)\$;
+        fastcgi_pass unix:${php_sock};
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_param PATH_INFO \$fastcgi_path_info;
+        include fastcgi_params;
+    }
+
+    location ~ /\\. {
+        deny all;
+    }
+}"
+                vm_write_file "$vmid" "/etc/nginx/sites-available/testlink" "$nginx_conf"
+                ;;
+
+            default)
+                local nginx_conf
+                nginx_conf="server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    # Redirect HTTP to HTTPS
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
+    server_name _;
+
+    # SSL Configuration
+    ssl_certificate /etc/ssl/pve-manager/${hostname}-chain.pem;
+    ssl_certificate_key /etc/ssl/pve-manager/${hostname}.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    root /var/www/html;
+    index index.html index.htm;
+
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+}"
+                vm_write_file "$vmid" "/etc/nginx/sites-available/default" "$nginx_conf"
+                ;;
+        esac
+
+        # Step 4: Test and reload nginx
+        echo "Configuration updated."
+        echo ""
+        echo "Step 4: Testing nginx configuration..."
+        vm_exec_live "$vmid" "nginx -t"
+
+        echo ""
+        echo "Reloading nginx..."
+        vm_exec_live "$vmid" "systemctl reload nginx"
+
+        echo ""
+        echo "=== HTTPS Enabled Successfully ==="
+        echo ""
+        echo "Access URL: https://${ip}/"
+        echo ""
+        echo "NOTE: You may need to import the CA certificate into your browser."
+        echo "Export CA from: Certificate Management -> Export CA certificate"
+
+    ) 2>&1 | show_progress_box "Enabling HTTPS" 24 80
+
+    show_msg "HTTPS Enabled" "HTTPS has been enabled for $service!\n\nAccess: https://${ip}/\n\nNOTE: Import the CA certificate into your browser to avoid security warnings.\n\nExport CA from:\nCertificate Management -> Export CA certificate"
+}
+
+# Enable HTTPS for a Docker-deployed service in a VM by adding an nginx container
+vm_enable_https_for_docker_service() {
+    local vmid="$1"
+    local service="$2"
+    local hostname="$3"
+    local ip="$4"
+    local service_dir="/opt/services/${service}"
+
+    (
+        echo "=== Enabling HTTPS for $service (Docker) in VM $vmid ==="
+        echo ""
+
+        # Step 1: Generate certificate
+        echo "Step 1: Generating SSL certificate..."
+        local cert_dir="$CERTS_DIR/$hostname"
+
+        if [[ -f "$cert_dir/${hostname}.crt" ]]; then
+            echo "Certificate already exists for $hostname"
+        else
+            ca_generate_cert "$hostname" "$ip"
+            echo "Certificate generated."
+        fi
+        echo ""
+
+        # Step 2: Deploy certificate to VM
+        echo "Step 2: Deploying certificate to VM..."
+        vm_deploy_cert "$vmid" "$hostname"
+        echo "Certificate deployed to /etc/ssl/pve-manager/"
+        echo ""
+
+        # Step 3: Write nginx.conf
+        echo "Step 3: Writing nginx reverse-proxy configuration..."
+
+        local upstream_name upstream_port
+        case "$service" in
+            jenkins)    upstream_name="jenkins";  upstream_port="8080" ;;
+            gitea)      upstream_name="gitea";    upstream_port="3000" ;;
+            kiwi-tcms)  upstream_name="kiwi";     upstream_port="8080" ;;
+            testlink)   upstream_name="testlink";  upstream_port="8080" ;;
+            *)
+                echo "ERROR: Unknown service: $service"
+                return 1
+                ;;
+        esac
+
+        local nginx_conf="server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
+    server_name _;
+
+    ssl_certificate /etc/ssl/pve-manager/${hostname}-chain.pem;
+    ssl_certificate_key /etc/ssl/pve-manager/${hostname}.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    client_max_body_size 100M;
+    proxy_request_buffering off;
+
+    location / {
+        proxy_pass http://${upstream_name}:${upstream_port};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \"upgrade\";
+        proxy_connect_timeout 300s;
+        proxy_read_timeout 300s;
+    }
+}"
+        vm_write_file "$vmid" "${service_dir}/nginx.conf" "$nginx_conf"
+        echo "nginx.conf written to ${service_dir}/nginx.conf"
+        echo ""
+
+        # Step 4: Write updated docker-compose.yml with nginx service
+        echo "Step 4: Updating docker-compose.yml with nginx container..."
+
+        local compose_content=""
+        case "$service" in
+            jenkins)
+                compose_content="services:
+  jenkins:
+    image: jenkins/jenkins:lts
+    container_name: jenkins
+    restart: unless-stopped
+    expose:
+      - \"8080\"
+    ports:
+      - \"50000:50000\"
+    volumes:
+      - jenkins_data:/var/jenkins_home
+    environment:
+      - JAVA_OPTS=-Djava.awt.headless=true
+
+  nginx:
+    image: nginx:alpine
+    container_name: jenkins-nginx
+    restart: unless-stopped
+    ports:
+      - \"80:80\"
+      - \"443:443\"
+    volumes:
+      - /etc/ssl/pve-manager:/etc/ssl/pve-manager:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - jenkins
+
+volumes:
+  jenkins_data:"
+                ;;
+            gitea)
+                compose_content="services:
+  gitea:
+    image: gitea/gitea:latest
+    container_name: gitea
+    restart: unless-stopped
+    expose:
+      - \"3000\"
+    ports:
+      - \"2222:22\"
+    volumes:
+      - gitea_data:/data
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      - USER_UID=1000
+      - USER_GID=1000
+      - GITEA__database__DB_TYPE=sqlite3
+      - GITEA__server__ROOT_URL=https://${ip}/
+      - GITEA__server__DOMAIN=${ip}
+
+  nginx:
+    image: nginx:alpine
+    container_name: gitea-nginx
+    restart: unless-stopped
+    ports:
+      - \"80:80\"
+      - \"443:443\"
+    volumes:
+      - /etc/ssl/pve-manager:/etc/ssl/pve-manager:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - gitea
+
+volumes:
+  gitea_data:"
+                ;;
+            kiwi-tcms)
+                compose_content="services:
+  kiwi:
+    image: kiwitcms/kiwi:latest
+    container_name: kiwi
+    restart: unless-stopped
+    expose:
+      - \"8080\"
+    volumes:
+      - kiwi_uploads:/Kiwi/uploads
+      - kiwi_db:/Kiwi/db
+    environment:
+      - KIWI_DB_ENGINE=django.db.backends.sqlite3
+      - KIWI_DB_NAME=/Kiwi/db/kiwi.sqlite3
+
+  nginx:
+    image: nginx:alpine
+    container_name: kiwi-tcms-nginx
+    restart: unless-stopped
+    ports:
+      - \"80:80\"
+      - \"443:443\"
+    volumes:
+      - /etc/ssl/pve-manager:/etc/ssl/pve-manager:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - kiwi
+
+volumes:
+  kiwi_uploads:
+  kiwi_db:"
+                ;;
+            testlink)
+                compose_content="services:
+  mariadb:
+    image: mariadb:10.6
+    container_name: testlink-db
+    restart: unless-stopped
+    environment:
+      - MARIADB_ROOT_PASSWORD=\${MARIADB_ROOT_PASSWORD:-testlink_root}
+      - MARIADB_DATABASE=\${MARIADB_DATABASE:-testlink}
+      - MARIADB_USER=\${MARIADB_USER:-testlink}
+      - MARIADB_PASSWORD=\${MARIADB_PASSWORD:-testlink_pass}
+    volumes:
+      - testlink_db:/var/lib/mysql
+    healthcheck:
+      test: [\"CMD\", \"healthcheck.sh\", \"--connect\", \"--innodb_initialized\"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  testlink:
+    image: bitnami/testlink:latest
+    container_name: testlink
+    restart: unless-stopped
+    expose:
+      - \"8080\"
+    environment:
+      - TESTLINK_DATABASE_HOST=mariadb
+      - TESTLINK_DATABASE_PORT_NUMBER=3306
+      - TESTLINK_DATABASE_NAME=\${MARIADB_DATABASE:-testlink}
+      - TESTLINK_DATABASE_USER=\${MARIADB_USER:-testlink}
+      - TESTLINK_DATABASE_PASSWORD=\${MARIADB_PASSWORD:-testlink_pass}
+      - TESTLINK_USERNAME=\${TESTLINK_USERNAME:-admin}
+      - TESTLINK_PASSWORD=\${TESTLINK_PASSWORD:-admin}
+      - TESTLINK_EMAIL=\${TESTLINK_EMAIL:-admin@example.com}
+      - PHP_MEMORY_LIMIT=256M
+      - PHP_MAX_UPLOAD_SIZE=64M
+    volumes:
+      - testlink_data:/bitnami/testlink
+    depends_on:
+      mariadb:
+        condition: service_healthy
+
+  nginx:
+    image: nginx:alpine
+    container_name: testlink-nginx
+    restart: unless-stopped
+    ports:
+      - \"80:80\"
+      - \"443:443\"
+    volumes:
+      - /etc/ssl/pve-manager:/etc/ssl/pve-manager:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - testlink
+
+volumes:
+  testlink_db:
+  testlink_data:"
+                ;;
+        esac
+
+        vm_write_file "$vmid" "${service_dir}/docker-compose.yml" "$compose_content"
+        echo "docker-compose.yml updated with nginx service."
+        echo ""
+
+        # Step 5: Restart Docker stack
+        echo "Step 5: Restarting Docker stack..."
+        echo ""
+
+        echo "Stopping existing containers..."
+        vm_exec_live "$vmid" "cd ${service_dir} && docker compose down 2>&1"
+        echo ""
+
+        echo "Pulling nginx image..."
+        vm_exec_live "$vmid" "cd ${service_dir} && docker compose pull nginx 2>&1"
+        echo ""
+
+        echo "Starting services..."
+        vm_exec_live "$vmid" "cd ${service_dir} && docker compose up -d 2>&1"
+        echo ""
+
+        # Wait for services to start
+        echo "Waiting for services to start..."
+        sleep 10
+
+        echo ""
+        echo "Running containers:"
+        vm_exec_live "$vmid" "docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'"
+        echo ""
+
+        echo "=== HTTPS Enabled Successfully ==="
+        echo ""
+        echo "Access URL: https://${ip}/"
+        echo ""
+        echo "NOTE: You may need to import the CA certificate into your browser."
+        echo "Export CA from: Certificate Management -> Export CA certificate"
+
+    ) 2>&1 | show_progress_box "Enabling HTTPS (Docker)" 24 80
+
+    show_msg "HTTPS Enabled" "HTTPS has been enabled for $service (Docker)!\n\nAccess: https://${ip}/\n\nAn nginx container has been added to the Docker Compose stack for SSL termination.\n\nNOTE: Import the CA certificate into your browser to avoid security warnings.\n\nExport CA from:\nCertificate Management -> Export CA certificate"
+}
+
+# Install Docker inside a VM via QEMU Guest Agent
+vm_docker_install_with_progress() {
+    local vmid="$1"
+    local os_type="$2"
+
+    log_info "Installing Docker in VM $vmid (OS: $os_type)"
+
+    (
+        echo "=== Docker Installation for VM $vmid ==="
+        echo "Detected OS: $os_type"
+        echo ""
+
+        case "$os_type" in
+            debian|ubuntu)
+                echo "[1/5] Updating package lists..."
+                vm_exec_live "$vmid" "apt-get update -qq"
+                echo ""
+
+                echo "[2/5] Installing minimal dependencies..."
+                vm_exec_live "$vmid" "DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl"
+
+                if ! vm_exec "$vmid" "command -v curl" &>/dev/null; then
+                    echo "  ERROR: Failed to install curl"
+                    echo "  Attempting to fix..."
+                    vm_exec_live "$vmid" "DEBIAN_FRONTEND=noninteractive apt-get install -y --fix-broken"
+                    vm_exec_live "$vmid" "DEBIAN_FRONTEND=noninteractive apt-get install -y curl"
+                fi
+                echo ""
+
+                echo "[3/5] Adding Docker repository GPG key..."
+                vm_exec_live "$vmid" "install -m 0755 -d /etc/apt/keyrings"
+                vm_exec_live "$vmid" "rm -f /etc/apt/keyrings/docker.asc /etc/apt/keyrings/docker.gpg"
+
+                echo "  Downloading Docker GPG key..."
+                vm_exec_live "$vmid" "curl -fsSL https://download.docker.com/linux/${os_type}/gpg -o /etc/apt/keyrings/docker.asc"
+                vm_exec_live "$vmid" "chmod a+r /etc/apt/keyrings/docker.asc"
+
+                if ! vm_exec "$vmid" "test -s /etc/apt/keyrings/docker.asc" 2>/dev/null; then
+                    echo "  ERROR: Failed to download Docker GPG key"
+                    return 1
+                fi
+                echo "  GPG key installed successfully."
+                echo ""
+
+                echo "[4/5] Adding Docker repository..."
+                codename=$(vm_exec "$vmid" ". /etc/os-release && echo \$VERSION_CODENAME" 2>/dev/null)
+                if [[ -z "$codename" ]]; then
+                    version_id=$(vm_exec "$vmid" ". /etc/os-release && echo \$VERSION_ID" 2>/dev/null)
+                    case "$os_type-$version_id" in
+                        debian-13) codename="trixie" ;;
+                        debian-12) codename="bookworm" ;;
+                        debian-11) codename="bullseye" ;;
+                        ubuntu-24.04) codename="noble" ;;
+                        ubuntu-22.04) codename="jammy" ;;
+                        ubuntu-20.04) codename="focal" ;;
+                        *) codename="stable" ;;
+                    esac
+                fi
+                echo "  Distribution codename: $codename"
+
+                vm_exec "$vmid" "echo \"deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${os_type} ${codename} stable\" > /etc/apt/sources.list.d/docker.list"
+
+                echo "  Updating package lists with Docker repository..."
+                vm_exec_live "$vmid" "apt-get update"
+                echo ""
+
+                echo "[5/5] Installing Docker packages..."
+                vm_exec_live "$vmid" "DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
+
+                if ! vm_exec "$vmid" "command -v docker" &>/dev/null; then
+                    echo ""
+                    echo "  WARNING: Docker command not found after installation."
+                    echo "  Attempting to fix broken packages..."
+                    vm_exec_live "$vmid" "DEBIAN_FRONTEND=noninteractive apt-get install -y --fix-broken"
+                    vm_exec_live "$vmid" "DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io"
+                fi
+                echo ""
+                ;;
+            centos|rhel|rocky|almalinux)
+                echo "[1/4] Installing dependencies..."
+                vm_exec_live "$vmid" "dnf install -y yum-utils"
+                echo ""
+
+                echo "[2/4] Adding Docker repository..."
+                vm_exec_live "$vmid" "yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo"
+                echo ""
+
+                echo "[3/4] Installing Docker..."
+                vm_exec_live "$vmid" "dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
+                echo ""
+
+                echo "[4/4] Enabling Docker service..."
+                vm_exec_live "$vmid" "systemctl enable docker"
+                echo ""
+                ;;
+            fedora)
+                echo "[1/4] Installing dependencies..."
+                vm_exec_live "$vmid" "dnf install -y dnf-plugins-core"
+                echo ""
+
+                echo "[2/4] Adding Docker repository..."
+                vm_exec_live "$vmid" "dnf config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo"
+                echo ""
+
+                echo "[3/4] Installing Docker..."
+                vm_exec_live "$vmid" "dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
+                echo ""
+
+                echo "[4/4] Enabling Docker service..."
+                vm_exec_live "$vmid" "systemctl enable docker"
+                echo ""
+                ;;
+            *)
+                echo "ERROR: Unsupported OS: $os_type"
+                echo ""
+                echo "Supported OS types:"
+                echo "  - debian, ubuntu (APT-based)"
+                echo "  - centos, rhel, rocky, almalinux (DNF/YUM-based)"
+                echo "  - fedora (DNF-based)"
+                return 1
+                ;;
+        esac
+
+        echo ""
+        echo "Creating Docker daemon configuration..."
+        vm_exec_live "$vmid" "mkdir -p /etc/docker"
+        vm_exec_live "$vmid" 'cat > /etc/docker/daemon.json << EOF
+{
+    "storage-driver": "overlay2",
+    "log-driver": "json-file",
+    "log-opts": {
+        "max-size": "10m",
+        "max-file": "3"
+    }
+}
+EOF'
+
+        echo ""
+        echo "Starting Docker service..."
+        vm_exec_live "$vmid" "systemctl enable docker && systemctl start docker"
+        echo ""
+
+        echo "Waiting for Docker to start..."
+        sleep 3
+
+        echo ""
+        echo "=== Verifying Docker Installation ==="
+        vm_exec_live "$vmid" "docker --version"
+        vm_exec_live "$vmid" "docker compose version"
+        echo ""
+
+        echo "Testing Docker with hello-world..."
+        vm_exec_live "$vmid" "docker run --rm hello-world"
+        echo ""
+
+        echo "=== Docker Installation Complete ==="
+
+    ) 2>&1 | show_progress_box "Installing Docker in VM $vmid" 24 80
+}
+
 # ============================================================================
 # VM Management Menu
 # ============================================================================
@@ -4103,8 +5028,9 @@ vm_management_menu() {
         choice=$(show_menu "VM Management" "Select an operation:" \
             "1" "List VMs" \
             "2" "VM details" \
-            "3" "Deploy certificate to VM" \
-            "4" "Execute command in VM" \
+            "3" "Enable HTTPS for service" \
+            "4" "Deploy service to VM" \
+            "5" "Execute command in VM" \
             "0" "Back to main menu")
 
         case "$choice" in
@@ -4166,84 +5092,25 @@ vm_management_menu() {
                 fi
                 ;;
             3)
-                # Deploy certificate to VM
-                if [[ ! -f "$CA_DIR/ca.key" ]]; then
-                    show_msg "No CA" "CA not initialized. Please initialize CA first in Certificate Management."
-                    continue
-                fi
-
-                local vms
-                vms=$(pve_list_vms)
-                if [[ -z "$vms" ]]; then
-                    show_msg "No VMs" "No virtual machines found."
-                    continue
-                fi
-
-                # Filter running VMs only
-                local vm_array=()
-                while read -r vmid status mem name; do
-                    [[ -z "$vmid" ]] && continue
-                    [[ "$status" != "running" ]] && continue
-                    vm_array+=("$vmid" "$name ($status)")
-                done <<< "$vms"
-
-                if [[ ${#vm_array[@]} -eq 0 ]]; then
-                    show_msg "No Running VMs" "No running VMs found. VMs must be running with QEMU Guest Agent for certificate deployment."
-                    continue
-                fi
-
-                local selected
-                selected=$(show_menu "Deploy Certificate" "Select VM (must have QEMU Guest Agent):" "${vm_array[@]}")
-
-                if [[ -n "$selected" ]]; then
-                    # Check guest agent
-                    show_info "Checking..." "Verifying QEMU Guest Agent..."
-                    if ! vm_has_guest_agent "$selected"; then
-                        show_msg "Guest Agent Required" "QEMU Guest Agent is not available on VM $selected.\n\nPlease ensure:\n1. qemu-guest-agent is installed in the VM\n2. Guest Agent is enabled in VM options\n3. VM is running"
-                        continue
-                    fi
-
-                    # Get hostname
-                    local hostname
-                    hostname=$(vm_get_hostname "$selected")
-                    if [[ -z "$hostname" ]]; then
-                        hostname=$(show_input "VM Hostname" "Enter hostname for certificate:" "vm-$selected")
-                        [[ -z "$hostname" ]] && continue
-                    fi
-
-                    # Check if certificate exists
-                    if [[ ! -f "$CERTS_DIR/$hostname/$hostname.crt" ]]; then
-                        if show_yesno "Generate Certificate" "No certificate found for '$hostname'.\n\nGenerate a new certificate?"; then
-                            (
-                                echo "Generating certificate for $hostname..."
-                                ca_generate_cert "$hostname"
-                                echo "Certificate generated."
-                            ) | show_progress_box "Generate Certificate"
-                        else
-                            continue
-                        fi
-                    fi
-
-                    # Deploy
-                    (
-                        echo "=== Deploying Certificate to VM $selected ==="
-                        echo ""
-                        echo "Hostname: $hostname"
-                        echo ""
-                        echo "Copying certificate files..."
-                        vm_deploy_cert "$selected" "$hostname"
-                        echo ""
-                        echo "Certificate deployed successfully!"
-                        echo ""
-                        echo "Files deployed to /etc/ssl/pve-manager/:"
-                        echo "  - ${hostname}.key (private key)"
-                        echo "  - ${hostname}.crt (certificate)"
-                        echo "  - ${hostname}-chain.pem (full chain)"
-                        echo "  - ca.crt (CA certificate)"
-                    ) | show_progress_box "Deploy Certificate to VM"
-                fi
+                vm_enable_https_wizard
                 ;;
             4)
+                # Deploy service to VM
+                local svc_choice
+                svc_choice=$(show_menu "Deploy Service to VM" "Select service to deploy:" \
+                    "jenkins" "Jenkins (CI/CD automation server)" \
+                    "0" "Back")
+
+                case "$svc_choice" in
+                    jenkins)
+                        vm_deploy_service_wizard "jenkins" "Jenkins"
+                        ;;
+                    0|"")
+                        continue
+                        ;;
+                esac
+                ;;
+            5)
                 # Execute command in VM
                 local vms
                 vms=$(pve_list_vms)
@@ -4297,6 +5164,380 @@ vm_management_menu() {
                 ;;
         esac
     done
+}
+
+# Deploy service to VM with Docker
+vm_deploy_service() {
+    local vmid="$1"
+    local service="$2"
+    local service_name="$3"
+    local deploy_result_file="/tmp/pve-vm-deploy-result-$$.txt"
+
+    log_info "Deploying $service to VM $vmid (Docker)"
+    log_service_op "$service" "VM_DEPLOY_DOCKER" "vmid=$vmid service_name=$service_name"
+
+    # Initialize result file
+    echo "0" > "$deploy_result_file"
+
+    (
+        echo "=== Deploying $service_name to VM $vmid ==="
+        echo ""
+
+        # Check if Docker is installed
+        echo "Checking Docker installation..."
+        docker_check=$(vm_exec "$vmid" "docker --version 2>/dev/null")
+        if [[ -z "$docker_check" ]]; then
+            echo "ERROR: Docker not installed in VM $vmid"
+            echo "Please install Docker first."
+            echo "1" > "$deploy_result_file"
+            exit 1
+        fi
+        echo "Docker found: $docker_check"
+        echo ""
+
+        # Get compose content
+        compose_content=$(get_service_compose "$service")
+        if [[ -z "$compose_content" ]]; then
+            echo "ERROR: Unknown service: $service"
+            echo "1" > "$deploy_result_file"
+            exit 1
+        fi
+
+        # Create service directory
+        service_dir="/opt/services/${service}"
+        echo "Creating service directory: $service_dir"
+        vm_exec_live "$vmid" "mkdir -p $service_dir"
+        echo ""
+
+        # Write docker-compose.yml
+        echo "Writing docker-compose.yml..."
+        vm_write_file "$vmid" "${service_dir}/docker-compose.yml" "$compose_content"
+        echo "Done."
+        echo ""
+
+        # Pull Docker images with retry logic
+        echo "Pulling Docker images (this may take a few minutes)..."
+        echo ""
+
+        local pull_attempts=0
+        local max_pull_attempts=3
+        local pull_status=1
+
+        while [[ $pull_attempts -lt $max_pull_attempts && $pull_status -ne 0 ]]; do
+            pull_attempts=$((pull_attempts + 1))
+            echo "Pull attempt $pull_attempts of $max_pull_attempts..."
+
+            # Use timeout to prevent indefinite hangs (5 minutes per attempt)
+            pull_output=$(vm_exec_timeout "$vmid" 300 "cd ${service_dir} && docker compose pull --quiet 2>&1")
+            pull_status=$?
+
+            if [[ $pull_status -eq 124 ]]; then
+                echo "Pull timed out. Retrying..."
+                vm_exec "$vmid" "systemctl restart docker 2>/dev/null || true" > /dev/null 2>&1
+                sleep 5
+            elif [[ $pull_status -ne 0 ]]; then
+                echo "Pull failed: $pull_output"
+                if [[ $pull_attempts -lt $max_pull_attempts ]]; then
+                    echo "Waiting 10 seconds before retry..."
+                    sleep 10
+                fi
+            else
+                echo "Images pulled successfully."
+            fi
+        done
+
+        if [[ $pull_status -ne 0 ]]; then
+            echo "ERROR: Failed to pull Docker images after $max_pull_attempts attempts"
+            echo "Possible causes: network issues, Docker registry unavailable"
+            echo "1" > "$deploy_result_file"
+            exit 1
+        fi
+        echo ""
+
+        echo "Starting $service_name..."
+        echo ""
+        start_output=$(vm_exec "$vmid" "cd ${service_dir} && docker compose up -d 2>&1")
+        start_status=$?
+        echo "$start_output"
+        echo ""
+
+        if [[ $start_status -ne 0 ]]; then
+            echo "ERROR: Failed to start containers"
+            echo "1" > "$deploy_result_file"
+            exit 1
+        fi
+
+        # Wait for services to start
+        echo "Waiting for services to start..."
+        sleep 5
+
+        # Verify containers are running
+        echo ""
+        echo "Verifying deployment..."
+        running_containers=$(vm_exec "$vmid" "docker ps --format '{{.Names}}' 2>/dev/null" | wc -l)
+
+        if [[ "$running_containers" -eq 0 ]]; then
+            echo "WARNING: No containers are running!"
+            echo ""
+            echo "Checking container logs..."
+            vm_exec_live "$vmid" "cd ${service_dir} && docker compose logs --tail=20 2>&1"
+            echo "1" > "$deploy_result_file"
+            exit 1
+        fi
+
+        echo "Running containers ($running_containers):"
+        vm_exec_live "$vmid" "docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'"
+        echo ""
+
+        echo "=== Deployment Complete ==="
+        echo "0" > "$deploy_result_file"
+
+    ) 2>&1 | show_progress_box "Deploying $service_name to VM" 24 80
+
+    # Check deployment result
+    local result
+    result=$(cat "$deploy_result_file" 2>/dev/null)
+    rm -f "$deploy_result_file"
+
+    if [[ "$result" != "0" ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# Deploy service to VM natively (reuses plugin install.sh scripts)
+vm_deploy_service_native() {
+    local vmid="$1"
+    local service="$2"
+    local service_name="$3"
+    local deploy_result_file="/tmp/pve-vm-deploy-native-result-$$.txt"
+
+    log_info "Deploying $service natively to VM $vmid"
+    log_service_op "$service" "VM_DEPLOY_NATIVE" "vmid=$vmid service_name=$service_name"
+
+    # Check if plugin supports native installation
+    if ! is_plugin_service "$service" || ! plugin_supports_native "$service"; then
+        log_error "Native installation not available for $service"
+        return 1
+    fi
+
+    local install_script="${PLUGINS[$service]}/install.sh"
+    if [[ ! -f "$install_script" ]]; then
+        log_error "Install script not found for $service"
+        return 1
+    fi
+
+    # Initialize result file
+    echo "0" > "$deploy_result_file"
+
+    (
+        echo "=== Installing $service_name Natively in VM $vmid ==="
+        echo ""
+
+        # Detect OS
+        echo "Detecting OS..."
+        os_type=$(vm_exec "$vmid" "cat /etc/os-release 2>/dev/null | grep '^ID=' | cut -d= -f2 | tr -d '\"'")
+        echo "OS: $os_type"
+        echo ""
+
+        # Run plugin installer - override lxc_exec_live/lxc_exec to use VM equivalents
+        # This allows reusing existing plugin install.sh scripts unchanged
+        echo "Using plugin installer for $service..."
+        export VMID="$vmid"
+        export OS_TYPE="$os_type"
+        lxc_exec_live() { vm_exec_live "$@"; }
+        lxc_exec() { vm_exec "$@"; }
+        export -f lxc_exec_live
+        export -f lxc_exec
+        source "$install_script"
+        local result=$?
+        # Restore original functions
+        unset -f lxc_exec_live
+        unset -f lxc_exec
+        if [[ $result -ne 0 ]]; then
+            echo "1" > "$deploy_result_file"
+            exit $result
+        fi
+
+        echo ""
+        echo "Verifying installation..."
+        sleep 3
+
+        # Check service status
+        local conf="${PLUGINS[$service]}/plugin.conf"
+        local systemd_service
+        systemd_service=$(grep "^PLUGIN_SYSTEMD_SERVICE=" "$conf" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
+        [[ -z "$systemd_service" ]] && systemd_service="$service"
+
+        service_running=false
+        case "$os_type" in
+            debian|ubuntu)
+                if vm_exec "$vmid" "systemctl is-active --quiet $systemd_service 2>/dev/null"; then
+                    service_running=true
+                fi
+                ;;
+            centos|rhel|rocky|almalinux|fedora)
+                if vm_exec "$vmid" "systemctl is-active --quiet $systemd_service 2>/dev/null"; then
+                    service_running=true
+                fi
+                ;;
+        esac
+
+        if [[ "$service_running" == true ]]; then
+            echo "Service is running!"
+            echo "0" > "$deploy_result_file"
+        else
+            echo "WARNING: Service may not be running. Check logs."
+            echo "0" > "$deploy_result_file"  # Still return success, user can check
+        fi
+
+        echo ""
+        echo "=== Native Installation Complete ==="
+
+    ) 2>&1 | show_progress_box "Installing $service_name in VM (Native)" 24 80
+
+    # Check deployment result
+    local result
+    result=$(cat "$deploy_result_file" 2>/dev/null)
+    rm -f "$deploy_result_file"
+
+    if [[ "$result" != "0" ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# Interactive wizard for deploying services to VMs
+vm_deploy_service_wizard() {
+    local service="$1"
+    local service_name="$2"
+
+    # Select VM (running only)
+    local vms
+    vms=$(pve_list_vms)
+    if [[ -z "$vms" ]]; then
+        show_msg "No VMs" "No virtual machines found."
+        return
+    fi
+
+    local vm_array=()
+    while read -r vmid status mem name; do
+        [[ -z "$vmid" ]] && continue
+        [[ "$status" != "running" ]] && continue
+        vm_array+=("$vmid" "$name ($status)")
+    done <<< "$vms"
+
+    if [[ ${#vm_array[@]} -eq 0 ]]; then
+        show_msg "No Running VMs" "No running VMs found. VMs must be running with QEMU Guest Agent."
+        return
+    fi
+
+    local selected
+    selected=$(show_menu "Deploy $service_name" "Select VM (must have QEMU Guest Agent):" "${vm_array[@]}")
+    [[ -z "$selected" ]] && return
+
+    # Verify guest agent
+    show_info "Checking..." "Verifying QEMU Guest Agent on VM $selected..."
+    if ! vm_has_guest_agent "$selected"; then
+        show_msg "Guest Agent Required" "QEMU Guest Agent is not available on VM $selected.\n\nPlease ensure:\n1. qemu-guest-agent is installed in the VM\n2. Guest Agent is enabled in VM options\n3. VM is running"
+        return
+    fi
+
+    # Choose deployment method
+    local method
+    local method_options=()
+
+    if is_plugin_service "$service" && plugin_supports_docker "$service"; then
+        method_options+=("docker" "Docker (container-based)")
+    fi
+    if is_plugin_service "$service" && plugin_supports_native "$service"; then
+        method_options+=("native" "Native (direct installation)")
+    fi
+
+    if [[ ${#method_options[@]} -eq 0 ]]; then
+        show_msg "No Methods" "No deployment methods available for $service_name."
+        return
+    elif [[ ${#method_options[@]} -eq 2 ]]; then
+        # Only one method available
+        method="${method_options[0]}"
+    else
+        method=$(show_menu "Deployment Method" "Choose how to deploy $service_name:" "${method_options[@]}")
+        [[ -z "$method" ]] && return
+    fi
+
+    # For Docker method, check if Docker is installed
+    if [[ "$method" == "docker" ]]; then
+        show_info "Checking..." "Checking Docker in VM $selected..."
+        local docker_check
+        docker_check=$(vm_exec "$selected" "docker --version 2>/dev/null")
+        if [[ -z "$docker_check" ]]; then
+            if show_yesno "Docker Not Found" "Docker is not installed in VM $selected.\n\nWould you like to install Docker now?"; then
+                local os_type
+                os_type=$(detect_vm_os "$selected")
+                if [[ -z "$os_type" ]]; then
+                    show_msg "OS Detection Failed" "Could not detect the operating system in VM $selected."
+                    return
+                fi
+                vm_docker_install_with_progress "$selected" "$os_type"
+
+                # Verify Docker was installed
+                docker_check=$(vm_exec "$selected" "docker --version 2>/dev/null")
+                if [[ -z "$docker_check" ]]; then
+                    show_msg "Docker Installation Failed" "Docker installation did not complete successfully.\nPlease install Docker manually and try again."
+                    return
+                fi
+            else
+                return
+            fi
+        fi
+    fi
+
+    # Confirm deployment
+    local vm_ip
+    vm_ip=$(vm_get_ip "$selected")
+    local ip_display="${vm_ip:-unknown}"
+
+    if ! show_yesno "Confirm Deployment" "Deploy $service_name to VM $selected?\n\nMethod: $method\nVM IP: $ip_display"; then
+        return
+    fi
+
+    # Deploy
+    local deploy_result=0
+    if [[ "$method" == "docker" ]]; then
+        vm_deploy_service "$selected" "$service" "$service_name"
+        deploy_result=$?
+    else
+        vm_deploy_service_native "$selected" "$service" "$service_name"
+        deploy_result=$?
+    fi
+
+    # Show access info
+    if [[ $deploy_result -eq 0 ]]; then
+        local conf="${PLUGINS[$service]}/plugin.conf"
+        local access_url="" credentials=""
+
+        if [[ "$method" == "docker" ]]; then
+            access_url=$(grep "^PLUGIN_DOCKER_URL=" "$conf" 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'")
+            credentials=$(grep "^PLUGIN_DOCKER_CREDENTIALS=" "$conf" 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'")
+        else
+            access_url=$(grep "^PLUGIN_NATIVE_URL=" "$conf" 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'")
+            credentials=$(grep "^PLUGIN_NATIVE_CREDENTIALS=" "$conf" 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'")
+        fi
+
+        # Replace {IP} placeholder
+        if [[ -n "$vm_ip" && -n "$access_url" ]]; then
+            access_url="${access_url//\{IP\}/$vm_ip}"
+        fi
+
+        local msg="$service_name deployed successfully to VM $selected!\n\n"
+        [[ -n "$access_url" ]] && msg+="Access URL: $access_url\n"
+        [[ -n "$credentials" ]] && msg+="Credentials: $credentials\n"
+        msg+="\nMethod: $method"
+
+        show_msg "Deployment Complete" "$msg"
+    else
+        show_msg "Deployment Failed" "$service_name deployment to VM $selected failed.\n\nCheck the logs for details."
+    fi
 }
 
 # LXC Creation Wizard
