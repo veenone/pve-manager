@@ -4205,6 +4205,11 @@ vm_enable_https_wizard() {
             svc_array+=("testlink" "TestLink")
         fi
 
+        # Check for GitLab (uses bundled nginx, config in /etc/gitlab/gitlab.rb)
+        if vm_exec "$selected" "test -f /etc/gitlab/gitlab.rb" 2>/dev/null; then
+            svc_array+=("gitlab" "GitLab")
+        fi
+
         if vm_exec "$selected" "test -f /etc/nginx/sites-available/default" 2>/dev/null; then
             svc_array+=("default" "Default Site")
         fi
@@ -4214,7 +4219,7 @@ vm_enable_https_wizard() {
         if [[ "$is_docker_mode" == "true" ]]; then
             show_msg "No Services" "No Docker-deployed services found in VM $selected.\n\nSearched in /opt/services/ for: Jenkins, Gitea, Kiwi TCMS, TestLink"
         else
-            show_msg "No Services" "No HTTPS-compatible services found in VM $selected.\n\nSupported services: Jenkins, Kiwi TCMS, Gitea, TestLink"
+            show_msg "No Services" "No HTTPS-compatible services found in VM $selected.\n\nSupported services: Jenkins, Kiwi TCMS, Gitea, TestLink, GitLab"
         fi
         return
     fi
@@ -4257,6 +4262,12 @@ vm_enable_https_for_service() {
     local service="$2"
     local hostname="$3"
     local ip="$4"
+
+    # GitLab uses its own bundled nginx - handle separately
+    if [[ "$service" == "gitlab" ]]; then
+        vm_enable_https_for_gitlab "$vmid" "$hostname" "$ip"
+        return
+    fi
 
     (
         echo "=== Enabling HTTPS for $service in VM $vmid ==="
@@ -4559,6 +4570,86 @@ server {
     ) 2>&1 | show_progress_box "Enabling HTTPS" 24 80
 
     show_msg "HTTPS Enabled" "HTTPS has been enabled for $service!\n\nAccess: https://${ip}/\n\nNOTE: Import the CA certificate into your browser to avoid security warnings.\n\nExport CA from:\nCertificate Management -> Export CA certificate"
+}
+
+# Enable HTTPS for GitLab in a VM (uses bundled nginx, configured via gitlab.rb)
+vm_enable_https_for_gitlab() {
+    local vmid="$1"
+    local hostname="$2"
+    local ip="$3"
+
+    (
+        echo "=== Enabling HTTPS for GitLab in VM $vmid ==="
+        echo ""
+
+        # Step 1: Generate certificate
+        echo "Step 1: Generating SSL certificate..."
+        local cert_dir="$CERTS_DIR/$hostname"
+
+        if [[ -f "$cert_dir/${hostname}.crt" ]]; then
+            echo "Certificate already exists for $hostname"
+        else
+            ca_generate_cert "$hostname" "$ip"
+            echo "Certificate generated."
+        fi
+        echo ""
+
+        # Step 2: Deploy certificate to VM
+        echo "Step 2: Deploying certificate to VM..."
+        vm_deploy_cert "$vmid" "$hostname"
+        echo "Certificate deployed to /etc/ssl/pve-manager/"
+        echo ""
+
+        # Step 3: Update GitLab configuration
+        echo "Step 3: Configuring GitLab for HTTPS..."
+
+        # Backup original config
+        echo "Backing up gitlab.rb..."
+        vm_exec "$vmid" "cp /etc/gitlab/gitlab.rb /etc/gitlab/gitlab.rb.bak-\$(date +%Y%m%d%H%M%S)"
+
+        # Remove any existing SSL configuration lines to avoid duplicates
+        echo "Removing old SSL configuration..."
+        vm_exec "$vmid" "sed -i '/^external_url/d; /^letsencrypt/d; /^nginx\[.ssl/d; /^nginx\[.redirect_http_to_https/d; /^nginx\[.client_max_body_size/d' /etc/gitlab/gitlab.rb"
+
+        # Append new SSL configuration
+        local gitlab_config="
+# HTTPS configuration added by PVE Manager
+external_url 'https://${ip}'
+letsencrypt['enable'] = false
+nginx['ssl_certificate'] = '/etc/ssl/pve-manager/${hostname}-chain.pem'
+nginx['ssl_certificate_key'] = '/etc/ssl/pve-manager/${hostname}.key'
+nginx['ssl_protocols'] = 'TLSv1.2 TLSv1.3'
+nginx['ssl_ciphers'] = 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384'
+nginx['redirect_http_to_https'] = true
+nginx['client_max_body_size'] = '250m'
+"
+        vm_write_file "$vmid" "/tmp/gitlab-ssl-config.txt" "$gitlab_config"
+        vm_exec "$vmid" "cat /tmp/gitlab-ssl-config.txt >> /etc/gitlab/gitlab.rb"
+        vm_exec "$vmid" "rm -f /tmp/gitlab-ssl-config.txt"
+        echo "GitLab configuration updated."
+        echo ""
+
+        # Step 4: Reconfigure GitLab
+        echo "Step 4: Reconfiguring GitLab (this may take a few minutes)..."
+        echo ""
+        vm_exec_live "$vmid" "gitlab-ctl reconfigure 2>&1 | tail -30"
+        echo ""
+
+        # Restart GitLab nginx to apply changes
+        echo "Restarting GitLab nginx..."
+        vm_exec_live "$vmid" "gitlab-ctl restart nginx"
+        echo ""
+
+        echo "=== HTTPS Enabled Successfully ==="
+        echo ""
+        echo "Access URL: https://${ip}/"
+        echo ""
+        echo "NOTE: You may need to import the CA certificate into your browser."
+        echo "Export CA from: Certificate Management -> Export CA certificate"
+
+    ) 2>&1 | show_progress_box "Enabling HTTPS for GitLab" 24 80
+
+    show_msg "HTTPS Enabled" "HTTPS has been enabled for GitLab!\n\nAccess: https://${ip}/\n\nNOTE: Import the CA certificate into your browser to avoid security warnings.\n\nExport CA from:\nCertificate Management -> Export CA certificate"
 }
 
 # Enable HTTPS for a Docker-deployed service in a VM by adding an nginx container
