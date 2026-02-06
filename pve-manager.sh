@@ -4152,16 +4152,21 @@ vm_enable_https_wizard() {
         return
     fi
 
-    # Check for nginx or Docker
-    local has_nginx is_docker_mode="false"
+    # Check for nginx, GitLab, or Docker
+    local has_nginx is_docker_mode="false" has_gitlab="false"
     has_nginx=$(vm_exec "$selected" "which nginx 2>/dev/null")
 
-    if [[ -z "$has_nginx" ]]; then
-        # No native nginx — check if Docker is available as fallback
+    # Check for GitLab (uses its own bundled nginx, not in PATH)
+    if vm_exec "$selected" "test -f /etc/gitlab/gitlab.rb" 2>/dev/null; then
+        has_gitlab="true"
+    fi
+
+    if [[ -z "$has_nginx" && "$has_gitlab" != "true" ]]; then
+        # No native nginx and no GitLab — check if Docker is available as fallback
         local has_docker
         has_docker=$(vm_exec "$selected" "which docker 2>/dev/null")
         if [[ -z "$has_docker" ]]; then
-            show_msg "No Nginx or Docker" "Neither nginx nor Docker is installed in VM $selected.\n\nHTTPS enablement requires nginx (native) or Docker to add an nginx container."
+            show_msg "No Nginx or Docker" "Neither nginx nor Docker is installed in VM $selected.\n\nHTTPS enablement requires nginx (native), GitLab, or Docker to add an nginx container."
             return
         fi
         is_docker_mode="true"
