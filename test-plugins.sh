@@ -67,29 +67,30 @@ rm -rf "$PLUGINS_DIR"/* 2>/dev/null
 create_builtin_plugins 2>/dev/null
 
 PLUGIN_COUNT=$(find "$PLUGINS_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
-if [[ "$PLUGIN_COUNT" -eq 21 ]]; then
-    pass "Created 21 plugins"
+if [[ "$PLUGIN_COUNT" -eq 24 ]]; then
+    pass "Created 24 plugins"
 else
-    fail "Expected 21 plugins, got $PLUGIN_COUNT"
+    fail "Expected 24 plugins, got $PLUGIN_COUNT"
 fi
 
 # Test 3: Load plugins
 info "Test 3: Loading plugins..."
 load_plugins 2>/dev/null
 LOADED_COUNT=${#PLUGINS[@]}
-if [[ "$LOADED_COUNT" -eq 21 ]]; then
-    pass "Loaded 21 plugins into PLUGINS array"
+if [[ "$LOADED_COUNT" -eq 24 ]]; then
+    pass "Loaded 24 plugins into PLUGINS array"
 else
-    fail "Expected 21 loaded plugins, got $LOADED_COUNT"
+    fail "Expected 24 loaded plugins, got $LOADED_COUNT"
 fi
 
 # Test 4: Verify all expected plugins exist
-info "Test 4: Verifying all 21 plugins..."
+info "Test 4: Verifying all 24 plugins..."
 EXPECTED_PLUGINS=(
     prometheus grafana loki alloy node-exporter monitoring-stack
     sonarqube nexus gitea jenkins harbor dependency-track
     kiwi-tcms selenium-grid testlink
     pihole keycloak freeipa postfix-relay traefik nginx
+    mysql postgresql mongodb
 )
 
 for plugin in "${EXPECTED_PLUGINS[@]}"; do
@@ -164,7 +165,7 @@ done
 
 # Test 9: Verify non-native services don't claim native support
 info "Test 9: Verifying non-native services..."
-NON_NATIVE_PLUGINS=(loki alloy node-exporter monitoring-stack nexus dependency-track selenium-grid keycloak freeipa postfix-relay traefik)
+NON_NATIVE_PLUGINS=(loki alloy node-exporter monitoring-stack nexus dependency-track selenium-grid keycloak freeipa postfix-relay traefik mysql postgresql mongodb)
 for plugin in "${NON_NATIVE_PLUGINS[@]}"; do
     if ! plugin_supports_native "$plugin" 2>/dev/null; then
         pass "Correctly no native support: $plugin"
@@ -222,6 +223,7 @@ MONITORING=$(list_plugins_by_category "monitoring" 2>/dev/null | wc -l)
 DEVTOOLS=$(list_plugins_by_category "devtools" 2>/dev/null | wc -l)
 TESTING=$(list_plugins_by_category "testing" 2>/dev/null | wc -l)
 INFRASTRUCTURE=$(list_plugins_by_category "infrastructure" 2>/dev/null | wc -l)
+DATABASE=$(list_plugins_by_category "database" 2>/dev/null | wc -l)
 
 if [[ "$MONITORING" -eq 6 ]]; then
     pass "Monitoring category: 6 plugins"
@@ -245,6 +247,12 @@ if [[ "$INFRASTRUCTURE" -eq 6 ]]; then
     pass "Infrastructure category: 6 plugins"
 else
     fail "Infrastructure category: expected 6, got $INFRASTRUCTURE"
+fi
+
+if [[ "$DATABASE" -eq 3 ]]; then
+    pass "Database category: 3 plugins"
+else
+    fail "Database category: expected 3, got $DATABASE"
 fi
 
 # Test 14: Test get_plugin_name()

@@ -132,9 +132,17 @@ LOG_LEVEL="INFO"          # Log level (INFO, DEBUG)
 | Traefik | Reverse proxy and load balancer | 80, 443, 8080 |
 | Nginx | Reverse proxy and web server | 80, 443 |
 
+### Databases
+| Service | Description | Ports |
+|---------|-------------|-------|
+| MySQL | MySQL 8 relational database server | 3306 |
+| PostgreSQL | PostgreSQL 16 relational database server | 5432 |
+| MongoDB | MongoDB 7 NoSQL document database | 27017 |
+
 ### Deployment Options
 - **Docker**: All services support Docker-based deployment
 - **Native**: Prometheus, Grafana, Gitea, Jenkins, Kiwi TCMS, TestLink, SonarQube, Pi-hole, Nginx
+- **Databases**: Docker-only; the deploy wizard prompts for credentials (blank = auto-generated) and stores them in `/opt/services/<db>/.env`
 
 ## Main Menu
 
@@ -234,20 +242,38 @@ Certificate locations in containers:
 │  3. Testing Tools                   │
 │  4. Infrastructure Tools            │
 │  5. Reverse Proxy (Nginx/Traefik)   │
-│  6. View deployed services          │
-│  7. Update/Redeploy service         │
-│  8. Stop service                    │
-│  9. Remove service                  │
-│ 10. Enable HTTPS for service        │
-│ 11. Auto-HTTPS via Nginx (proxy)    │
-│ 12. View supported services list    │
+│  6. Databases (MySQL/PgSQL/Mongo)   │
+│  7. View deployed services          │
+│  8. Update/Redeploy service         │
+│  9. Stop service                    │
+│ 10. Remove service                  │
+│ 11. Enable HTTPS for service        │
+│ 12. Auto-HTTPS via Nginx (proxy)    │
+│ 13. View supported services list    │
 │  0. Back                            │
 └─────────────────────────────────────┘
 ```
 
+### Databases
+
+The **Databases** menu (Service Deployment → option 6) deploys a Docker-based
+database engine and provisions its credentials:
+
+1. Choose the engine — **MySQL**, **PostgreSQL**, or **MongoDB**.
+2. Select a running container (Docker is installed if missing).
+3. Enter the listening port and credentials (root/superuser password, database name,
+   and — for MySQL — an application user). Leaving a password blank auto-generates a
+   strong one via `openssl rand`.
+4. The wizard writes `docker-compose.yml` plus a `.env` file (mode `600`) holding the
+   credentials to `/opt/services/<engine>/`, then runs `docker compose up -d`.
+
+Data persists in a named Docker volume, and the final screen shows a ready-to-use
+connection command. Databases are intentionally excluded from the Auto-HTTPS wizard
+(they are not HTTP services).
+
 ### Auto-HTTPS via Nginx
 
-The **Auto-HTTPS via Nginx** wizard (Service Deployment → option 11) automatically
+The **Auto-HTTPS via Nginx** wizard (Service Deployment → option 12) automatically
 puts an Nginx reverse proxy with TLS in front of the plain-HTTP services already
 running in a container:
 

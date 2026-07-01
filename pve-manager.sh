@@ -274,7 +274,12 @@ create_builtin_plugins() {
     create_plugin_traefik
     create_plugin_nginx
 
-    log_info "Created 21 built-in plugins"
+    # Database plugins
+    create_plugin_mysql
+    create_plugin_postgresql
+    create_plugin_mongodb
+
+    log_info "Created 24 built-in plugins"
 }
 
 #######################################
@@ -2890,6 +2895,186 @@ lxc_exec_live "$VMID" "systemctl disable nginx 2>/dev/null || rc-update del ngin
 lxc_exec "$VMID" "rm -f /etc/nginx/conf.d/pve-reverse-proxy.conf /etc/nginx/http.d/pve-reverse-proxy.conf 2>/dev/null || true"
 lxc_exec "$VMID" "rm -rf /etc/nginx/ssl 2>/dev/null || true"
 lxc_exec_live "$VMID" "apt-get remove -y nginx nginx-common 2>/dev/null || apk del nginx 2>/dev/null || true"
+EOF
+}
+
+#######################################
+# DATABASE PLUGINS
+#######################################
+
+# Create MySQL plugin
+create_plugin_mysql() {
+    local dir
+    dir=$(create_plugin_dir "mysql")
+
+    cat > "$dir/plugin.conf" << 'EOF'
+PLUGIN_ID="mysql"
+PLUGIN_NAME="MySQL"
+PLUGIN_VERSION="8"
+PLUGIN_CATEGORY="database"
+PLUGIN_DESCRIPTION="MySQL relational database server"
+PLUGIN_DOCKER_SUPPORT="true"
+PLUGIN_NATIVE_SUPPORT="false"
+PLUGIN_NATIVE_OS=""
+PLUGIN_DOCKER_PORT="3306"
+PLUGIN_DOCKER_URL="{IP}:3306"
+PLUGIN_DOCKER_CREDENTIALS="See deployment output"
+PLUGIN_NATIVE_URL=""
+PLUGIN_NATIVE_CREDENTIALS=""
+PLUGIN_SYSTEMD_SERVICE=""
+PLUGIN_DOCKER_CONTAINER="mysql"
+EOF
+
+    cat > "$dir/compose.yml" << 'EOF'
+version: '3.8'
+services:
+  mysql:
+    image: mysql:8
+    container_name: mysql
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    command: --default-authentication-plugin=mysql_native_password
+    ports:
+      - "${DB_PORT:-3306}:3306"
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-changeme}
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-appdb}
+      - MYSQL_USER=${MYSQL_USER:-appuser}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-changeme}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-changeme}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  mysql_data:
+EOF
+
+    cat > "$dir/remove.sh" << 'EOF'
+#!/bin/bash
+# Removal handled by generic docker compose down; native not supported.
+true
+EOF
+}
+
+# Create PostgreSQL plugin
+create_plugin_postgresql() {
+    local dir
+    dir=$(create_plugin_dir "postgresql")
+
+    cat > "$dir/plugin.conf" << 'EOF'
+PLUGIN_ID="postgresql"
+PLUGIN_NAME="PostgreSQL"
+PLUGIN_VERSION="16"
+PLUGIN_CATEGORY="database"
+PLUGIN_DESCRIPTION="PostgreSQL relational database server"
+PLUGIN_DOCKER_SUPPORT="true"
+PLUGIN_NATIVE_SUPPORT="false"
+PLUGIN_NATIVE_OS=""
+PLUGIN_DOCKER_PORT="5432"
+PLUGIN_DOCKER_URL="{IP}:5432"
+PLUGIN_DOCKER_CREDENTIALS="See deployment output"
+PLUGIN_NATIVE_URL=""
+PLUGIN_NATIVE_CREDENTIALS=""
+PLUGIN_SYSTEMD_SERVICE=""
+PLUGIN_DOCKER_CONTAINER="postgresql"
+EOF
+
+    cat > "$dir/compose.yml" << 'EOF'
+version: '3.8'
+services:
+  postgresql:
+    image: postgres:16
+    container_name: postgresql
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    environment:
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-changeme}
+      - POSTGRES_USER=${POSTGRES_USER:-appuser}
+      - POSTGRES_DB=${POSTGRES_DB:-appdb}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-appuser} -d ${POSTGRES_DB:-appdb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  postgres_data:
+EOF
+
+    cat > "$dir/remove.sh" << 'EOF'
+#!/bin/bash
+# Removal handled by generic docker compose down; native not supported.
+true
+EOF
+}
+
+# Create MongoDB plugin
+create_plugin_mongodb() {
+    local dir
+    dir=$(create_plugin_dir "mongodb")
+
+    cat > "$dir/plugin.conf" << 'EOF'
+PLUGIN_ID="mongodb"
+PLUGIN_NAME="MongoDB"
+PLUGIN_VERSION="7"
+PLUGIN_CATEGORY="database"
+PLUGIN_DESCRIPTION="MongoDB NoSQL document database server"
+PLUGIN_DOCKER_SUPPORT="true"
+PLUGIN_NATIVE_SUPPORT="false"
+PLUGIN_NATIVE_OS=""
+PLUGIN_DOCKER_PORT="27017"
+PLUGIN_DOCKER_URL="{IP}:27017"
+PLUGIN_DOCKER_CREDENTIALS="See deployment output"
+PLUGIN_NATIVE_URL=""
+PLUGIN_NATIVE_CREDENTIALS=""
+PLUGIN_SYSTEMD_SERVICE=""
+PLUGIN_DOCKER_CONTAINER="mongodb"
+EOF
+
+    cat > "$dir/compose.yml" << 'EOF'
+version: '3.8'
+services:
+  mongodb:
+    image: mongo:7
+    container_name: mongodb
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    ports:
+      - "${DB_PORT:-27017}:27017"
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_ROOT_USER:-admin}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_ROOT_PASSWORD:-changeme}
+      - MONGO_INITDB_DATABASE=${MONGO_DB:-appdb}
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  mongo_data:
+EOF
+
+    cat > "$dir/remove.sh" << 'EOF'
+#!/bin/bash
+# Removal handled by generic docker compose down; native not supported.
+true
 EOF
 }
 
@@ -8942,6 +9127,14 @@ show_supported_services() {
 │  • Nginx             - Reverse proxy & web server           │
 └─────────────────────────────────────────────────────────────┘
 
+┌─────────────────────────────────────────────────────────────┐
+│  DATABASES                                                 │
+├─────────────────────────────────────────────────────────────┤
+│  • MySQL             - Relational database server           │
+│  • PostgreSQL        - Relational database server           │
+│  • MongoDB           - NoSQL document database              │
+└─────────────────────────────────────────────────────────────┘
+
 ───────────────────────────────────────────────────────────────
   DEPLOYMENT OPTIONS:
   ─────────────────────────────────────────────────────────────
@@ -8949,9 +9142,11 @@ show_supported_services() {
   [Native]  Some services support native OS installation:
             Prometheus, Grafana, Gitea, Jenkins, Kiwi TCMS,
             TestLink, SonarQube, Pi-hole, Nginx
+  [.env]    Databases prompt for credentials at deploy time
+            (stored in /opt/services/<db>/.env)
 
 ───────────────────────────────────────────────────────────────
-  Total Services: 22
+  Total Services: 25
 ═══════════════════════════════════════════════════════════════
 "
 
@@ -8993,13 +9188,14 @@ service_deployment_menu() {
             "3" "Testing Tools" \
             "4" "Infrastructure Tools" \
             "5" "Reverse Proxy (Nginx / Traefik)" \
-            "6" "View deployed services" \
-            "7" "Update/Redeploy service" \
-            "8" "Stop service" \
-            "9" "Remove service" \
-            "10" "Enable HTTPS for service (manual)" \
-            "11" "Auto-HTTPS via Nginx (reverse proxy)" \
-            "12" "View supported services list" \
+            "6" "Databases (MySQL / PostgreSQL / MongoDB)" \
+            "7" "View deployed services" \
+            "8" "Update/Redeploy service" \
+            "9" "Stop service" \
+            "10" "Remove service" \
+            "11" "Enable HTTPS for service (manual)" \
+            "12" "Auto-HTTPS via Nginx (reverse proxy)" \
+            "13" "View supported services list" \
             "0" "Back to main menu")
 
         case "$choice" in
@@ -9019,24 +9215,27 @@ service_deployment_menu() {
                 reverse_proxy_menu
                 ;;
             6)
-                view_deployed_services
+                database_menu
                 ;;
             7)
-                update_service_wizard
+                view_deployed_services
                 ;;
             8)
-                stop_service_wizard
+                update_service_wizard
                 ;;
             9)
-                remove_service_wizard
+                stop_service_wizard
                 ;;
             10)
-                enable_https_wizard
+                remove_service_wizard
                 ;;
             11)
-                nginx_auto_https_wizard
+                enable_https_wizard
                 ;;
             12)
+                nginx_auto_https_wizard
+                ;;
+            13)
                 show_supported_services
                 ;;
             0|"")
@@ -9411,11 +9610,14 @@ nginx_auto_https_wizard() {
 
     # Build container-name -> "port|label" map from plugin metadata
     local -A SVC_PORT SVC_LABEL
-    local pid conf cname cport pname
+    local pid conf cname cport pname pcat
     for pid in "${!PLUGINS[@]}"; do
         # Skip the reverse proxies themselves
         [[ "$pid" == "nginx" || "$pid" == "traefik" ]] && continue
         conf="${PLUGINS[$pid]}/plugin.conf"
+        # Skip databases - they are not HTTP services and must not be proxied
+        pcat=$(get_plugin_value "$conf" "PLUGIN_CATEGORY")
+        [[ "$pcat" == "database" ]] && continue
         cname=$(get_plugin_value "$conf" "PLUGIN_DOCKER_CONTAINER")
         cport=$(get_plugin_value "$conf" "PLUGIN_DOCKER_PORT")
         pname=$(get_plugin_value "$conf" "PLUGIN_NAME")
@@ -11066,6 +11268,201 @@ volumes:
     ) 2>&1 | show_progress_box "Deploying Jenkins Agent" 24 84
 
     show_msg "Jenkins Agent Deployed" "Inbound agent '$aname' deployed to container $selected.\n\nController : $jurl\nContainer  : $cname\nDirectory  : $service_dir\n\nVerify the agent shows as connected in Jenkins\n(Manage Jenkins > Nodes).\n\nView logs:\n  docker logs -f $cname\n\nIf it fails to connect, check the secret and that the\ncontroller URL is reachable from the container."
+}
+
+# Deploy a database service (MySQL / PostgreSQL / MongoDB) via Docker.
+# Prompts for credentials and writes them to a .env file that docker compose reads.
+db_deploy_wizard() {
+    local service="$1"
+    local service_name="$2"
+
+    local containers
+    containers=$(pve_list_containers)
+    if [[ -z "$containers" ]]; then
+        show_msg "No Containers" "No containers found."
+        return
+    fi
+
+    local ct_array=()
+    while read -r vmid status _ name; do
+        [[ -z "$vmid" ]] && continue
+        [[ "$status" != "running" ]] && continue
+        ct_array+=("$vmid" "$name")
+    done <<< "$containers"
+
+    if [[ ${#ct_array[@]} -eq 0 ]]; then
+        show_msg "No Running Containers" "No running containers found."
+        return
+    fi
+
+    local selected
+    selected=$(show_menu "Select Container" "Choose container to deploy $service_name:" "${ct_array[@]}")
+    [[ -z "$selected" ]] && return
+
+    # Ensure Docker is available (offer to install)
+    show_info "Checking..." "Checking Docker installation..."
+    local docker_check
+    docker_check=$(lxc_exec "$selected" "docker --version 2>/dev/null")
+    if [[ -z "$docker_check" ]]; then
+        if show_yesno "Docker Required" "Docker is not installed in container $selected.\n\nInstall Docker now?"; then
+            local os_type
+            os_type=$(detect_container_os "$selected")
+            docker_install_with_progress "$selected" "$os_type"
+            docker_check=$(lxc_exec "$selected" "docker --version 2>/dev/null")
+            if [[ -z "$docker_check" ]]; then
+                show_msg "Docker Failed" "Docker installation failed. Cannot proceed."
+                return
+            fi
+        else
+            return
+        fi
+    fi
+
+    # Default listening port per engine
+    local def_port
+    case "$service" in
+        mysql)      def_port="3306" ;;
+        postgresql) def_port="5432" ;;
+        mongodb)    def_port="27017" ;;
+    esac
+
+    local db_port
+    db_port=$(show_input "Database Port" "Host port to publish $service_name on:" "$def_port")
+    [[ -z "$db_port" ]] && db_port="$def_port"
+
+    # Collect engine-specific credentials. Empty password => auto-generated.
+    local env_content="" summary="" access_line="" conn_example=""
+    local dbname dbuser dbpass rootpass
+
+    case "$service" in
+        mysql)
+            rootpass=$(show_input "MySQL root Password" "Password for the MySQL 'root' user (blank = auto-generate):" "")
+            [[ -z "$rootpass" ]] && rootpass=$(openssl rand -hex 16)
+            dbname=$(show_input "Database Name" "Name of the initial database to create:" "appdb")
+            [[ -z "$dbname" ]] && dbname="appdb"
+            dbuser=$(show_input "Application User" "Non-root application username to create:" "appuser")
+            [[ -z "$dbuser" ]] && dbuser="appuser"
+            dbpass=$(show_input "Application Password" "Password for '$dbuser' (blank = auto-generate):" "")
+            [[ -z "$dbpass" ]] && dbpass=$(openssl rand -hex 16)
+            env_content="DB_PORT=${db_port}
+MYSQL_ROOT_PASSWORD=${rootpass}
+MYSQL_DATABASE=${dbname}
+MYSQL_USER=${dbuser}
+MYSQL_PASSWORD=${dbpass}"
+            summary="Port         : ${db_port}\nroot password: ${rootpass}\nDatabase     : ${dbname}\nApp user     : ${dbuser}\nApp password : ${dbpass}"
+            conn_example="mysql -h {IP} -P ${db_port} -u ${dbuser} -p'${dbpass}' ${dbname}"
+            ;;
+        postgresql)
+            dbuser=$(show_input "Superuser Name" "PostgreSQL superuser/role to create:" "appuser")
+            [[ -z "$dbuser" ]] && dbuser="appuser"
+            dbpass=$(show_input "Superuser Password" "Password for '$dbuser' (blank = auto-generate):" "")
+            [[ -z "$dbpass" ]] && dbpass=$(openssl rand -hex 16)
+            dbname=$(show_input "Database Name" "Name of the initial database to create:" "appdb")
+            [[ -z "$dbname" ]] && dbname="appdb"
+            env_content="DB_PORT=${db_port}
+POSTGRES_USER=${dbuser}
+POSTGRES_PASSWORD=${dbpass}
+POSTGRES_DB=${dbname}"
+            summary="Port     : ${db_port}\nUser     : ${dbuser}\nPassword : ${dbpass}\nDatabase : ${dbname}"
+            conn_example="psql \"postgresql://${dbuser}:${dbpass}@{IP}:${db_port}/${dbname}\""
+            ;;
+        mongodb)
+            dbuser=$(show_input "Root Username" "MongoDB root username to create:" "admin")
+            [[ -z "$dbuser" ]] && dbuser="admin"
+            dbpass=$(show_input "Root Password" "Password for '$dbuser' (blank = auto-generate):" "")
+            [[ -z "$dbpass" ]] && dbpass=$(openssl rand -hex 16)
+            dbname=$(show_input "Initial Database" "Name of the initial database:" "appdb")
+            [[ -z "$dbname" ]] && dbname="appdb"
+            env_content="DB_PORT=${db_port}
+MONGO_ROOT_USER=${dbuser}
+MONGO_ROOT_PASSWORD=${dbpass}
+MONGO_DB=${dbname}"
+            summary="Port     : ${db_port}\nRoot user: ${dbuser}\nPassword : ${dbpass}\nDatabase : ${dbname}"
+            conn_example="mongosh \"mongodb://${dbuser}:${dbpass}@{IP}:${db_port}/${dbname}?authSource=admin\""
+            ;;
+        *)
+            show_msg "Unknown Database" "Unsupported database service: $service"
+            return
+            ;;
+    esac
+
+    local service_dir="/opt/services/${service}"
+
+    # Warn if already deployed
+    if lxc_exec "$selected" "test -f ${service_dir}/docker-compose.yml" 2>/dev/null; then
+        if ! show_yesno "Already Deployed" "$service_name already appears deployed at:\n  ${service_dir}\n\nRedeploy / overwrite it? (existing data volume is preserved)"; then
+            return
+        fi
+    fi
+
+    if ! show_yesno "Confirm Deployment" "Deploy $service_name to container $selected via Docker?\n\n${summary}\n\nCredentials are written to ${service_dir}/.env"; then
+        return
+    fi
+
+    # Fetch compose from the plugin and prepare payloads
+    local compose_content
+    compose_content=$(get_service_compose "$service")
+    if [[ -z "$compose_content" ]]; then
+        show_msg "Error" "Could not load compose definition for $service."
+        return
+    fi
+    local compose_b64 env_b64
+    compose_b64=$(printf '%s' "$compose_content" | base64 -w0)
+    env_b64=$(printf '%s' "$env_content" | base64 -w0)
+
+    (
+        echo "=== Deploying $service_name to Container $selected ==="
+        echo ""
+        echo "Checking Docker..."
+        lxc_exec "$selected" "docker --version 2>/dev/null"
+        echo ""
+
+        echo "Creating service directory: $service_dir"
+        lxc_exec_live "$selected" "mkdir -p $service_dir"
+
+        echo "Writing docker-compose.yml..."
+        lxc_exec "$selected" "echo '$compose_b64' | base64 -d > ${service_dir}/docker-compose.yml"
+
+        echo "Writing .env (credentials)..."
+        lxc_exec "$selected" "echo '$env_b64' | base64 -d > ${service_dir}/.env"
+        lxc_exec "$selected" "chmod 600 ${service_dir}/.env"
+        echo ""
+
+        echo "Pulling image and starting database..."
+        lxc_exec_live "$selected" "cd ${service_dir} && docker compose up -d 2>&1"
+        echo ""
+
+        echo "Current status:"
+        lxc_exec "$selected" "docker ps --filter name=${service} --format '  {{.Names}}: {{.Status}}' 2>/dev/null"
+        echo ""
+        echo "=== Deployment finished ==="
+    ) 2>&1 | show_progress_box "Deploying $service_name" 24 84
+
+    local ip
+    ip=$(get_container_ip "$selected")
+    [[ -z "$ip" ]] && ip="<container-ip>"
+    local conn="${conn_example//\{IP\}/$ip}"
+
+    show_msg "$service_name Deployed" "$service_name deployed to container $selected.\n\nHost:Port : ${ip}:${db_port}\n${summary}\n\nConnect:\n  ${conn}\n\nCredentials saved in ${service_dir}/.env\nData persists in a Docker named volume.\n\nNote: the database listens on the container IP. Expose it beyond\nthe host only if you intend remote access."
+}
+
+# Database deployment menu
+database_menu() {
+    while true; do
+        local choice
+        choice=$(show_menu "Databases" "Select a database engine to deploy:" \
+            "1" "MySQL (relational)" \
+            "2" "PostgreSQL (relational)" \
+            "3" "MongoDB (NoSQL document)" \
+            "0" "Back")
+
+        case "$choice" in
+            1) db_deploy_wizard "mysql" "MySQL" ;;
+            2) db_deploy_wizard "postgresql" "PostgreSQL" ;;
+            3) db_deploy_wizard "mongodb" "MongoDB" ;;
+            0|"") break ;;
+        esac
+    done
 }
 
 # Service deployment wizard
