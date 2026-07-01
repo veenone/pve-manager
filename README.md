@@ -9,7 +9,7 @@ A comprehensive single-file Bash TUI application for managing Proxmox VE infrast
 - **Docker Setup**: Automated Docker installation with LXC-specific configuration
 - **SSH Key Management**: Generate and distribute SSH keys across containers
 - **Certificate Authority**: Self-signed CA with automatic certificate generation, deployment, and renewal
-- **Service Deployment**: 21 pre-configured services with Docker and native installation options
+- **Service Deployment**: 22 pre-configured services with Docker and native installation options
 - **FreeIPA Setup Wizard**: Complete LDAP structure management for identity services
 
 ## Requirements
@@ -92,7 +92,7 @@ SSH_KEY_TYPE="ed25519"    # SSH key type (ed25519, rsa, ecdsa)
 LOG_LEVEL="INFO"          # Log level (INFO, DEBUG)
 ```
 
-## Supported Services (21 Total)
+## Supported Services (22 Total)
 
 ### Monitoring Stack
 | Service | Description | Ports |
@@ -111,6 +111,7 @@ LOG_LEVEL="INFO"          # Log level (INFO, DEBUG)
 | Nexus | Artifact repository manager | 8081 |
 | Gitea | Lightweight Git server | 3000 |
 | Jenkins | CI/CD automation server | 8080 |
+| Jenkins Inbound Agent | JNLP build agent that connects out to a controller | — (outbound) |
 | Harbor | Container image registry | 80, 5000 |
 | Dependency-Track | SCA and SBOM vulnerability management | 8080, 8081 |
 
@@ -129,10 +130,11 @@ LOG_LEVEL="INFO"          # Log level (INFO, DEBUG)
 | FreeIPA | Identity management (LDAP/Kerberos/DNS) | 80, 443, 389, 636, 88 |
 | Postfix Relay | SMTP mail relay server | 25, 587 |
 | Traefik | Reverse proxy and load balancer | 80, 443, 8080 |
+| Nginx | Reverse proxy and web server | 80, 443 |
 
 ### Deployment Options
 - **Docker**: All services support Docker-based deployment
-- **Native**: Prometheus, Grafana, Gitea, Jenkins, Kiwi TCMS, TestLink, SonarQube, Pi-hole
+- **Native**: Prometheus, Grafana, Gitea, Jenkins, Kiwi TCMS, TestLink, SonarQube, Pi-hole, Nginx
 
 ## Main Menu
 
@@ -231,16 +233,62 @@ Certificate locations in containers:
 │  2. Development Tools               │
 │  3. Testing Tools                   │
 │  4. Infrastructure Tools            │
-│  5. Reverse Proxy (Traefik)         │
+│  5. Reverse Proxy (Nginx/Traefik)   │
 │  6. View deployed services          │
 │  7. Update/Redeploy service         │
 │  8. Stop service                    │
 │  9. Remove service                  │
 │ 10. Enable HTTPS for service        │
-│ 11. View supported services list    │
+│ 11. Auto-HTTPS via Nginx (proxy)    │
+│ 12. View supported services list    │
 │  0. Back                            │
 └─────────────────────────────────────┘
 ```
+
+### Auto-HTTPS via Nginx
+
+The **Auto-HTTPS via Nginx** wizard (Service Deployment → option 11) automatically
+puts an Nginx reverse proxy with TLS in front of the plain-HTTP services already
+running in a container:
+
+1. Select a running container.
+2. The wizard scans running Docker services and matches them to known HTTP ports
+   (Grafana, Gitea, Jenkins, SonarQube, Nexus, Prometheus, Keycloak, …). Services
+   that already serve HTTPS (Harbor, Kiwi TCMS, FreeIPA) and non-HTTP services are
+   skipped automatically.
+3. Pick which services to expose (all selected by default).
+4. Nginx is installed natively if missing, a certificate for the container is issued
+   by the PVE Manager CA and deployed, and one HTTPS reverse-proxy `server` block is
+   generated per service (config is validated with `nginx -t` before reload).
+
+Each service is published on a dedicated TLS port (`service port + 10000`, e.g.
+Grafana `3000` → `https://<ip>:13000`); port collisions are resolved automatically.
+Generated files live in `conf.d/pve-https-*.conf` (or `http.d/` on Alpine).
+
+### Jenkins Inbound Agent
+
+The **Jenkins Inbound Agent** wizard (Service Deployment → Development Tools →
+option 5) deploys a Docker-based JNLP build agent
+([`jenkins/inbound-agent`](https://hub.docker.com/r/jenkins/inbound-agent/)) that
+connects **out** to an existing Jenkins controller:
+
+1. Select a running container (Docker is installed if missing).
+2. Provide the controller URL, the agent (node) name, and the agent secret from the
+   Jenkins node's connection page. Optionally choose the work directory and whether
+   to use WebSocket transport (recommended behind an HTTPS reverse proxy).
+3. If the controller URL is **HTTPS**, the wizard offers to make the agent trust the
+   controller's certificate:
+   - **Fetch from controller** — retrieves the certificate chain via `openssl
+     s_client` from `host:port`.
+   - **Reuse PVE Manager CA** — uses the local CA cert (ideal when the controller was
+     fronted by the Auto-HTTPS wizard).
+   - **Skip** — for publicly-trusted certs.
+
+The chosen certificate is mounted into the agent container and imported into a
+writable copy of the JVM trust store at startup (`JAVA_OPTS` points the agent at it),
+so a self-signed or private-CA controller is trusted without touching the image.
+Each agent is deployed to `/opt/services/jenkins-agent-<name>/` with `restart:
+unless-stopped`, so multiple agents can coexist in one container.
 
 ### 7. FreeIPA Setup Wizard
 
