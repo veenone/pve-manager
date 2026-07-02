@@ -310,11 +310,17 @@ connects **out** to an existing Jenkins controller:
      fronted by the Auto-HTTPS wizard).
    - **Skip** — for publicly-trusted certs.
 
-The chosen certificate is mounted into the agent container and imported into a
-writable copy of the JVM trust store at startup (`JAVA_OPTS` points the agent at it),
-so a self-signed or private-CA controller is trusted without touching the image.
-Each agent is deployed to `/opt/services/jenkins-agent-<name>/` with `restart:
-unless-stopped`, so multiple agents can coexist in one container.
+The chosen chain is split into individual certificates under
+`/opt/services/jenkins-agent-<name>/certs/`, mounted into the container at `/pve`,
+and passed to the agent via its built-in, repeatable `-cert @/pve/cert-N.pem` option
+(`hudson.remoting`). This is the officially-supported way to trust a self-signed or
+private-CA controller and covers both the initial HTTPS resolve and the WebSocket
+connection — no JVM trust-store surgery required. Each agent is deployed with
+`restart: unless-stopped`, so multiple agents can coexist in one container.
+
+> If you still see `unable to find valid certification path to requested target`,
+> re-run the wizard and choose **Fetch from controller** so the exact certificate the
+> controller presents (including any intermediates) is the one that gets trusted.
 
 ### 7. FreeIPA Setup Wizard
 

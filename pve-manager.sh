@@ -11182,8 +11182,22 @@ jenkins_agent_wizard() {
         return
     fi
 
-    # Build docker-compose.yml. Runtime shell variables that must survive into the
-    # container (\$TS, \${JAVA_HOME}, \$c, \$i) are escaped; wizard values expand now.
+    # Build docker-compose.yml. We use the remoting agent's built-in `-cert @file`
+    # option (repeatable, one trust anchor per file) rather than editing the JVM
+    # trust store, so a self-signed / private-CA controller is trusted reliably.
+    # The default `jenkins-agent` entrypoint appends these command args to agent.jar.
+    local cert_count=0 cert_cmd=""
+    if [[ "$cert_mode" == "custom" ]]; then
+        cert_count=$(printf '%s\n' "$cert_pem" | grep -c 'BEGIN CERTIFICATE')
+        [[ "$cert_count" -lt 1 ]] && cert_count=1
+        local n
+        for ((n=0; n<cert_count; n++)); do
+            cert_cmd+="
+      - \"-cert\"
+      - \"@/pve/cert-${n}.pem\""
+        done
+    fi
+
     local compose
     compose="version: '3.8'
 services:
@@ -11200,28 +11214,10 @@ services:
 
     if [[ "$cert_mode" == "custom" ]]; then
         compose+="
-      - \"JAVA_OPTS=-Djavax.net.ssl.trustStore=/home/jenkins/pve-cacerts -Djavax.net.ssl.trustStorePassword=changeit\"
     volumes:
       - agent_work:${awork}
-      - ./pve-jenkins-ca.pem:/pve/ca.pem:ro
-    entrypoint:
-      - /bin/bash
-      - -c
-      - |
-        set +e
-        TS=/home/jenkins/pve-cacerts
-        if [ ! -f \"\$TS\" ]; then
-          cp \"\${JAVA_HOME}/lib/security/cacerts\" \"\$TS\"
-          chmod u+w \"\$TS\"
-          csplit -z -f /tmp/pvec- -b '%02d.pem' /pve/ca.pem '/-----BEGIN CERTIFICATE-----/' '{*}' >/dev/null 2>&1
-          i=0
-          for c in /tmp/pvec-*.pem; do
-            [ -f \"\$c\" ] || continue
-            keytool -importcert -noprompt -trustcacerts -alias \"pve-jenkins-\$i\" -file \"\$c\" -keystore \"\$TS\" -storepass changeit >/dev/null 2>&1
-            i=\$((i+1))
-          done
-        fi
-        exec jenkins-agent"
+      - ./certs:/pve:ro
+    command:${cert_cmd}"
     else
         compose+="
     volumes:
@@ -11232,10 +11228,16 @@ services:
 volumes:
   agent_work:"
 
-    # Deploy with a progress box
-    local compose_b64 cert_b64=""
+    # Deploy with a progress box. Split the trust chain into one PEM per cert
+    # (each becomes a `-cert @/pve/cert-N.pem`), since agent.jar reads only the
+    # first certificate from each file.
+    local compose_b64 cert_dir=""
     compose_b64=$(printf '%s' "$compose" | base64 -w0)
-    [[ "$cert_mode" == "custom" ]] && cert_b64=$(printf '%s' "$cert_pem" | base64 -w0)
+    if [[ "$cert_mode" == "custom" ]]; then
+        cert_dir=$(mktemp -d)
+        printf '%s\n' "$cert_pem" > "$cert_dir/chain.pem"
+        ( cd "$cert_dir" && csplit -z -s -f cert- -b '%d.pem' chain.pem '/-----BEGIN CERTIFICATE-----/' '{*}' 2>/dev/null ) || true
+    fi
 
     (
         echo "=== Deploying Jenkins Inbound Agent to Container $selected ==="
@@ -11249,8 +11251,17 @@ volumes:
         lxc_exec_live "$selected" "mkdir -p $service_dir"
 
         if [[ "$cert_mode" == "custom" ]]; then
-            echo "Writing controller certificate ($cert_source)..."
-            lxc_exec "$selected" "echo '$cert_b64' | base64 -d > ${service_dir}/pve-jenkins-ca.pem"
+            echo "Writing controller certificate(s) ($cert_source)..."
+            lxc_exec_live "$selected" "mkdir -p ${service_dir}/certs"
+            lxc_exec "$selected" "rm -f ${service_dir}/certs/cert-*.pem 2>/dev/null || true"
+            local cf base b64
+            for cf in "$cert_dir"/cert-*.pem; do
+                [ -f "$cf" ] || continue
+                base=$(basename "$cf")
+                b64=$(base64 -w0 "$cf")
+                lxc_exec "$selected" "echo '$b64' | base64 -d > ${service_dir}/certs/${base}"
+                echo "  ${base}"
+            done
         fi
 
         echo "Writing docker-compose.yml..."
@@ -11267,7 +11278,12 @@ volumes:
         echo "=== Deployment finished ==="
     ) 2>&1 | show_progress_box "Deploying Jenkins Agent" 24 84
 
-    show_msg "Jenkins Agent Deployed" "Inbound agent '$aname' deployed to container $selected.\n\nController : $jurl\nContainer  : $cname\nDirectory  : $service_dir\n\nVerify the agent shows as connected in Jenkins\n(Manage Jenkins > Nodes).\n\nView logs:\n  docker logs -f $cname\n\nIf it fails to connect, check the secret and that the\ncontroller URL is reachable from the container."
+    # Clean up the host-side temporary cert directory
+    [[ -n "$cert_dir" && -d "$cert_dir" ]] && rm -rf "$cert_dir"
+
+    local cert_note=""
+    [[ "$cert_mode" == "custom" ]] && cert_note="\nTrusted cert: ${cert_source} (${cert_count} cert(s) via -cert)"
+    show_msg "Jenkins Agent Deployed" "Inbound agent '$aname' deployed to container $selected.\n\nController : $jurl\nContainer  : $cname\nDirectory  : $service_dir${cert_note}\n\nVerify the agent shows as connected in Jenkins\n(Manage Jenkins > Nodes).\n\nView logs:\n  docker logs -f $cname\n\nIf it still reports 'unable to find valid certification path',\nre-run this wizard and choose 'Fetch certificate from controller'\nso the exact presented chain is trusted."
 }
 
 # Deploy a database service (MySQL / PostgreSQL / MongoDB) via Docker.
