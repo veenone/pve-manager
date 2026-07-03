@@ -310,13 +310,27 @@ connects **out** to an existing Jenkins controller:
      fronted by the Auto-HTTPS wizard).
    - **Skip** — for publicly-trusted certs.
 
-The chosen chain is split into individual certificates under
-`/opt/services/jenkins-agent-<name>/certs/`, mounted into the container at `/pve`,
-and passed to the agent via its built-in, repeatable `-cert @/pve/cert-N.pem` option
-(`hudson.remoting`). This is the officially-supported way to trust a self-signed or
-private-CA controller and covers both the initial HTTPS resolve and the WebSocket
-connection — no JVM trust-store surgery required. Each agent is deployed with
-`restart: unless-stopped`, so multiple agents can coexist in one container.
+The chosen chain is split into individual certificates and each is passed **inline**
+to the agent via its built-in, repeatable `-cert` option (`hudson.remoting`), embedded
+directly in the compose file's `command:`. This is the officially-supported way to
+trust a self-signed or private-CA controller and covers both the initial HTTPS resolve
+and the WebSocket connection — no JVM trust-store surgery required. Each agent is
+deployed with `restart: unless-stopped`, so multiple agents can coexist in one
+container.
+
+> **Why inline and not `-cert @file`?** The remoting option parser (args4j) treats any
+> argument beginning with `@` as a *command file* and splices its lines in as
+> arguments before option parsing. Passing `-cert @/path/cert.pem` therefore expands
+> the PEM's body lines into bogus options and fails with
+> `'-----END CERTIFICATE-----' is not a valid option`. An inline PEM value is a single
+> argument and is parsed correctly.
+
+When you choose **Fetch from controller**, the wizard also inspects the certificate's
+SAN/CN and warns if it does **not** cover the host in your Controller URL. The agent
+still verifies the hostname (trusting a cert does not disable that check), so a
+mismatch fails with `No name matching <host> found` even though the cert is trusted.
+Fix it by pointing the Controller URL at a name the cert covers, or reissuing the
+controller cert with the right SAN.
 
 > If you still see `unable to find valid certification path to requested target`,
 > re-run the wizard and choose **Fetch from controller** so the exact certificate the

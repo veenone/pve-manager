@@ -11144,6 +11144,22 @@ jenkins_agent_wizard() {
                 fi
                 cert_mode="custom"
                 cert_source="fetched from ${host}:${port}"
+
+                # Warn on hostname mismatch: the remoting agent still performs TLS
+                # hostname verification (trust via -cert does not disable it). If the
+                # controller's leaf cert does not cover the host in the URL, the agent
+                # will fail with "No name matching <host> found" even though the cert
+                # is trusted. Surface this now so the user can fix the URL or cert.
+                local leaf_names
+                leaf_names=$(printf '%s\n' "$cert_pem" \
+                    | openssl x509 -noout -ext subjectAltName 2>/dev/null \
+                    | grep -oE '(DNS|IP Address):[^,]+' | sed 's/^\(DNS\|IP Address\)://; s/ //g' | paste -sd, -)
+                if [[ -z "$leaf_names" ]]; then
+                    leaf_names=$(printf '%s\n' "$cert_pem" | openssl x509 -noout -subject 2>/dev/null | sed 's/.*CN *= *//; s/,.*//')
+                fi
+                if [[ -n "$leaf_names" ]] && ! printf '%s' ",${leaf_names}," | grep -qiF ",${host},"; then
+                    show_msg "Certificate Name Mismatch" "The controller's certificate is issued for:\n  ${leaf_names}\n\nbut the agent connects to host:\n  ${host}\n\nThe agent verifies the hostname against the certificate, so it will\nfail with 'No name matching ${host} found' unless you either:\n\n  - set the Controller URL to a name the cert covers\n    (e.g. https://${leaf_names%%,*}:${port}), or\n  - reissue the controller cert with '${host}' in its SAN.\n\nDeployment will continue; fix the URL/cert if the agent does not connect." 20 78
+                fi
                 ;;
             pveca)
                 if [[ "$ca_avail" != "yes" ]]; then
@@ -11182,20 +11198,38 @@ jenkins_agent_wizard() {
         return
     fi
 
-    # Build docker-compose.yml. We use the remoting agent's built-in `-cert @file`
-    # option (repeatable, one trust anchor per file) rather than editing the JVM
-    # trust store, so a self-signed / private-CA controller is trusted reliably.
+    # Build docker-compose.yml. We pass each trust anchor INLINE to the remoting
+    # agent's repeatable `-cert` option (one PEM per value) rather than editing the
+    # JVM trust store, so a self-signed / private-CA controller is trusted reliably.
+    #
+    # We deliberately avoid the `-cert @file` at-syntax: args4j (the option parser
+    # in hudson.remoting.Launcher) expands ANY argv token beginning with `@` as a
+    # command file, splicing that file's lines in as arguments *before* option
+    # parsing. That turned each PEM body line into a bogus option, producing
+    # "'-----END CERTIFICATE-----' is not a valid option". An inline PEM value is a
+    # single argv token (not `@`-prefixed) and is parsed directly as a certificate.
+    #
     # The default `jenkins-agent` entrypoint appends these command args to agent.jar.
-    local cert_count=0 cert_cmd=""
+    # agent.jar reads only the FIRST certificate from each -cert value, so we split
+    # the chain into one PEM per cert and emit one -cert per certificate.
+    local cert_count=0 cert_cmd="" cert_dir=""
     if [[ "$cert_mode" == "custom" ]]; then
-        cert_count=$(printf '%s\n' "$cert_pem" | grep -c 'BEGIN CERTIFICATE')
-        [[ "$cert_count" -lt 1 ]] && cert_count=1
-        local n
-        for ((n=0; n<cert_count; n++)); do
+        cert_dir=$(mktemp -d)
+        printf '%s\n' "$cert_pem" > "$cert_dir/chain.pem"
+        ( cd "$cert_dir" && csplit -z -s -f cert- -b '%d.pem' chain.pem '/-----BEGIN CERTIFICATE-----/' '{*}' 2>/dev/null ) || true
+        local cf esc
+        for cf in "$cert_dir"/cert-*.pem; do
+            [ -f "$cf" ] || continue
+            # Flatten the PEM into a single YAML double-quoted scalar: real newlines
+            # become literal \n, which YAML re-expands to newlines in the argv token.
+            # PEM is base64 + dashes only, so no " or \ to escape.
+            esc=$(awk 'BEGIN{ORS=""} {printf "%s\\n", $0}' "$cf")
             cert_cmd+="
       - \"-cert\"
-      - \"@/pve/cert-${n}.pem\""
+      - \"${esc}\""
+            ((cert_count++)) || true
         done
+        [[ "$cert_count" -lt 1 ]] && cert_count=1
     fi
 
     local compose
@@ -11216,7 +11250,6 @@ services:
         compose+="
     volumes:
       - agent_work:${awork}
-      - ./certs:/pve:ro
     command:${cert_cmd}"
     else
         compose+="
@@ -11228,16 +11261,11 @@ services:
 volumes:
   agent_work:"
 
-    # Deploy with a progress box. Split the trust chain into one PEM per cert
-    # (each becomes a `-cert @/pve/cert-N.pem`), since agent.jar reads only the
-    # first certificate from each file.
-    local compose_b64 cert_dir=""
+    # Deploy with a progress box. The trust anchors are embedded inline in the
+    # compose file's command:, so nothing cert-related needs to be written into
+    # the container separately.
+    local compose_b64
     compose_b64=$(printf '%s' "$compose" | base64 -w0)
-    if [[ "$cert_mode" == "custom" ]]; then
-        cert_dir=$(mktemp -d)
-        printf '%s\n' "$cert_pem" > "$cert_dir/chain.pem"
-        ( cd "$cert_dir" && csplit -z -s -f cert- -b '%d.pem' chain.pem '/-----BEGIN CERTIFICATE-----/' '{*}' 2>/dev/null ) || true
-    fi
 
     (
         echo "=== Deploying Jenkins Inbound Agent to Container $selected ==="
@@ -11251,17 +11279,9 @@ volumes:
         lxc_exec_live "$selected" "mkdir -p $service_dir"
 
         if [[ "$cert_mode" == "custom" ]]; then
-            echo "Writing controller certificate(s) ($cert_source)..."
-            lxc_exec_live "$selected" "mkdir -p ${service_dir}/certs"
-            lxc_exec "$selected" "rm -f ${service_dir}/certs/cert-*.pem 2>/dev/null || true"
-            local cf base b64
-            for cf in "$cert_dir"/cert-*.pem; do
-                [ -f "$cf" ] || continue
-                base=$(basename "$cf")
-                b64=$(base64 -w0 "$cf")
-                lxc_exec "$selected" "echo '$b64' | base64 -d > ${service_dir}/certs/${base}"
-                echo "  ${base}"
-            done
+            echo "Embedding controller certificate(s) inline ($cert_source, $cert_count cert(s))..."
+            # Remove any stale certs/ dir from a previous @file-based deployment.
+            lxc_exec "$selected" "rm -rf ${service_dir}/certs 2>/dev/null || true"
         fi
 
         echo "Writing docker-compose.yml..."
