@@ -272,8 +272,14 @@ create_builtin_plugins() {
     create_plugin_freeipa
     create_plugin_postfix_relay
     create_plugin_traefik
+    create_plugin_nginx
 
-    log_info "Created 20 built-in plugins"
+    # Database plugins
+    create_plugin_mysql
+    create_plugin_postgresql
+    create_plugin_mongodb
+
+    log_info "Created 24 built-in plugins"
 }
 
 #######################################
@@ -2427,14 +2433,16 @@ PLUGIN_DOCKER_CREDENTIALS="admin / Admin123"
 PLUGIN_DOCKER_CONTAINER="freeipa"
 EOF
 
-    # compose.yml - FreeIPA requires special handling for LXC+Docker
+    # compose.yml - Note: FreeIPA is deployed via custom docker run in deploy_service_with_progress
+    # This compose.yml is kept for reference but the deploy function uses docker run directly
+    # to handle --add-host for hostname resolution
     cat > "$dir/compose.yml" << 'EOF'
 version: '3.8'
 services:
   freeipa:
     image: freeipa/freeipa-server:fedora-43-4.13.0
     container_name: freeipa
-    hostname: ipa.local
+    hostname: ipa.srv.local
     restart: unless-stopped
     privileged: true
     stdin_open: true
@@ -2447,8 +2455,8 @@ services:
       - PASSWORD=Admin123
     command:
       - -U
-      - --realm=LOCAL
-      - --domain=local
+      - --realm=SRV.LOCAL
+      - --domain=srv.local
       - --ds-password=Admin123
       - --admin-password=Admin123
       - --no-ntp
@@ -2478,19 +2486,86 @@ volumes:
   freeipa_data:
 EOF
 
-    # Create a helper script for manual docker run (fallback if compose fails)
+    # Create a helper script for manual docker run
     cat > "$dir/run.sh" << 'RUNEOF'
 #!/bin/bash
-# Manual FreeIPA run command - use if docker-compose fails
-# This provides more control over cgroup settings
+# Manual FreeIPA deployment script
+# Usage: ./run.sh [FQDN] [CONTAINER_IP]
+# Example: ./run.sh ipa.home.lab 192.168.1.100
+
+FQDN="${1:-ipa.srv.local}"
+CONTAINER_IP="${2:-$(hostname -I | awk '{print $1}')}"
+DOMAIN="${FQDN#*.}"
+REALM="${DOMAIN^^}"
+
+echo "FreeIPA deployment:"
+echo "  FQDN:   $FQDN"
+echo "  Domain: $DOMAIN"
+echo "  Realm:  $REALM"
+echo "  IP:     $CONTAINER_IP"
+echo ""
+
+# Update /etc/hosts
+grep -q "$FQDN" /etc/hosts || echo "${CONTAINER_IP} ${FQDN} ${FQDN%%.*}" >> /etc/hosts
+
+# Clean up previous instance and stale networking state
+echo "Cleaning up previous deployment..."
+docker rm -f freeipa 2>/dev/null || true
+docker volume rm freeipa_data 2>/dev/null || true
+docker network prune -f 2>/dev/null || true
+docker container prune -f 2>/dev/null || true
+
+# Disable systemd start rate limiting for docker
+echo "Preparing Docker daemon..."
+mkdir -p /etc/systemd/system/docker.service.d
+cat > /etc/systemd/system/docker.service.d/no-rate-limit.conf << 'SVCEOF'
+[Unit]
+StartLimitIntervalSec=0
+StartLimitBurst=0
+[Service]
+RestartSec=3
+SVCEOF
+systemctl daemon-reload
+systemctl reset-failed docker.service containerd.service 2>/dev/null || true
+
+# Full stop and clean
+systemctl stop docker.socket docker containerd 2>/dev/null || true
+rm -rf /var/run/docker /var/run/docker.sock /run/containerd/containerd.sock 2>/dev/null || true
+
+# Start clean
+echo "Starting Docker daemon..."
+systemctl start containerd
+sleep 2
+systemctl start docker
+sleep 3
+
+if ! docker info >/dev/null 2>&1; then
+    echo "Docker failed to start. Retrying..."
+    systemctl stop docker.socket docker containerd 2>/dev/null || true
+    rm -rf /var/run/docker /var/run/docker.sock /run/containerd/containerd.sock 2>/dev/null || true
+    systemctl reset-failed docker.service containerd.service 2>/dev/null || true
+    sleep 5
+    systemctl start containerd
+    sleep 2
+    systemctl start docker
+    sleep 5
+    if ! docker info >/dev/null 2>&1; then
+        echo "ERROR: Docker daemon failed to start."
+        echo "Check: journalctl -u docker.service -n 20"
+        exit 1
+    fi
+fi
+echo "Docker daemon is healthy."
+echo ""
 
 docker run -d \
     --name freeipa \
-    --hostname ipa.local \
+    --hostname "${FQDN}" \
     --privileged \
     --security-opt seccomp=unconfined \
     --security-opt apparmor=unconfined \
     --cgroupns=host \
+    --add-host "${FQDN}:${CONTAINER_IP}" \
     -e PASSWORD=Admin123 \
     -p 80:80 -p 443:443 \
     -p 389:389 -p 636:636 \
@@ -2501,13 +2576,15 @@ docker run -d \
     -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
     --tmpfs /run --tmpfs /tmp \
     freeipa/freeipa-server:fedora-43-4.13.0 \
-    -U --realm=LOCAL --domain=local \
+    -U "--realm=${REALM}" "--domain=${DOMAIN}" \
     --ds-password=Admin123 --admin-password=Admin123 \
     --no-ntp --no-host-dns \
     --setup-dns --no-forwarders --allow-zone-overlap
 
+echo ""
 echo "FreeIPA container started. Check logs with: docker logs -f freeipa"
 echo "First startup takes 5-10 minutes for initial configuration."
+echo "Access: https://${CONTAINER_IP}/ (admin / Admin123)"
 RUNEOF
     chmod +x "$dir/run.sh"
 }
@@ -2630,6 +2707,374 @@ providers:
   file:
     directory: "/etc/traefik/dynamic"
     watch: true
+EOF
+}
+
+# Create nginx plugin (reverse proxy / web server)
+create_plugin_nginx() {
+    local dir
+    dir=$(create_plugin_dir "nginx")
+    mkdir -p "$dir/conf.d"
+
+    # plugin.conf
+    cat > "$dir/plugin.conf" << 'EOF'
+PLUGIN_ID="nginx"
+PLUGIN_NAME="Nginx"
+PLUGIN_VERSION="stable"
+PLUGIN_CATEGORY="infrastructure"
+PLUGIN_DESCRIPTION="Reverse proxy and web server"
+PLUGIN_DOCKER_SUPPORT="true"
+PLUGIN_NATIVE_SUPPORT="true"
+PLUGIN_NATIVE_OS="debian ubuntu alpine"
+PLUGIN_DOCKER_PORT="80"
+PLUGIN_DOCKER_URL="HTTP: http://{IP}\nHTTPS: https://{IP}"
+PLUGIN_DOCKER_CREDENTIALS=""
+PLUGIN_NATIVE_URL="HTTP: http://{IP}\nHTTPS: https://{IP}"
+PLUGIN_NATIVE_CREDENTIALS=""
+PLUGIN_SYSTEMD_SERVICE="nginx"
+PLUGIN_DOCKER_CONTAINER="nginx"
+EOF
+
+    # compose.yml
+    cat > "$dir/compose.yml" << 'EOF'
+version: '3.8'
+services:
+  nginx:
+    image: nginx:stable
+    container_name: nginx
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./conf.d:/etc/nginx/conf.d:ro
+      - ./ssl:/etc/nginx/ssl:ro
+      - /etc/ssl/pve-manager:/etc/ssl/pve-manager:ro
+EOF
+
+    # nginx.conf (main config)
+    cat > "$dir/nginx.conf" << 'EOF'
+user  nginx;
+worker_processes  auto;
+error_log  /var/log/nginx/error.log  warn;
+pid        /var/run/nginx.pid;
+
+events {
+    worker_connections  1024;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+
+    log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                      '$status $body_bytes_sent "$http_referer" '
+                      '"$http_user_agent" "$http_x_forwarded_for"';
+    access_log  /var/log/nginx/access.log  main;
+
+    sendfile           on;
+    keepalive_timeout  65;
+    client_max_body_size 100M;
+
+    # Reverse proxy sites live in conf.d/*.conf
+    include /etc/nginx/conf.d/*.conf;
+}
+EOF
+
+    # conf.d/default.conf (reverse proxy site template, shared by docker + native)
+    cat > "$dir/conf.d/default.conf" << 'EOF'
+# ============================================================================
+# PVE Manager - Nginx reverse proxy site
+# Edit the server/location blocks below to route to your backends.
+# Apply changes:  Docker  -> docker compose restart nginx
+#                 Native  -> nginx -t && systemctl reload nginx
+# ============================================================================
+
+# Optional: define reusable upstreams for load balancing
+# upstream app_backend {
+#     server 10.0.0.50:8080;
+#     # server 10.0.0.51:8080;
+# }
+
+# HTTP -> health check + redirect to HTTPS
+server {
+    listen 80 default_server;
+    server_name _;
+
+    location /healthz {
+        default_type text/plain;
+        return 200 "ok\n";
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# HTTPS reverse proxy
+server {
+    listen 443 ssl default_server;
+    server_name _;
+
+    ssl_certificate     /etc/nginx/ssl/server.crt;
+    ssl_certificate_key /etc/nginx/ssl/server.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+
+    # ------------------------------------------------------------------
+    # REVERSE PROXY EXAMPLE - uncomment and point at your service, then
+    # remove the placeholder "location /" block below.
+    # ------------------------------------------------------------------
+    # location / {
+    #     proxy_pass http://10.0.0.50:8080;            # <-- backend IP:port
+    #     proxy_set_header Host              $host;
+    #     proxy_set_header X-Real-IP         $remote_addr;
+    #     proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    #     proxy_set_header X-Forwarded-Proto $scheme;
+    #     proxy_http_version 1.1;
+    #     proxy_set_header Upgrade           $http_upgrade;
+    #     proxy_set_header Connection        "upgrade";
+    # }
+
+    location / {
+        default_type text/plain;
+        return 200 "PVE Manager nginx reverse proxy is running.\nEdit conf.d/default.conf to add your backends.\n";
+    }
+}
+EOF
+
+    # install.sh (native installation)
+    cat > "$dir/install.sh" << 'INSTALLEOF'
+#!/bin/bash
+# Native installation script for Nginx reverse proxy
+# Reuses the same reverse proxy site template as the Docker deployment.
+site_content=$(cat "${PLUGINS[nginx]}/conf.d/default.conf")
+
+case "$OS_TYPE" in
+    debian|ubuntu)
+        lxc_exec_live "$VMID" "apt-get update"
+        lxc_exec_live "$VMID" "DEBIAN_FRONTEND=noninteractive apt-get install -y nginx openssl"
+        lxc_exec_live "$VMID" "mkdir -p /etc/nginx/ssl"
+        lxc_exec "$VMID" "test -f /etc/nginx/ssl/server.crt || openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout /etc/nginx/ssl/server.key -out /etc/nginx/ssl/server.crt -subj '/CN=pve-nginx-reverse-proxy' 2>/dev/null"
+        lxc_exec "$VMID" "rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true"
+        lxc_exec "$VMID" "cat > /etc/nginx/conf.d/pve-reverse-proxy.conf << 'SITEEOF'
+${site_content}
+SITEEOF"
+        lxc_exec_live "$VMID" "nginx -t"
+        lxc_exec_live "$VMID" "systemctl enable nginx"
+        lxc_exec_live "$VMID" "systemctl restart nginx"
+        ;;
+    alpine)
+        lxc_exec_live "$VMID" "apk add --no-cache nginx openssl"
+        lxc_exec_live "$VMID" "mkdir -p /etc/nginx/ssl /run/nginx /etc/nginx/http.d"
+        lxc_exec "$VMID" "test -f /etc/nginx/ssl/server.crt || openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout /etc/nginx/ssl/server.key -out /etc/nginx/ssl/server.crt -subj '/CN=pve-nginx-reverse-proxy' 2>/dev/null"
+        lxc_exec "$VMID" "rm -f /etc/nginx/http.d/default.conf 2>/dev/null || true"
+        lxc_exec "$VMID" "cat > /etc/nginx/http.d/pve-reverse-proxy.conf << 'SITEEOF'
+${site_content}
+SITEEOF"
+        lxc_exec_live "$VMID" "nginx -t"
+        lxc_exec_live "$VMID" "rc-update add nginx default"
+        lxc_exec_live "$VMID" "rc-service nginx restart"
+        ;;
+    *)
+        echo "ERROR: Unsupported OS for native Nginx installation"
+        exit 1
+        ;;
+esac
+INSTALLEOF
+
+    # remove.sh (native removal)
+    cat > "$dir/remove.sh" << 'EOF'
+#!/bin/bash
+# Removal script for Nginx
+lxc_exec_live "$VMID" "systemctl stop nginx 2>/dev/null || rc-service nginx stop 2>/dev/null || true"
+lxc_exec_live "$VMID" "systemctl disable nginx 2>/dev/null || rc-update del nginx default 2>/dev/null || true"
+lxc_exec "$VMID" "rm -f /etc/nginx/conf.d/pve-reverse-proxy.conf /etc/nginx/http.d/pve-reverse-proxy.conf 2>/dev/null || true"
+lxc_exec "$VMID" "rm -rf /etc/nginx/ssl 2>/dev/null || true"
+lxc_exec_live "$VMID" "apt-get remove -y nginx nginx-common 2>/dev/null || apk del nginx 2>/dev/null || true"
+EOF
+}
+
+#######################################
+# DATABASE PLUGINS
+#######################################
+
+# Create MySQL plugin
+create_plugin_mysql() {
+    local dir
+    dir=$(create_plugin_dir "mysql")
+
+    cat > "$dir/plugin.conf" << 'EOF'
+PLUGIN_ID="mysql"
+PLUGIN_NAME="MySQL"
+PLUGIN_VERSION="8"
+PLUGIN_CATEGORY="database"
+PLUGIN_DESCRIPTION="MySQL relational database server"
+PLUGIN_DOCKER_SUPPORT="true"
+PLUGIN_NATIVE_SUPPORT="false"
+PLUGIN_NATIVE_OS=""
+PLUGIN_DOCKER_PORT="3306"
+PLUGIN_DOCKER_URL="{IP}:3306"
+PLUGIN_DOCKER_CREDENTIALS="See deployment output"
+PLUGIN_NATIVE_URL=""
+PLUGIN_NATIVE_CREDENTIALS=""
+PLUGIN_SYSTEMD_SERVICE=""
+PLUGIN_DOCKER_CONTAINER="mysql"
+EOF
+
+    cat > "$dir/compose.yml" << 'EOF'
+version: '3.8'
+services:
+  mysql:
+    image: mysql:8
+    container_name: mysql
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    command: --default-authentication-plugin=mysql_native_password
+    ports:
+      - "${DB_PORT:-3306}:3306"
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-changeme}
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-appdb}
+      - MYSQL_USER=${MYSQL_USER:-appuser}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-changeme}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-changeme}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  mysql_data:
+EOF
+
+    cat > "$dir/remove.sh" << 'EOF'
+#!/bin/bash
+# Removal handled by generic docker compose down; native not supported.
+true
+EOF
+}
+
+# Create PostgreSQL plugin
+create_plugin_postgresql() {
+    local dir
+    dir=$(create_plugin_dir "postgresql")
+
+    cat > "$dir/plugin.conf" << 'EOF'
+PLUGIN_ID="postgresql"
+PLUGIN_NAME="PostgreSQL"
+PLUGIN_VERSION="16"
+PLUGIN_CATEGORY="database"
+PLUGIN_DESCRIPTION="PostgreSQL relational database server"
+PLUGIN_DOCKER_SUPPORT="true"
+PLUGIN_NATIVE_SUPPORT="false"
+PLUGIN_NATIVE_OS=""
+PLUGIN_DOCKER_PORT="5432"
+PLUGIN_DOCKER_URL="{IP}:5432"
+PLUGIN_DOCKER_CREDENTIALS="See deployment output"
+PLUGIN_NATIVE_URL=""
+PLUGIN_NATIVE_CREDENTIALS=""
+PLUGIN_SYSTEMD_SERVICE=""
+PLUGIN_DOCKER_CONTAINER="postgresql"
+EOF
+
+    cat > "$dir/compose.yml" << 'EOF'
+version: '3.8'
+services:
+  postgresql:
+    image: postgres:16
+    container_name: postgresql
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    environment:
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-changeme}
+      - POSTGRES_USER=${POSTGRES_USER:-appuser}
+      - POSTGRES_DB=${POSTGRES_DB:-appdb}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-appuser} -d ${POSTGRES_DB:-appdb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  postgres_data:
+EOF
+
+    cat > "$dir/remove.sh" << 'EOF'
+#!/bin/bash
+# Removal handled by generic docker compose down; native not supported.
+true
+EOF
+}
+
+# Create MongoDB plugin
+create_plugin_mongodb() {
+    local dir
+    dir=$(create_plugin_dir "mongodb")
+
+    cat > "$dir/plugin.conf" << 'EOF'
+PLUGIN_ID="mongodb"
+PLUGIN_NAME="MongoDB"
+PLUGIN_VERSION="7"
+PLUGIN_CATEGORY="database"
+PLUGIN_DESCRIPTION="MongoDB NoSQL document database server"
+PLUGIN_DOCKER_SUPPORT="true"
+PLUGIN_NATIVE_SUPPORT="false"
+PLUGIN_NATIVE_OS=""
+PLUGIN_DOCKER_PORT="27017"
+PLUGIN_DOCKER_URL="{IP}:27017"
+PLUGIN_DOCKER_CREDENTIALS="See deployment output"
+PLUGIN_NATIVE_URL=""
+PLUGIN_NATIVE_CREDENTIALS=""
+PLUGIN_SYSTEMD_SERVICE=""
+PLUGIN_DOCKER_CONTAINER="mongodb"
+EOF
+
+    cat > "$dir/compose.yml" << 'EOF'
+version: '3.8'
+services:
+  mongodb:
+    image: mongo:7
+    container_name: mongodb
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    ports:
+      - "${DB_PORT:-27017}:27017"
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_ROOT_USER:-admin}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_ROOT_PASSWORD:-changeme}
+      - MONGO_INITDB_DATABASE=${MONGO_DB:-appdb}
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  mongo_data:
+EOF
+
+    cat > "$dir/remove.sh" << 'EOF'
+#!/bin/bash
+# Removal handled by generic docker compose down; native not supported.
+true
 EOF
 }
 
@@ -5195,11 +5640,15 @@ vm_management_menu() {
                 local svc_choice
                 svc_choice=$(show_menu "Deploy Service to VM" "Select service to deploy:" \
                     "jenkins" "Jenkins (CI/CD automation server)" \
+                    "nginx" "Nginx (reverse proxy & web server)" \
                     "0" "Back")
 
                 case "$svc_choice" in
                     jenkins)
                         vm_deploy_service_wizard "jenkins" "Jenkins"
+                        ;;
+                    nginx)
+                        vm_deploy_service_wizard "nginx" "Nginx Reverse Proxy"
                         ;;
                     0|"")
                         continue
@@ -5310,6 +5759,21 @@ vm_deploy_service() {
         vm_write_file "$vmid" "${service_dir}/docker-compose.yml" "$compose_content"
         echo "Done."
         echo ""
+
+        # Write additional config files if needed
+        case "$service" in
+            nginx)
+                echo "Writing nginx.conf and reverse proxy site..."
+                vm_write_file "$vmid" "${service_dir}/nginx.conf" "$(cat "${PLUGINS[$service]}/nginx.conf")"
+                vm_exec_live "$vmid" "mkdir -p ${service_dir}/conf.d ${service_dir}/ssl"
+                vm_write_file "$vmid" "${service_dir}/conf.d/default.conf" "$(cat "${PLUGINS[$service]}/conf.d/default.conf")"
+                echo "Generating self-signed TLS certificate..."
+                vm_ip_cert=$(vm_get_ip "$vmid")
+                vm_exec "$vmid" "test -f ${service_dir}/ssl/server.crt || openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout ${service_dir}/ssl/server.key -out ${service_dir}/ssl/server.crt -subj '/CN=${vm_ip_cert:-pve-nginx}' -addext 'subjectAltName=IP:${vm_ip_cert:-127.0.0.1}' 2>/dev/null"
+                echo "Done."
+                echo ""
+                ;;
+        esac
 
         # Pull Docker images with retry logic
         echo "Pulling Docker images (this may take a few minutes)..."
@@ -8289,6 +8753,174 @@ ALLOYEOF"
                 lxc_exec_live "$vmid" "sysctl -w vm.max_map_count=262144 2>/dev/null || true"
                 echo ""
                 ;;
+            freeipa)
+                # FreeIPA needs custom deployment with hostname resolution
+                local fqdn="${FREEIPA_FQDN:-ipa.srv.local}"
+                local domain="${fqdn#*.}"
+                local realm="${domain^^}"
+
+                echo "FreeIPA custom deployment..."
+                echo "  FQDN:   $fqdn"
+                echo "  Domain: $domain"
+                echo "  Realm:  $realm"
+                echo ""
+
+                # Get the container IP
+                container_ip=$(lxc_exec "$vmid" "hostname -I | awk '{print \$1}'" 2>/dev/null | tr -d '[:space:]')
+                echo "Container IP: $container_ip"
+
+                # Set hostname in the LXC container
+                echo "Setting up hostname in LXC container..."
+                lxc_exec_live "$vmid" "hostnamectl set-hostname $fqdn 2>/dev/null || echo $fqdn > /etc/hostname"
+
+                # Add FQDN to /etc/hosts in the LXC container
+                echo "Updating /etc/hosts..."
+                lxc_exec "$vmid" "sed -i '/$fqdn/d' /etc/hosts 2>/dev/null || true"
+                lxc_exec "$vmid" "echo '${container_ip} ${fqdn} ${fqdn%%.*}' >> /etc/hosts"
+                echo "Done."
+                echo ""
+
+                # Clean up any previous FreeIPA deployment
+                echo "Cleaning up any previous FreeIPA deployment..."
+                lxc_exec "$vmid" "docker rm -f freeipa 2>/dev/null || true"
+                lxc_exec "$vmid" "docker volume rm freeipa_data 2>/dev/null || true"
+                # Prune stale networks and containers to avoid containerd networking errors
+                echo "Pruning stale Docker networks..."
+                lxc_exec "$vmid" "docker network prune -f 2>/dev/null || true"
+                lxc_exec "$vmid" "docker container prune -f 2>/dev/null || true"
+
+                # Resolve Docker daemon issues
+                echo "Preparing Docker daemon..."
+
+                # Disable systemd start rate limiting for docker to prevent
+                # "Start request repeated too quickly" errors from previous failures
+                lxc_exec "$vmid" "mkdir -p /etc/systemd/system/docker.service.d"
+                lxc_exec "$vmid" "cat > /etc/systemd/system/docker.service.d/no-rate-limit.conf << 'SVCEOF'
+[Unit]
+StartLimitIntervalSec=0
+StartLimitBurst=0
+[Service]
+RestartSec=3
+SVCEOF"
+                lxc_exec "$vmid" "systemctl daemon-reload"
+                lxc_exec "$vmid" "systemctl reset-failed docker.service containerd.service 2>/dev/null || true"
+
+                # Full stop of Docker stack
+                lxc_exec "$vmid" "systemctl stop docker.socket docker containerd 2>/dev/null || true"
+                # Clean stale runtime state
+                lxc_exec "$vmid" "rm -rf /var/run/docker /var/run/docker.sock /run/containerd/containerd.sock 2>/dev/null || true"
+
+                # Start containerd first, then Docker
+                echo "Starting Docker daemon..."
+                lxc_exec_live "$vmid" "systemctl start containerd"
+                sleep 2
+                lxc_exec_live "$vmid" "systemctl start docker"
+                sleep 3
+
+                # Verify Docker is running
+                if ! lxc_exec "$vmid" "docker info >/dev/null 2>&1"; then
+                    echo "Docker failed to start. Retrying..."
+                    lxc_exec "$vmid" "systemctl stop docker.socket docker containerd 2>/dev/null || true"
+                    lxc_exec "$vmid" "rm -rf /var/run/docker /var/run/docker.sock /run/containerd/containerd.sock 2>/dev/null || true"
+                    lxc_exec "$vmid" "systemctl reset-failed docker.service containerd.service 2>/dev/null || true"
+                    sleep 5
+                    lxc_exec_live "$vmid" "systemctl start containerd"
+                    sleep 2
+                    lxc_exec_live "$vmid" "systemctl start docker"
+                    sleep 5
+                    if ! lxc_exec "$vmid" "docker info >/dev/null 2>&1"; then
+                        echo "ERROR: Docker daemon failed to start."
+                        echo ""
+                        echo "Docker logs:"
+                        lxc_exec_live "$vmid" "journalctl -u docker.service -n 20 --no-pager 2>&1"
+                        echo "1" > "$deploy_result_file"
+                        exit 1
+                    fi
+                fi
+                echo "Docker daemon is healthy."
+                echo ""
+
+                # Pull the image first
+                echo "Pulling FreeIPA image (this may take several minutes)..."
+                local pull_attempts=0
+                local pull_status=1
+                while [[ $pull_attempts -lt 3 && $pull_status -ne 0 ]]; do
+                    pull_attempts=$((pull_attempts + 1))
+                    echo "Pull attempt $pull_attempts of 3..."
+                    lxc_exec_timeout "$vmid" 300 "docker pull freeipa/freeipa-server:fedora-43-4.13.0 2>&1"
+                    pull_status=$?
+                    if [[ $pull_status -ne 0 && $pull_attempts -lt 3 ]]; then
+                        echo "Retrying in 10 seconds..."
+                        sleep 10
+                    fi
+                done
+                if [[ $pull_status -ne 0 ]]; then
+                    echo "ERROR: Failed to pull FreeIPA image"
+                    echo "1" > "$deploy_result_file"
+                    exit 1
+                fi
+                echo "Image pulled successfully."
+                echo ""
+
+                # Run FreeIPA using docker run with --add-host for hostname resolution
+                echo "Starting FreeIPA container..."
+                lxc_exec_live "$vmid" "docker run -d \
+                    --name freeipa \
+                    --hostname ${fqdn} \
+                    --privileged \
+                    --security-opt seccomp=unconfined \
+                    --security-opt apparmor=unconfined \
+                    --cgroupns=host \
+                    --add-host ${fqdn}:${container_ip} \
+                    -e PASSWORD=Admin123 \
+                    -p 80:80 -p 443:443 \
+                    -p 389:389 -p 636:636 \
+                    -p 88:88 -p 88:88/udp \
+                    -p 464:464 -p 464:464/udp \
+                    -p 53:53 -p 53:53/udp \
+                    -v freeipa_data:/data \
+                    -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+                    --tmpfs /run --tmpfs /tmp \
+                    freeipa/freeipa-server:fedora-43-4.13.0 \
+                    -U --realm=${realm} --domain=${domain} \
+                    --ds-password=Admin123 --admin-password=Admin123 \
+                    --no-ntp --no-host-dns \
+                    --setup-dns --no-forwarders --allow-zone-overlap"
+
+                echo ""
+                echo "FreeIPA container started."
+                echo "Initial setup takes 5-10 minutes. Checking startup..."
+                echo ""
+
+                # Wait and check if container is still running
+                sleep 10
+                local freeipa_status
+                freeipa_status=$(lxc_exec "$vmid" "docker inspect -f '{{.State.Status}}' freeipa 2>/dev/null")
+
+                if [[ "$freeipa_status" == "running" ]]; then
+                    echo "FreeIPA container is running."
+                    echo ""
+                    echo "Recent logs:"
+                    lxc_exec_live "$vmid" "docker logs --tail=10 freeipa 2>&1"
+                    echo ""
+                    echo "=== FreeIPA Deployment Started ==="
+                    echo "Setup is running in the background (5-10 minutes)."
+                    echo "Monitor with: docker logs -f freeipa"
+                    echo ""
+                    echo "Access:"
+                    echo "  Web UI: https://${container_ip}/"
+                    echo "  LDAP:   ldap://${container_ip}:389"
+                    echo "  Admin:  admin / Admin123"
+                    echo "0" > "$deploy_result_file"
+                else
+                    echo "ERROR: FreeIPA container stopped unexpectedly."
+                    echo ""
+                    echo "Container logs:"
+                    lxc_exec_live "$vmid" "docker logs --tail=30 freeipa 2>&1"
+                    echo "1" > "$deploy_result_file"
+                fi
+                exit 0
+                ;;
             harbor)
                 # Harbor uses official installer - handle specially
                 echo "Harbor requires the official installer..."
@@ -8428,6 +9060,24 @@ with open('docker-compose.yml', 'w') as f:
                 echo "Credentials: admin / Harbor12345"
                 echo "0" > "$deploy_result_file"
                 exit 0
+                ;;
+            nginx)
+                echo "Writing nginx.conf..."
+                nginx_main=$(cat "${PLUGINS[$service]}/nginx.conf")
+                lxc_exec "$vmid" "cat > ${service_dir}/nginx.conf << 'NGINXMAINEOF'
+${nginx_main}
+NGINXMAINEOF"
+                echo "Writing reverse proxy site (conf.d/default.conf)..."
+                lxc_exec_live "$vmid" "mkdir -p ${service_dir}/conf.d ${service_dir}/ssl"
+                nginx_site=$(cat "${PLUGINS[$service]}/conf.d/default.conf")
+                lxc_exec "$vmid" "cat > ${service_dir}/conf.d/default.conf << 'NGINXSITEEOF'
+${nginx_site}
+NGINXSITEEOF"
+                echo "Generating self-signed TLS certificate..."
+                container_ip=$(lxc_exec "$vmid" "hostname -I | awk '{print \$1}'" 2>/dev/null | tr -d '[:space:]')
+                lxc_exec "$vmid" "test -f ${service_dir}/ssl/server.crt || openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout ${service_dir}/ssl/server.key -out ${service_dir}/ssl/server.crt -subj '/CN=${container_ip:-pve-nginx}' -addext 'subjectAltName=IP:${container_ip:-127.0.0.1}' 2>/dev/null"
+                echo "Done."
+                echo ""
                 ;;
         esac
 
@@ -8570,6 +9220,15 @@ show_supported_services() {
 │  • FreeIPA           - Identity mgmt (LDAP/Kerberos/DNS)    │
 │  • Postfix Relay     - SMTP mail relay server               │
 │  • Traefik           - Reverse proxy & load balancer        │
+│  • Nginx             - Reverse proxy & web server           │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│  DATABASES                                                 │
+├─────────────────────────────────────────────────────────────┤
+│  • MySQL             - Relational database server           │
+│  • PostgreSQL        - Relational database server           │
+│  • MongoDB           - NoSQL document database              │
 └─────────────────────────────────────────────────────────────┘
 
 ───────────────────────────────────────────────────────────────
@@ -8578,10 +9237,12 @@ show_supported_services() {
   [Docker]  All services support Docker-based deployment
   [Native]  Some services support native OS installation:
             Prometheus, Grafana, Gitea, Jenkins, Kiwi TCMS,
-            TestLink, SonarQube, Pi-hole
+            TestLink, SonarQube, Pi-hole, Nginx
+  [.env]    Databases prompt for credentials at deploy time
+            (stored in /opt/services/<db>/.env)
 
 ───────────────────────────────────────────────────────────────
-  Total Services: 21
+  Total Services: 25
 ═══════════════════════════════════════════════════════════════
 "
 
@@ -8589,6 +9250,23 @@ show_supported_services() {
     echo "$services_info" > "$tmpfile"
     show_textbox "Supported Services" "$tmpfile" 30 70
     rm -f "$tmpfile"
+}
+
+# Reverse Proxy Menu
+reverse_proxy_menu() {
+    while true; do
+        local choice
+        choice=$(show_menu "Reverse Proxy" "Select reverse proxy to deploy:" \
+            "1" "Nginx (reverse proxy & web server)" \
+            "2" "Traefik (reverse proxy & load balancer)" \
+            "0" "Back")
+
+        case "$choice" in
+            1) deploy_service_wizard "nginx" "Nginx Reverse Proxy" ;;
+            2) deploy_service_wizard "traefik" "Traefik Reverse Proxy" ;;
+            0|"") break ;;
+        esac
+    done
 }
 
 # Service Deployment Menu
@@ -8605,13 +9283,15 @@ service_deployment_menu() {
             "2" "Development Tools" \
             "3" "Testing Tools" \
             "4" "Infrastructure Tools" \
-            "5" "Reverse Proxy (Traefik)" \
-            "6" "View deployed services" \
-            "7" "Update/Redeploy service" \
-            "8" "Stop service" \
-            "9" "Remove service" \
-            "10" "Enable HTTPS for service" \
-            "11" "View supported services list" \
+            "5" "Reverse Proxy (Nginx / Traefik)" \
+            "6" "Databases (MySQL / PostgreSQL / MongoDB)" \
+            "7" "View deployed services" \
+            "8" "Update/Redeploy service" \
+            "9" "Stop service" \
+            "10" "Remove service" \
+            "11" "Enable HTTPS for service (manual)" \
+            "12" "Auto-HTTPS via Nginx (reverse proxy)" \
+            "13" "View supported services list" \
             "0" "Back to main menu")
 
         case "$choice" in
@@ -8628,24 +9308,30 @@ service_deployment_menu() {
                 infrastructure_menu
                 ;;
             5)
-                deploy_service_wizard "traefik" "Traefik Reverse Proxy"
+                reverse_proxy_menu
                 ;;
             6)
-                view_deployed_services
+                database_menu
                 ;;
             7)
-                update_service_wizard
+                view_deployed_services
                 ;;
             8)
-                stop_service_wizard
+                update_service_wizard
                 ;;
             9)
-                remove_service_wizard
+                stop_service_wizard
                 ;;
             10)
-                enable_https_wizard
+                remove_service_wizard
                 ;;
             11)
+                enable_https_wizard
+                ;;
+            12)
+                nginx_auto_https_wizard
+                ;;
+            13)
                 show_supported_services
                 ;;
             0|"")
@@ -8983,6 +9669,271 @@ remove_native_service() {
     ) 2>&1 | show_progress_box "Removing Native Service" 20 70
 
     show_msg "Service Removed" "$service (Native) has been removed from container $vmid."
+}
+
+# Auto-HTTPS via Nginx wizard
+# Detects running services in a container and automatically fronts them with
+# an Nginx reverse proxy terminating TLS with a PVE Manager CA certificate.
+nginx_auto_https_wizard() {
+    # Check if CA is initialized
+    if [[ ! -f "$CA_DIR/ca.key" ]]; then
+        show_msg "CA Not Initialized" "Certificate Authority is not initialized.\n\nPlease go to Certificate Management and initialize the CA first."
+        return
+    fi
+
+    local containers
+    containers=$(pve_list_containers)
+    if [[ -z "$containers" ]]; then
+        show_msg "No Containers" "No containers found."
+        return
+    fi
+
+    local ct_array=()
+    while read -r vmid status _ name; do
+        [[ -z "$vmid" ]] && continue
+        [[ "$status" != "running" ]] && continue
+        ct_array+=("$vmid" "$name")
+    done <<< "$containers"
+
+    if [[ ${#ct_array[@]} -eq 0 ]]; then
+        show_msg "No Running Containers" "No running containers found."
+        return
+    fi
+
+    local selected
+    selected=$(show_menu "Auto-HTTPS via Nginx" "Choose container to scan for services:" "${ct_array[@]}")
+    [[ -z "$selected" ]] && return
+
+    # Build container-name -> "port|label" map from plugin metadata
+    local -A SVC_PORT SVC_LABEL
+    local pid conf cname cport pname pcat
+    for pid in "${!PLUGINS[@]}"; do
+        # Skip the reverse proxies themselves
+        [[ "$pid" == "nginx" || "$pid" == "traefik" ]] && continue
+        conf="${PLUGINS[$pid]}/plugin.conf"
+        # Skip databases - they are not HTTP services and must not be proxied
+        pcat=$(get_plugin_value "$conf" "PLUGIN_CATEGORY")
+        [[ "$pcat" == "database" ]] && continue
+        cname=$(get_plugin_value "$conf" "PLUGIN_DOCKER_CONTAINER")
+        cport=$(get_plugin_value "$conf" "PLUGIN_DOCKER_PORT")
+        pname=$(get_plugin_value "$conf" "PLUGIN_NAME")
+        [[ -z "$cname" ]] && continue
+        # Take the first port token only (e.g. "80, 5000" -> "80")
+        cport="${cport%%[!0-9]*}"
+        [[ -z "$cport" ]] && continue
+        SVC_PORT["$cname"]="$cport"
+        SVC_LABEL["$cname"]="${pname:-$cname}"
+    done
+
+    # Detect running Docker containers and match them to known web services
+    show_info "Detecting..." "Scanning running services in container $selected..."
+    local running
+    running=$(lxc_exec "$selected" "docker ps --format '{{.Names}}' 2>/dev/null")
+
+    local checklist=()
+    local detected_count=0
+    if [[ -n "$running" ]]; then
+        while read -r cn; do
+            [[ -z "$cn" ]] && continue
+            # Skip proxy containers
+            case "$cn" in
+                nginx|traefik|nginx-proxy) continue ;;
+            esac
+            local port="${SVC_PORT[$cn]}"
+            [[ -z "$port" ]] && continue
+            # Skip services that already serve TLS or are not HTTP
+            case "$port" in
+                443|8443|25) continue ;;
+            esac
+            checklist+=("$cn" "${SVC_LABEL[$cn]} (http://127.0.0.1:$port)" "on")
+            ((detected_count++)) || true
+        done <<< "$running"
+    fi
+
+    if [[ $detected_count -eq 0 ]]; then
+        show_msg "No Services Detected" "No plain-HTTP web services were detected in container $selected.\n\nThe wizard looks for running Docker services with a known HTTP port (e.g. Grafana, Gitea, Jenkins, SonarQube, Nexus, Prometheus, Keycloak).\n\nServices already serving HTTPS (Harbor, Kiwi TCMS, FreeIPA) are skipped."
+        return
+    fi
+
+    local picked
+    picked=$(show_checklist "Select Services" "Select services to expose over HTTPS via Nginx:" "${checklist[@]}")
+    [[ -z "$picked" ]] && return
+
+    # Get hostname and IP for the certificate
+    local hostname ip
+    hostname=$(lxc_exec "$selected" "hostname" 2>/dev/null | tr -d '[:space:]')
+    ip=$(get_container_ip "$selected")
+    if [[ -z "$hostname" || -z "$ip" ]]; then
+        show_msg "Error" "Could not determine hostname or IP for container $selected."
+        return
+    fi
+
+    # Determine OS-specific paths/commands
+    local os_type conf_dir reload_cmd install_cmd
+    os_type=$(detect_container_os "$selected")
+    case "$os_type" in
+        alpine)
+            conf_dir="/etc/nginx/http.d"
+            reload_cmd="rc-service nginx reload 2>/dev/null || rc-service nginx restart"
+            install_cmd="apk add --no-cache nginx openssl && rc-update add nginx default"
+            ;;
+        debian|ubuntu|*)
+            conf_dir="/etc/nginx/conf.d"
+            reload_cmd="systemctl reload nginx 2>/dev/null || systemctl restart nginx"
+            install_cmd="apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y nginx openssl && systemctl enable nginx"
+            ;;
+    esac
+
+    # Ensure nginx is installed in the container
+    local has_nginx
+    has_nginx=$(lxc_exec "$selected" "command -v nginx 2>/dev/null")
+    if [[ -z "$has_nginx" ]]; then
+        if ! show_yesno "Install Nginx" "Nginx is not installed in container $selected.\n\nInstall nginx now (native) to use as the HTTPS reverse proxy?"; then
+            return
+        fi
+    fi
+
+    # Assign a dedicated HTTPS port to each selected service and build summary
+    local -A USED_PORTS
+    # Mark all detected service ports as used so we never collide with them
+    local cn
+    for cn in "${!SVC_PORT[@]}"; do USED_PORTS["${SVC_PORT[$cn]}"]=1; done
+
+    local svc_tags=() svc_ports=() svc_https=()
+    local summary=""
+    local tag
+    for tag in $picked; do
+        tag="${tag//\"/}"
+        [[ -z "$tag" ]] && continue
+        local sport="${SVC_PORT[$tag]}"
+        [[ -z "$sport" ]] && continue
+        # Default HTTPS port = service port + 10000, fall back to 9443+ on collision/overflow
+        local hport=$((sport + 10000))
+        if [[ $hport -gt 65000 ]]; then hport=9443; fi
+        while [[ -n "${USED_PORTS[$hport]}" ]]; do hport=$((hport + 1)); done
+        USED_PORTS["$hport"]=1
+        svc_tags+=("$tag")
+        svc_ports+=("$sport")
+        svc_https+=("$hport")
+        summary+="  • ${SVC_LABEL[$tag]}: https://${ip}:${hport}  ->  127.0.0.1:${sport}\n"
+    done
+
+    if [[ ${#svc_tags[@]} -eq 0 ]]; then
+        show_msg "Nothing Selected" "No valid services were selected."
+        return
+    fi
+
+    if ! show_yesno "Confirm Auto-HTTPS" "This will configure Nginx HTTPS reverse proxies in container $selected:\n\n${summary}\nCertificate: $hostname ($ip), issued by PVE Manager CA.\n\nProceed?"; then
+        return
+    fi
+
+    # Build the connection-upgrade map (written once, http context)
+    local map_conf
+    map_conf=$(cat << 'MAPEOF'
+# PVE Manager - websocket/upgrade support for reverse proxy
+map $http_upgrade $pve_connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+MAPEOF
+)
+    local map_b64
+    map_b64=$(printf '%s' "$map_conf" | base64 -w0)
+
+    # Apply everything with a progress box
+    (
+        echo "=== Auto-HTTPS via Nginx - Container $selected ==="
+        echo ""
+
+        if [[ -z "$has_nginx" ]]; then
+            echo "Installing nginx ($os_type)..."
+            lxc_exec_live "$selected" "$install_cmd"
+            echo ""
+        fi
+        lxc_exec_live "$selected" "mkdir -p $conf_dir"
+
+        echo "Generating certificate for $hostname ($ip)..."
+        if [[ -f "$CERTS_DIR/$hostname/${hostname}.crt" ]]; then
+            echo "Certificate already exists, reusing."
+        else
+            ca_generate_cert "$hostname" "$ip"
+        fi
+        echo "Deploying certificate to container..."
+        ca_deploy_cert "$selected" "$hostname" >/dev/null 2>&1
+        echo "Certificate installed to /etc/ssl/pve-manager/"
+        echo ""
+
+        echo "Writing upgrade map..."
+        lxc_exec "$selected" "echo '$map_b64' | base64 -d > $conf_dir/pve-https-upgrade-map.conf"
+
+        # Write one reverse-proxy server block per service
+        local i
+        for i in "${!svc_tags[@]}"; do
+            local t="${svc_tags[$i]}"
+            local sp="${svc_ports[$i]}"
+            local hp="${svc_https[$i]}"
+            echo "Configuring ${SVC_LABEL[$t]}: https://${ip}:${hp} -> 127.0.0.1:${sp}"
+
+            local site
+            site=$(cat << EOF
+# PVE Manager - auto HTTPS reverse proxy for ${t}
+server {
+    listen ${hp} ssl;
+    listen [::]:${hp} ssl;
+    server_name ${hostname} ${ip};
+
+    ssl_certificate     /etc/ssl/pve-manager/${hostname}-chain.pem;
+    ssl_certificate_key /etc/ssl/pve-manager/${hostname}.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache   shared:SSL:10m;
+
+    client_max_body_size 0;
+
+    location / {
+        proxy_pass http://127.0.0.1:${sp};
+        proxy_set_header Host              \$host;
+        proxy_set_header X-Real-IP         \$remote_addr;
+        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Host  \$host;
+        proxy_set_header X-Forwarded-Port  ${hp};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade           \$http_upgrade;
+        proxy_set_header Connection        \$pve_connection_upgrade;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+}
+EOF
+)
+            local site_b64
+            site_b64=$(printf '%s' "$site" | base64 -w0)
+            lxc_exec "$selected" "echo '$site_b64' | base64 -d > $conf_dir/pve-https-${t}.conf"
+        done
+        echo ""
+
+        echo "Validating nginx configuration..."
+        if lxc_exec "$selected" "nginx -t 2>&1"; then
+            echo "Configuration valid. Reloading nginx..."
+            lxc_exec_live "$selected" "$reload_cmd"
+            echo ""
+            echo "=== Auto-HTTPS configuration complete ==="
+        else
+            echo ""
+            echo "ERROR: nginx configuration test failed. No changes were reloaded."
+            echo "Review the generated files in $conf_dir/pve-https-*.conf"
+        fi
+    ) 2>&1 | show_progress_box "Configuring Auto-HTTPS" 24 84
+
+    # Build access summary
+    local access=""
+    local i
+    for i in "${!svc_tags[@]}"; do
+        access+="${SVC_LABEL[${svc_tags[$i]}]}: https://${ip}:${svc_https[$i]}\n"
+    done
+    show_msg "Auto-HTTPS Complete" "Nginx HTTPS reverse proxies configured in container $selected:\n\n${access}\nThe PVE Manager CA certificate is trusted inside the container. To trust these URLs from your workstation, import the CA cert (Certificate Management > Export CA certificate)."
 }
 
 # Enable HTTPS wizard
@@ -9371,8 +10322,9 @@ devtools_menu() {
             "2" "Nexus (Artifact Repository)" \
             "3" "Gitea (Git Server)" \
             "4" "Jenkins (CI/CD)" \
-            "5" "Harbor (Container Registry)" \
-            "6" "Dependency-Track (SCA/SBOM)" \
+            "5" "Jenkins Inbound Agent (Docker)" \
+            "6" "Harbor (Container Registry)" \
+            "7" "Dependency-Track (SCA/SBOM)" \
             "0" "Back")
 
         case "$choice" in
@@ -9380,8 +10332,9 @@ devtools_menu() {
             2) deploy_service_wizard "nexus" "Nexus Repository" ;;
             3) deploy_service_wizard "gitea" "Gitea" ;;
             4) deploy_service_wizard "jenkins" "Jenkins" ;;
-            5) deploy_service_wizard "harbor" "Harbor" ;;
-            6) deploy_service_wizard "dependency-track" "Dependency-Track" ;;
+            5) jenkins_agent_wizard ;;
+            6) deploy_service_wizard "harbor" "Harbor" ;;
+            7) deploy_service_wizard "dependency-track" "Dependency-Track" ;;
             0|"") break ;;
         esac
     done
@@ -10185,6 +11138,465 @@ update_dns_settings_wizard() {
     show_msg "DNS Updated" "DNS settings have been updated.\n\nDNS Server: $dns_server\nContainers updated: ${#target_containers[@]}"
 }
 
+# Deploy a Jenkins inbound (JNLP) agent into a container via Docker.
+# Based on https://hub.docker.com/r/jenkins/inbound-agent/
+# When the Jenkins controller URL is HTTPS, the wizard can fetch the controller's
+# certificate (or reuse the PVE Manager CA) and inject it into the agent's JVM
+# trust store so the agent trusts a self-signed / private-CA controller.
+jenkins_agent_wizard() {
+    local containers
+    containers=$(pve_list_containers)
+    if [[ -z "$containers" ]]; then
+        show_msg "No Containers" "No containers found."
+        return
+    fi
+
+    local ct_array=()
+    while read -r vmid status _ name; do
+        [[ -z "$vmid" ]] && continue
+        [[ "$status" != "running" ]] && continue
+        ct_array+=("$vmid" "$name")
+    done <<< "$containers"
+
+    if [[ ${#ct_array[@]} -eq 0 ]]; then
+        show_msg "No Running Containers" "No running containers found."
+        return
+    fi
+
+    local selected
+    selected=$(show_menu "Jenkins Inbound Agent" "Choose container to run the Jenkins agent:" "${ct_array[@]}")
+    [[ -z "$selected" ]] && return
+
+    # Ensure Docker is available (offer to install)
+    show_info "Checking..." "Checking Docker installation..."
+    local docker_check
+    docker_check=$(lxc_exec "$selected" "docker --version 2>/dev/null")
+    if [[ -z "$docker_check" ]]; then
+        if show_yesno "Docker Required" "Docker is not installed in container $selected.\n\nInstall Docker now?"; then
+            local os_type
+            os_type=$(detect_container_os "$selected")
+            docker_install_with_progress "$selected" "$os_type"
+            docker_check=$(lxc_exec "$selected" "docker --version 2>/dev/null")
+            if [[ -z "$docker_check" ]]; then
+                show_msg "Docker Failed" "Docker installation failed. Cannot proceed."
+                return
+            fi
+        else
+            return
+        fi
+    fi
+
+    # Collect connection details from the Jenkins node configuration
+    local jurl aname asecret awork
+    jurl=$(show_input "Jenkins Controller URL" "Enter the Jenkins controller URL the agent connects to.\nUse the same scheme the controller is served on (http/https):" "https://jenkins.local:8080")
+    [[ -z "$jurl" ]] && return
+
+    aname=$(show_input "Agent Name" "Enter the agent (node) name exactly as configured in Jenkins\n(Manage Jenkins > Nodes > <node>):" "agent-${selected}")
+    [[ -z "$aname" ]] && return
+
+    asecret=$(show_input "Agent Secret" "Enter the agent secret shown on the Jenkins node's connection page\n(the long hex string next to '-secret'):" "")
+    if [[ -z "$asecret" ]]; then
+        show_msg "Secret Required" "The agent secret is required to connect an inbound agent."
+        return
+    fi
+
+    awork=$(show_input "Agent Work Directory" "Remoting work directory inside the agent container:" "/home/jenkins/agent")
+    [[ -z "$awork" ]] && awork="/home/jenkins/agent"
+
+    # WebSocket transport (recommended when the controller is behind an HTTPS proxy)
+    local ws="false"
+    if show_yesno "WebSocket Transport" "Use WebSocket transport (-webSocket)?\n\nRecommended when the controller is behind an HTTPS reverse proxy\n(e.g. the Auto-HTTPS via Nginx wizard), as it needs only the HTTPS port."; then
+        ws="true"
+    fi
+
+    # HTTPS handling: obtain a certificate the agent should trust
+    local cert_mode="none" cert_pem="" cert_source=""
+    if [[ "$jurl" == https://* ]]; then
+        # Parse host and port from the URL
+        local hostport host port
+        hostport="${jurl#*://}"; hostport="${hostport%%/*}"
+        host="${hostport%%:*}"
+        port="${hostport##*:}"
+        [[ "$port" == "$host" || -z "$port" ]] && port=443
+
+        local ca_avail="no"
+        [[ -f "$CA_DIR/ca.crt" ]] && ca_avail="yes"
+
+        local method
+        method=$(show_menu "HTTPS Certificate" "Controller URL is HTTPS. How should the agent trust the controller's certificate?" \
+            "fetch" "Fetch certificate from controller ($host:$port)" \
+            "pveca" "Reuse PVE Manager CA certificate ($ca_avail)" \
+            "skip"  "Skip (controller uses a publicly-trusted cert)")
+        [[ -z "$method" ]] && return
+
+        case "$method" in
+            fetch)
+                show_info "Fetching..." "Retrieving certificate chain from $host:$port ..."
+                cert_pem=$(echo | openssl s_client -connect "${host}:${port}" -servername "$host" -showcerts 2>/dev/null \
+                    | awk '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/')
+                if [[ -z "$cert_pem" ]]; then
+                    show_msg "Fetch Failed" "Could not retrieve a certificate from $host:$port.\n\nThe PVE host may be unable to reach the controller, or the port is wrong.\n\nYou can retry, reuse the PVE Manager CA, or skip."
+                    return
+                fi
+                cert_mode="custom"
+                cert_source="fetched from ${host}:${port}"
+
+                # Warn on hostname mismatch: the remoting agent still performs TLS
+                # hostname verification (trust via -cert does not disable it). If the
+                # controller's leaf cert does not cover the host in the URL, the agent
+                # will fail with "No name matching <host> found" even though the cert
+                # is trusted. Surface this now so the user can fix the URL or cert.
+                local leaf_names
+                leaf_names=$(printf '%s\n' "$cert_pem" \
+                    | openssl x509 -noout -ext subjectAltName 2>/dev/null \
+                    | grep -oE '(DNS|IP Address):[^,]+' | sed 's/^\(DNS\|IP Address\)://; s/ //g' | paste -sd, -)
+                if [[ -z "$leaf_names" ]]; then
+                    leaf_names=$(printf '%s\n' "$cert_pem" | openssl x509 -noout -subject 2>/dev/null | sed 's/.*CN *= *//; s/,.*//')
+                fi
+                if [[ -n "$leaf_names" ]] && ! printf '%s' ",${leaf_names}," | grep -qiF ",${host},"; then
+                    show_msg "Certificate Name Mismatch" "The controller's certificate is issued for:\n  ${leaf_names}\n\nbut the agent connects to host:\n  ${host}\n\nThe agent verifies the hostname against the certificate, so it will\nfail with 'No name matching ${host} found' unless you either:\n\n  - set the Controller URL to a name the cert covers\n    (e.g. https://${leaf_names%%,*}:${port}), or\n  - reissue the controller cert with '${host}' in its SAN.\n\nDeployment will continue; fix the URL/cert if the agent does not connect." 20 78
+                fi
+                ;;
+            pveca)
+                if [[ "$ca_avail" != "yes" ]]; then
+                    show_msg "CA Not Available" "The PVE Manager CA is not initialized.\n\nInitialize it under Certificate Management, or choose 'Fetch'."
+                    return
+                fi
+                cert_pem=$(cat "$CA_DIR/ca.crt")
+                cert_mode="custom"
+                cert_source="PVE Manager CA"
+                ;;
+            skip)
+                cert_mode="none"
+                ;;
+        esac
+    fi
+
+    # Sanitize agent name for docker container/dir naming
+    local safe
+    safe=$(echo "$aname" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_.-' '-' | sed 's/^-*//; s/-*$//')
+    [[ -z "$safe" ]] && safe="agent"
+    local cname="jenkins-agent-${safe}"
+    local service_dir="/opt/services/${cname}"
+
+    # Warn if this agent already exists
+    if lxc_exec "$selected" "test -d ${service_dir}" 2>/dev/null; then
+        if ! show_yesno "Agent Exists" "An agent deployment already exists at:\n  ${service_dir}\n\nRedeploy / overwrite it?"; then
+            return
+        fi
+    fi
+
+    # Confirmation summary
+    local tls_line="Plain HTTP (no certificate handling)"
+    [[ "$jurl" == https://* ]] && tls_line="HTTPS"
+    [[ "$cert_mode" == "custom" ]] && tls_line="HTTPS (trust cert: ${cert_source})"
+    if ! show_yesno "Confirm Agent Deployment" "Deploy Jenkins inbound agent to container $selected?\n\nController : $jurl\nAgent name : $aname\nWork dir   : $awork\nWebSocket  : $ws\nTransport  : $tls_line\nContainer  : $cname" 20 78; then
+        return
+    fi
+
+    # Build docker-compose.yml. We pass each trust anchor INLINE to the remoting
+    # agent's repeatable `-cert` option (one PEM per value) rather than editing the
+    # JVM trust store, so a self-signed / private-CA controller is trusted reliably.
+    #
+    # We deliberately avoid the `-cert @file` at-syntax: args4j (the option parser
+    # in hudson.remoting.Launcher) expands ANY argv token beginning with `@` as a
+    # command file, splicing that file's lines in as arguments *before* option
+    # parsing. That turned each PEM body line into a bogus option, producing
+    # "'-----END CERTIFICATE-----' is not a valid option". An inline PEM value is a
+    # single argv token (not `@`-prefixed) and is parsed directly as a certificate.
+    #
+    # The default `jenkins-agent` entrypoint appends these command args to agent.jar.
+    # agent.jar reads only the FIRST certificate from each -cert value, so we split
+    # the chain into one PEM per cert and emit one -cert per certificate.
+    local cert_count=0 cert_cmd="" cert_dir=""
+    if [[ "$cert_mode" == "custom" ]]; then
+        cert_dir=$(mktemp -d)
+        printf '%s\n' "$cert_pem" > "$cert_dir/chain.pem"
+        ( cd "$cert_dir" && csplit -z -s -f cert- -b '%d.pem' chain.pem '/-----BEGIN CERTIFICATE-----/' '{*}' 2>/dev/null ) || true
+        local cf esc
+        for cf in "$cert_dir"/cert-*.pem; do
+            [ -f "$cf" ] || continue
+            # Flatten the PEM into a single YAML double-quoted scalar: real newlines
+            # become literal \n, which YAML re-expands to newlines in the argv token.
+            # PEM is base64 + dashes only, so no " or \ to escape.
+            esc=$(awk 'BEGIN{ORS=""} {printf "%s\\n", $0}' "$cf")
+            cert_cmd+="
+      - \"-cert\"
+      - \"${esc}\""
+            ((cert_count++)) || true
+        done
+        [[ "$cert_count" -lt 1 ]] && cert_count=1
+    fi
+
+    local compose
+    compose="version: '3.8'
+services:
+  jenkins-agent:
+    image: jenkins/inbound-agent:latest
+    container_name: ${cname}
+    restart: unless-stopped
+    environment:
+      - \"JENKINS_URL=${jurl}\"
+      - \"JENKINS_AGENT_NAME=${aname}\"
+      - \"JENKINS_SECRET=${asecret}\"
+      - \"JENKINS_AGENT_WORKDIR=${awork}\"
+      - \"JENKINS_WEB_SOCKET=${ws}\""
+
+    if [[ "$cert_mode" == "custom" ]]; then
+        compose+="
+    volumes:
+      - agent_work:${awork}
+    command:${cert_cmd}"
+    else
+        compose+="
+    volumes:
+      - agent_work:${awork}"
+    fi
+
+    compose+="
+volumes:
+  agent_work:"
+
+    # Deploy with a progress box. The trust anchors are embedded inline in the
+    # compose file's command:, so nothing cert-related needs to be written into
+    # the container separately.
+    local compose_b64
+    compose_b64=$(printf '%s' "$compose" | base64 -w0)
+
+    (
+        echo "=== Deploying Jenkins Inbound Agent to Container $selected ==="
+        echo ""
+        echo "Agent name : $aname"
+        echo "Controller : $jurl"
+        echo "Transport  : $tls_line"
+        echo ""
+
+        echo "Creating service directory: $service_dir"
+        lxc_exec_live "$selected" "mkdir -p $service_dir"
+
+        if [[ "$cert_mode" == "custom" ]]; then
+            echo "Embedding controller certificate(s) inline ($cert_source, $cert_count cert(s))..."
+            # Remove any stale certs/ dir from a previous @file-based deployment.
+            lxc_exec "$selected" "rm -rf ${service_dir}/certs 2>/dev/null || true"
+        fi
+
+        echo "Writing docker-compose.yml..."
+        lxc_exec "$selected" "echo '$compose_b64' | base64 -d > ${service_dir}/docker-compose.yml"
+        echo ""
+
+        echo "Pulling image and starting agent..."
+        lxc_exec_live "$selected" "cd ${service_dir} && docker compose up -d 2>&1"
+        echo ""
+
+        echo "Current status:"
+        lxc_exec "$selected" "docker ps --filter name=${cname} --format '  {{.Names}}: {{.Status}}' 2>/dev/null"
+        echo ""
+        echo "=== Deployment finished ==="
+    ) 2>&1 | show_progress_box "Deploying Jenkins Agent" 24 84
+
+    # Clean up the host-side temporary cert directory
+    [[ -n "$cert_dir" && -d "$cert_dir" ]] && rm -rf "$cert_dir"
+
+    local cert_note=""
+    [[ "$cert_mode" == "custom" ]] && cert_note="\nTrusted cert: ${cert_source} (${cert_count} cert(s) via -cert)"
+    show_msg "Jenkins Agent Deployed" "Inbound agent '$aname' deployed to container $selected.\n\nController : $jurl\nContainer  : $cname\nDirectory  : $service_dir${cert_note}\n\nVerify the agent shows as connected in Jenkins\n(Manage Jenkins > Nodes).\n\nView logs:\n  docker logs -f $cname\n\nIf it still reports 'unable to find valid certification path',\nre-run this wizard and choose 'Fetch certificate from controller'\nso the exact presented chain is trusted."
+}
+
+# Deploy a database service (MySQL / PostgreSQL / MongoDB) via Docker.
+# Prompts for credentials and writes them to a .env file that docker compose reads.
+db_deploy_wizard() {
+    local service="$1"
+    local service_name="$2"
+
+    local containers
+    containers=$(pve_list_containers)
+    if [[ -z "$containers" ]]; then
+        show_msg "No Containers" "No containers found."
+        return
+    fi
+
+    local ct_array=()
+    while read -r vmid status _ name; do
+        [[ -z "$vmid" ]] && continue
+        [[ "$status" != "running" ]] && continue
+        ct_array+=("$vmid" "$name")
+    done <<< "$containers"
+
+    if [[ ${#ct_array[@]} -eq 0 ]]; then
+        show_msg "No Running Containers" "No running containers found."
+        return
+    fi
+
+    local selected
+    selected=$(show_menu "Select Container" "Choose container to deploy $service_name:" "${ct_array[@]}")
+    [[ -z "$selected" ]] && return
+
+    # Ensure Docker is available (offer to install)
+    show_info "Checking..." "Checking Docker installation..."
+    local docker_check
+    docker_check=$(lxc_exec "$selected" "docker --version 2>/dev/null")
+    if [[ -z "$docker_check" ]]; then
+        if show_yesno "Docker Required" "Docker is not installed in container $selected.\n\nInstall Docker now?"; then
+            local os_type
+            os_type=$(detect_container_os "$selected")
+            docker_install_with_progress "$selected" "$os_type"
+            docker_check=$(lxc_exec "$selected" "docker --version 2>/dev/null")
+            if [[ -z "$docker_check" ]]; then
+                show_msg "Docker Failed" "Docker installation failed. Cannot proceed."
+                return
+            fi
+        else
+            return
+        fi
+    fi
+
+    # Default listening port per engine
+    local def_port
+    case "$service" in
+        mysql)      def_port="3306" ;;
+        postgresql) def_port="5432" ;;
+        mongodb)    def_port="27017" ;;
+    esac
+
+    local db_port
+    db_port=$(show_input "Database Port" "Host port to publish $service_name on:" "$def_port")
+    [[ -z "$db_port" ]] && db_port="$def_port"
+
+    # Collect engine-specific credentials. Empty password => auto-generated.
+    local env_content="" summary="" access_line="" conn_example=""
+    local dbname dbuser dbpass rootpass
+
+    case "$service" in
+        mysql)
+            rootpass=$(show_input "MySQL root Password" "Password for the MySQL 'root' user (blank = auto-generate):" "")
+            [[ -z "$rootpass" ]] && rootpass=$(openssl rand -hex 16)
+            dbname=$(show_input "Database Name" "Name of the initial database to create:" "appdb")
+            [[ -z "$dbname" ]] && dbname="appdb"
+            dbuser=$(show_input "Application User" "Non-root application username to create:" "appuser")
+            [[ -z "$dbuser" ]] && dbuser="appuser"
+            dbpass=$(show_input "Application Password" "Password for '$dbuser' (blank = auto-generate):" "")
+            [[ -z "$dbpass" ]] && dbpass=$(openssl rand -hex 16)
+            env_content="DB_PORT=${db_port}
+MYSQL_ROOT_PASSWORD=${rootpass}
+MYSQL_DATABASE=${dbname}
+MYSQL_USER=${dbuser}
+MYSQL_PASSWORD=${dbpass}"
+            summary="Port         : ${db_port}\nroot password: ${rootpass}\nDatabase     : ${dbname}\nApp user     : ${dbuser}\nApp password : ${dbpass}"
+            conn_example="mysql -h {IP} -P ${db_port} -u ${dbuser} -p'${dbpass}' ${dbname}"
+            ;;
+        postgresql)
+            dbuser=$(show_input "Superuser Name" "PostgreSQL superuser/role to create:" "appuser")
+            [[ -z "$dbuser" ]] && dbuser="appuser"
+            dbpass=$(show_input "Superuser Password" "Password for '$dbuser' (blank = auto-generate):" "")
+            [[ -z "$dbpass" ]] && dbpass=$(openssl rand -hex 16)
+            dbname=$(show_input "Database Name" "Name of the initial database to create:" "appdb")
+            [[ -z "$dbname" ]] && dbname="appdb"
+            env_content="DB_PORT=${db_port}
+POSTGRES_USER=${dbuser}
+POSTGRES_PASSWORD=${dbpass}
+POSTGRES_DB=${dbname}"
+            summary="Port     : ${db_port}\nUser     : ${dbuser}\nPassword : ${dbpass}\nDatabase : ${dbname}"
+            conn_example="psql \"postgresql://${dbuser}:${dbpass}@{IP}:${db_port}/${dbname}\""
+            ;;
+        mongodb)
+            dbuser=$(show_input "Root Username" "MongoDB root username to create:" "admin")
+            [[ -z "$dbuser" ]] && dbuser="admin"
+            dbpass=$(show_input "Root Password" "Password for '$dbuser' (blank = auto-generate):" "")
+            [[ -z "$dbpass" ]] && dbpass=$(openssl rand -hex 16)
+            dbname=$(show_input "Initial Database" "Name of the initial database:" "appdb")
+            [[ -z "$dbname" ]] && dbname="appdb"
+            env_content="DB_PORT=${db_port}
+MONGO_ROOT_USER=${dbuser}
+MONGO_ROOT_PASSWORD=${dbpass}
+MONGO_DB=${dbname}"
+            summary="Port     : ${db_port}\nRoot user: ${dbuser}\nPassword : ${dbpass}\nDatabase : ${dbname}"
+            conn_example="mongosh \"mongodb://${dbuser}:${dbpass}@{IP}:${db_port}/${dbname}?authSource=admin\""
+            ;;
+        *)
+            show_msg "Unknown Database" "Unsupported database service: $service"
+            return
+            ;;
+    esac
+
+    local service_dir="/opt/services/${service}"
+
+    # Warn if already deployed
+    if lxc_exec "$selected" "test -f ${service_dir}/docker-compose.yml" 2>/dev/null; then
+        if ! show_yesno "Already Deployed" "$service_name already appears deployed at:\n  ${service_dir}\n\nRedeploy / overwrite it? (existing data volume is preserved)"; then
+            return
+        fi
+    fi
+
+    if ! show_yesno "Confirm Deployment" "Deploy $service_name to container $selected via Docker?\n\n${summary}\n\nCredentials are written to ${service_dir}/.env"; then
+        return
+    fi
+
+    # Fetch compose from the plugin and prepare payloads
+    local compose_content
+    compose_content=$(get_service_compose "$service")
+    if [[ -z "$compose_content" ]]; then
+        show_msg "Error" "Could not load compose definition for $service."
+        return
+    fi
+    local compose_b64 env_b64
+    compose_b64=$(printf '%s' "$compose_content" | base64 -w0)
+    env_b64=$(printf '%s' "$env_content" | base64 -w0)
+
+    (
+        echo "=== Deploying $service_name to Container $selected ==="
+        echo ""
+        echo "Checking Docker..."
+        lxc_exec "$selected" "docker --version 2>/dev/null"
+        echo ""
+
+        echo "Creating service directory: $service_dir"
+        lxc_exec_live "$selected" "mkdir -p $service_dir"
+
+        echo "Writing docker-compose.yml..."
+        lxc_exec "$selected" "echo '$compose_b64' | base64 -d > ${service_dir}/docker-compose.yml"
+
+        echo "Writing .env (credentials)..."
+        lxc_exec "$selected" "echo '$env_b64' | base64 -d > ${service_dir}/.env"
+        lxc_exec "$selected" "chmod 600 ${service_dir}/.env"
+        echo ""
+
+        echo "Pulling image and starting database..."
+        lxc_exec_live "$selected" "cd ${service_dir} && docker compose up -d 2>&1"
+        echo ""
+
+        echo "Current status:"
+        lxc_exec "$selected" "docker ps --filter name=${service} --format '  {{.Names}}: {{.Status}}' 2>/dev/null"
+        echo ""
+        echo "=== Deployment finished ==="
+    ) 2>&1 | show_progress_box "Deploying $service_name" 24 84
+
+    local ip
+    ip=$(get_container_ip "$selected")
+    [[ -z "$ip" ]] && ip="<container-ip>"
+    local conn="${conn_example//\{IP\}/$ip}"
+
+    show_msg "$service_name Deployed" "$service_name deployed to container $selected.\n\nHost:Port : ${ip}:${db_port}\n${summary}\n\nConnect:\n  ${conn}\n\nCredentials saved in ${service_dir}/.env\nData persists in a Docker named volume.\n\nNote: the database listens on the container IP. Expose it beyond\nthe host only if you intend remote access."
+}
+
+# Database deployment menu
+database_menu() {
+    while true; do
+        local choice
+        choice=$(show_menu "Databases" "Select a database engine to deploy:" \
+            "1" "MySQL (relational)" \
+            "2" "PostgreSQL (relational)" \
+            "3" "MongoDB (NoSQL document)" \
+            "0" "Back")
+
+        case "$choice" in
+            1) db_deploy_wizard "mysql" "MySQL" ;;
+            2) db_deploy_wizard "postgresql" "PostgreSQL" ;;
+            3) db_deploy_wizard "mongodb" "MongoDB" ;;
+            0|"") break ;;
+        esac
+    done
+}
+
 # Service deployment wizard
 deploy_service_wizard() {
     local service="$1"
@@ -10262,6 +11674,19 @@ deploy_service_wizard() {
             else
                 return
             fi
+        fi
+
+        # FreeIPA requires a FQDN hostname before deployment
+        if [[ "$service" == "freeipa" ]]; then
+            local freeipa_fqdn
+            freeipa_fqdn=$(show_input "FreeIPA Hostname" "Enter fully qualified domain name (FQDN) for FreeIPA.\nMust have at least two labels (e.g. ipa.home.lab):" "ipa.srv.local")
+            [[ -z "$freeipa_fqdn" ]] && return
+            # Validate FQDN has at least two labels
+            if ! echo "$freeipa_fqdn" | grep -qE '^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$'; then
+                show_msg "Invalid Hostname" "Hostname must be a valid FQDN with at least two labels.\n\nExamples:\n  ipa.home.lab\n  ipa.srv.local\n  freeipa.mynetwork.lan"
+                return
+            fi
+            export FREEIPA_FQDN="$freeipa_fqdn"
         fi
 
         if show_yesno "Confirm Deployment" "Deploy $service_name to container $selected via Docker?"; then

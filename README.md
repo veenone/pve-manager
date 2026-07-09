@@ -9,7 +9,7 @@ A comprehensive single-file Bash TUI application for managing Proxmox VE infrast
 - **Docker Setup**: Automated Docker installation with LXC-specific configuration
 - **SSH Key Management**: Generate and distribute SSH keys across containers
 - **Certificate Authority**: Self-signed CA with automatic certificate generation, deployment, and renewal
-- **Service Deployment**: 21 pre-configured services with Docker and native installation options
+- **Service Deployment**: 22 pre-configured services with Docker and native installation options
 - **FreeIPA Setup Wizard**: Complete LDAP structure management for identity services
 
 ## Requirements
@@ -92,7 +92,7 @@ SSH_KEY_TYPE="ed25519"    # SSH key type (ed25519, rsa, ecdsa)
 LOG_LEVEL="INFO"          # Log level (INFO, DEBUG)
 ```
 
-## Supported Services (21 Total)
+## Supported Services (22 Total)
 
 ### Monitoring Stack
 | Service | Description | Ports |
@@ -111,6 +111,7 @@ LOG_LEVEL="INFO"          # Log level (INFO, DEBUG)
 | Nexus | Artifact repository manager | 8081 |
 | Gitea | Lightweight Git server | 3000 |
 | Jenkins | CI/CD automation server | 8080 |
+| Jenkins Inbound Agent | JNLP build agent that connects out to a controller | — (outbound) |
 | Harbor | Container image registry | 80, 5000 |
 | Dependency-Track | SCA and SBOM vulnerability management | 8080, 8081 |
 
@@ -129,10 +130,19 @@ LOG_LEVEL="INFO"          # Log level (INFO, DEBUG)
 | FreeIPA | Identity management (LDAP/Kerberos/DNS) | 80, 443, 389, 636, 88 |
 | Postfix Relay | SMTP mail relay server | 25, 587 |
 | Traefik | Reverse proxy and load balancer | 80, 443, 8080 |
+| Nginx | Reverse proxy and web server | 80, 443 |
+
+### Databases
+| Service | Description | Ports |
+|---------|-------------|-------|
+| MySQL | MySQL 8 relational database server | 3306 |
+| PostgreSQL | PostgreSQL 16 relational database server | 5432 |
+| MongoDB | MongoDB 7 NoSQL document database | 27017 |
 
 ### Deployment Options
 - **Docker**: All services support Docker-based deployment
-- **Native**: Prometheus, Grafana, Gitea, Jenkins, Kiwi TCMS, TestLink, SonarQube, Pi-hole
+- **Native**: Prometheus, Grafana, Gitea, Jenkins, Kiwi TCMS, TestLink, SonarQube, Pi-hole, Nginx
+- **Databases**: Docker-only; the deploy wizard prompts for credentials (blank = auto-generated) and stores them in `/opt/services/<db>/.env`
 
 ## Main Menu
 
@@ -231,16 +241,100 @@ Certificate locations in containers:
 │  2. Development Tools               │
 │  3. Testing Tools                   │
 │  4. Infrastructure Tools            │
-│  5. Reverse Proxy (Traefik)         │
-│  6. View deployed services          │
-│  7. Update/Redeploy service         │
-│  8. Stop service                    │
-│  9. Remove service                  │
-│ 10. Enable HTTPS for service        │
-│ 11. View supported services list    │
+│  5. Reverse Proxy (Nginx/Traefik)   │
+│  6. Databases (MySQL/PgSQL/Mongo)   │
+│  7. View deployed services          │
+│  8. Update/Redeploy service         │
+│  9. Stop service                    │
+│ 10. Remove service                  │
+│ 11. Enable HTTPS for service        │
+│ 12. Auto-HTTPS via Nginx (proxy)    │
+│ 13. View supported services list    │
 │  0. Back                            │
 └─────────────────────────────────────┘
 ```
+
+### Databases
+
+The **Databases** menu (Service Deployment → option 6) deploys a Docker-based
+database engine and provisions its credentials:
+
+1. Choose the engine — **MySQL**, **PostgreSQL**, or **MongoDB**.
+2. Select a running container (Docker is installed if missing).
+3. Enter the listening port and credentials (root/superuser password, database name,
+   and — for MySQL — an application user). Leaving a password blank auto-generates a
+   strong one via `openssl rand`.
+4. The wizard writes `docker-compose.yml` plus a `.env` file (mode `600`) holding the
+   credentials to `/opt/services/<engine>/`, then runs `docker compose up -d`.
+
+Data persists in a named Docker volume, and the final screen shows a ready-to-use
+connection command. Databases are intentionally excluded from the Auto-HTTPS wizard
+(they are not HTTP services).
+
+### Auto-HTTPS via Nginx
+
+The **Auto-HTTPS via Nginx** wizard (Service Deployment → option 12) automatically
+puts an Nginx reverse proxy with TLS in front of the plain-HTTP services already
+running in a container:
+
+1. Select a running container.
+2. The wizard scans running Docker services and matches them to known HTTP ports
+   (Grafana, Gitea, Jenkins, SonarQube, Nexus, Prometheus, Keycloak, …). Services
+   that already serve HTTPS (Harbor, Kiwi TCMS, FreeIPA) and non-HTTP services are
+   skipped automatically.
+3. Pick which services to expose (all selected by default).
+4. Nginx is installed natively if missing, a certificate for the container is issued
+   by the PVE Manager CA and deployed, and one HTTPS reverse-proxy `server` block is
+   generated per service (config is validated with `nginx -t` before reload).
+
+Each service is published on a dedicated TLS port (`service port + 10000`, e.g.
+Grafana `3000` → `https://<ip>:13000`); port collisions are resolved automatically.
+Generated files live in `conf.d/pve-https-*.conf` (or `http.d/` on Alpine).
+
+### Jenkins Inbound Agent
+
+The **Jenkins Inbound Agent** wizard (Service Deployment → Development Tools →
+option 5) deploys a Docker-based JNLP build agent
+([`jenkins/inbound-agent`](https://hub.docker.com/r/jenkins/inbound-agent/)) that
+connects **out** to an existing Jenkins controller:
+
+1. Select a running container (Docker is installed if missing).
+2. Provide the controller URL, the agent (node) name, and the agent secret from the
+   Jenkins node's connection page. Optionally choose the work directory and whether
+   to use WebSocket transport (recommended behind an HTTPS reverse proxy).
+3. If the controller URL is **HTTPS**, the wizard offers to make the agent trust the
+   controller's certificate:
+   - **Fetch from controller** — retrieves the certificate chain via `openssl
+     s_client` from `host:port`.
+   - **Reuse PVE Manager CA** — uses the local CA cert (ideal when the controller was
+     fronted by the Auto-HTTPS wizard).
+   - **Skip** — for publicly-trusted certs.
+
+The chosen chain is split into individual certificates and each is passed **inline**
+to the agent via its built-in, repeatable `-cert` option (`hudson.remoting`), embedded
+directly in the compose file's `command:`. This is the officially-supported way to
+trust a self-signed or private-CA controller and covers both the initial HTTPS resolve
+and the WebSocket connection — no JVM trust-store surgery required. Each agent is
+deployed with `restart: unless-stopped`, so multiple agents can coexist in one
+container.
+
+> **Why inline and not `-cert @file`?** The remoting option parser (args4j) treats any
+> argument beginning with `@` as a *command file* and splices its lines in as
+> arguments before option parsing. Passing `-cert @/path/cert.pem` therefore expands
+> the PEM's body lines into bogus options and fails with
+> `'-----END CERTIFICATE-----' is not a valid option`. An inline PEM value is a single
+> argument and is parsed correctly.
+
+When you choose **Fetch from controller**, the wizard also inspects the certificate's
+SAN/CN and warns if it does **not** cover the host in your Controller URL. The agent
+still verifies the hostname (trusting a cert does not disable that check), so a
+mismatch fails with `No name matching <host> found` even though the cert is trusted.
+Fix it by pointing the Controller URL at a name the cert covers, or reissuing the
+controller cert with the right SAN.
+
+> If you still see `unable to find valid certification path to requested target`,
+> re-run the wizard and choose **Fetch from controller** so the exact certificate the
+> controller presents (including any intermediates) is the one that gets trusted.
 
 ### 7. FreeIPA Setup Wizard
 
