@@ -1,0 +1,17 @@
+# Secrets -- never commit. The ACME feature stores the Cloudflare API token in
+# $HOME/.pve-manager/acme/, but guard against a stray copy inside the repo.
+acme/
+*.env
+cloudflare.env
+*token*
+*.key
+*.pem
+
+# Local backups made by tooling
+*.bak.*
+*.orig
+*.rej
+
+# Editor / OS noise
+*.swp
+.DS_Store
