@@ -8,6 +8,8 @@
 # - Docker setup and configuration
 # - SSH key management
 # - Self-signed CA and certificate management
+# - Publicly-trusted certificates via ACME (Let's Encrypt) + Cloudflare DNS-01,
+#   deployable to LXC containers and VMs to replace self-signed certs
 # - Service deployment (monitoring, dev tools, testing tools)
 #
 # Version: 1.0.0
@@ -20,7 +22,7 @@ set -o pipefail
 # CONFIGURATION & VARIABLES
 #######################################
 
-readonly VERSION="2.0.0"
+readonly VERSION="2.1.0"
 readonly SCRIPT_NAME="PVE Manager"
 readonly CONFIG_DIR="$HOME/.pve-manager"
 readonly CONFIG_FILE="$CONFIG_DIR/config.conf"
@@ -34,6 +36,10 @@ readonly OPERATIONS_LOG="$LOG_DIR/operations.log"
 readonly ERROR_LOG="$LOG_DIR/error.log"
 readonly TEMPLATES_DIR="$CONFIG_DIR/templates"
 readonly PLUGINS_DIR="$CONFIG_DIR/plugins"
+# ACME / Cloudflare (publicly-trusted certificates)
+readonly ACME_DIR="$CONFIG_DIR/acme"
+readonly ACME_TOKEN_FILE="$ACME_DIR/cloudflare.env"
+readonly ACME_TARGETS_FILE="$ACME_DIR/targets.conf"
 readonly PROGRESS_LOG="/tmp/pve-manager-progress-$$.log"
 
 # Dialog dimensions
@@ -72,8 +78,8 @@ trap cleanup EXIT
 
 # Initialize configuration directories
 init_config() {
-    mkdir -p "$CONFIG_DIR" "$CA_DIR" "$CERTS_DIR" "$SSH_DIR" "$TEMPLATES_DIR" "$PLUGINS_DIR"
-    chmod 700 "$CONFIG_DIR" "$CA_DIR" "$SSH_DIR"
+    mkdir -p "$CONFIG_DIR" "$CA_DIR" "$CERTS_DIR" "$SSH_DIR" "$TEMPLATES_DIR" "$PLUGINS_DIR" "$ACME_DIR"
+    chmod 700 "$CONFIG_DIR" "$CA_DIR" "$SSH_DIR" "$ACME_DIR"
 
     # Initialize logging directory
     if [[ ! -d "$LOG_DIR" ]]; then
@@ -97,6 +103,16 @@ CA_VALID_DAYS=3650
 CERT_VALID_DAYS=365
 SSH_KEY_TYPE="ed25519"
 LOG_LEVEL="INFO"
+# ACME / Cloudflare certificates (see Certificate Management -> option C)
+ACME_DOMAIN=""
+ACME_SUBDOMAIN="lan"
+ACME_EMAIL=""
+ACME_KEY_TYPE="ec-256"
+# Single-issuer model: leave ACME_ISSUER_HOST empty on the ONE host that issues;
+# set it to that host on every other host, which then only deploys.
+ACME_ISSUER_HOST=""
+ACME_ISSUER_DIR=""
+ACME_CERT_SOURCE_DIR=""
 EOF
     fi
 
@@ -5476,6 +5492,7 @@ vm_management_menu() {
             "3" "Enable HTTPS for service" \
             "4" "Deploy service to VM" \
             "5" "Execute command in VM" \
+            "6" "Create user" \
             "0" "Back to main menu")
 
         case "$choice" in
@@ -5607,6 +5624,9 @@ vm_management_menu() {
                         ) | show_progress_box "Execute Command"
                     fi
                 fi
+                ;;
+            6)
+                vm_create_user_wizard
                 ;;
             0|"")
                 return
@@ -6232,6 +6252,7 @@ lxc_management_menu() {
             "6" "Container details" \
             "7" "Bulk operations" \
             "8" "Template manager" \
+            "9" "Create user" \
             "0" "Back to main menu")
 
         case "$choice" in
@@ -6382,6 +6403,9 @@ lxc_management_menu() {
                 ;;
             8)
                 template_browser
+                ;;
+            9)
+                lxc_create_user_wizard
                 ;;
             0|"")
                 break
@@ -7354,6 +7378,116 @@ get_container_ip() {
     lxc_exec_timeout "$vmid" 5 "hostname -I 2>/dev/null | awk '{print \$1}'" 2>/dev/null
 }
 
+# Install/enable an SSH server in a container and permit root login.
+# auth_mode: key (default) | password | both
+# pwfile: optional path; when password/both generates a password, it is
+# written there (0600) instead of stdout, since stdout is routinely teed to
+# OPERATIONS_LOG by show_progress_box and must never carry a plaintext secret.
+lxc_enable_root_ssh() {
+    local vmid="$1"
+    local auth_mode="${2:-key}"
+    local pwfile="${3:-}"
+    case "$auth_mode" in
+        key|password|both) ;;
+        *) auth_mode="key" ;;
+    esac
+
+    log_ssh_op "ENABLE_ROOT_SSH" "vmid=$vmid mode=$auth_mode"
+
+    local os_type
+    os_type=$(detect_container_os "$vmid")
+    echo "Detected OS: ${os_type:-unknown}"
+
+    echo "Checking for SSH server..."
+    if ! lxc_exec "$vmid" "command -v sshd" &>/dev/null; then
+        echo "Installing SSH server..."
+        case "$os_type" in
+            debian|ubuntu)
+                lxc_exec_live "$vmid" "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server"
+                ;;
+            alpine)
+                lxc_exec_live "$vmid" "apk update && apk add openssh"
+                ;;
+            centos|rhel|rocky|almalinux|fedora)
+                lxc_exec_live "$vmid" "dnf install -y openssh-server"
+                ;;
+            *)
+                echo "ERROR: Unsupported or undetected OS ('$os_type'); install an SSH server manually."
+                return 1
+                ;;
+        esac
+    else
+        echo "SSH server already installed."
+    fi
+
+    if ! lxc_exec "$vmid" "command -v sshd" &>/dev/null; then
+        echo "ERROR: sshd still not found after install attempt."
+        return 1
+    fi
+
+    echo "Configuring sshd (PermitRootLogin)..."
+    local permit_root="prohibit-password"
+    [[ "$auth_mode" == "password" || "$auth_mode" == "both" ]] && permit_root="yes"
+
+    # Edit the main config...
+    lxc_exec "$vmid" "sed -i -E 's/^[# ]*PermitRootLogin[[:space:]].*/PermitRootLogin $permit_root/' /etc/ssh/sshd_config"
+    lxc_exec "$vmid" "grep -q '^PermitRootLogin' /etc/ssh/sshd_config || echo 'PermitRootLogin $permit_root' >> /etc/ssh/sshd_config"
+    # ...and also drop a high-precedence snippet, since distros (e.g. Ubuntu
+    # cloud images) ship an Include'd sshd_config.d/*.conf that would otherwise
+    # win over the edit above.
+    lxc_exec "$vmid" "[[ -d /etc/ssh/sshd_config.d ]] && printf 'PermitRootLogin %s\n' '$permit_root' > /etc/ssh/sshd_config.d/00-pve-manager-root-ssh.conf; true"
+
+    if [[ "$auth_mode" == "key" || "$auth_mode" == "both" ]]; then
+        echo "Setting up key-based access..."
+        local key_file="$SSH_DIR/id_${SSH_KEY_TYPE:-ed25519}"
+        [[ -f "$key_file" ]] || ssh_generate_key
+        ssh_copy_to_container "$vmid"
+    fi
+
+    local generated_password=""
+    if [[ "$auth_mode" == "password" || "$auth_mode" == "both" ]]; then
+        echo "Setting root password..."
+        generated_password=$(openssl rand -base64 16)
+        lxc_exec "$vmid" "echo 'root:${generated_password}' | chpasswd"
+        if [[ -n "$pwfile" ]]; then
+            (umask 077; printf '%s' "$generated_password" > "$pwfile")
+        fi
+        log_ssh_op "SET_ROOT_PASSWORD" "vmid=$vmid"
+    fi
+
+    echo "Enabling and starting SSH service..."
+    case "$os_type" in
+        alpine)
+            lxc_exec "$vmid" "rc-update add sshd default 2>/dev/null; rc-service sshd restart 2>/dev/null || rc-service sshd start 2>/dev/null"
+            ;;
+        debian|ubuntu)
+            lxc_exec "$vmid" "systemctl enable ssh 2>/dev/null; systemctl restart ssh 2>/dev/null || systemctl start ssh 2>/dev/null"
+            ;;
+        *)
+            lxc_exec "$vmid" "systemctl enable sshd 2>/dev/null; systemctl restart sshd 2>/dev/null || systemctl start sshd 2>/dev/null"
+            ;;
+    esac
+
+    echo "Opening firewall (if active)..."
+    lxc_exec "$vmid" "command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q 'Status: active' && ufw allow 22/tcp 2>/dev/null; command -v firewall-cmd &>/dev/null && firewall-cmd --state &>/dev/null && firewall-cmd --permanent --add-service=ssh 2>/dev/null && firewall-cmd --reload 2>/dev/null; true"
+
+    local ip
+    ip=$(get_container_ip "$vmid")
+
+    echo ""
+    echo "=== Root SSH enabled on container $vmid ==="
+    echo "IP address: ${ip:-unknown}"
+    echo "Auth mode:  $auth_mode"
+    if [[ "$auth_mode" == "key" || "$auth_mode" == "both" ]]; then
+        echo "Connect with: ssh -i $SSH_DIR/id_${SSH_KEY_TYPE:-ed25519} root@${ip:-<ip>}"
+    fi
+    if [[ -n "$generated_password" ]]; then
+        echo "Root password generated (not shown here; see the dialog that follows)."
+    fi
+
+    return 0
+}
+
 # SSH Management Menu
 ssh_management_menu() {
     while true; do
@@ -7375,6 +7509,8 @@ ssh_management_menu() {
             "4" "Distribute key to all containers" \
             "5" "Test SSH connectivity" \
             "6" "Setup inter-container SSH" \
+            "7" "Enable root SSH on container" \
+            "8" "Enable root SSH on all containers" \
             "0" "Back to main menu")
 
         case "$choice" in
@@ -7590,11 +7726,327 @@ KEYEOF"
                     ) 2>&1 | show_progress_box "Setup Inter-Container SSH" 24 76
                 fi
                 ;;
+            7)
+                local containers
+                containers=$(pve_list_containers)
+                if [[ -z "$containers" ]]; then
+                    show_msg "No Containers" "No containers found."
+                    continue
+                fi
+
+                local ct_array=()
+                while read -r vmid status _ name; do
+                    [[ -z "$vmid" ]] && continue
+                    [[ "$status" != "running" ]] && continue
+                    ct_array+=("$vmid" "$name")
+                done <<< "$containers"
+
+                if [[ ${#ct_array[@]} -eq 0 ]]; then
+                    show_msg "No Running Containers" "No running containers found."
+                    continue
+                fi
+
+                local selected
+                selected=$(show_menu "Select Container" "Choose container to enable root SSH on:" "${ct_array[@]}")
+                [[ -z "$selected" ]] && continue
+
+                local mode
+                mode=$(show_menu "Root SSH Auth Mode" "How should root authenticate over SSH?" \
+                    "key" "SSH key only (recommended)" \
+                    "password" "Password only (auto-generated)" \
+                    "both" "SSH key + password")
+                [[ -z "$mode" ]] && continue
+
+                if [[ "$mode" != "key" ]]; then
+                    if ! show_yesno "Confirm Password Auth" "This allows root to log in to container $selected with a password over SSH.\n\nA random password will be generated and shown once. Proceed?"; then
+                        continue
+                    fi
+                fi
+
+                local outfile="/tmp/pve-manager-ssh-enable-$$.log"
+                local pwfile; pwfile=$(mktemp); chmod 600 "$pwfile"
+                (lxc_enable_root_ssh "$selected" "$mode" "$pwfile") 2>&1 | tee "$outfile" | show_progress_box "Enable Root SSH: $selected" 24 76
+
+                local ip_line password_line
+                ip_line=$(grep '^IP address:' "$outfile" | tail -1 | sed 's/^IP address: //')
+                password_line=$(cat "$pwfile" 2>/dev/null)
+                rm -f "$outfile" "$pwfile"
+
+                local summary="Container: $selected\nAuth mode: $mode\nIP: ${ip_line:-unknown}"
+                [[ "$mode" != "password" ]] && summary+="\n\nConnect: ssh -i $SSH_DIR/id_${SSH_KEY_TYPE:-ed25519} root@${ip_line:-<ip>}"
+                [[ -n "$password_line" ]] && summary+="\n\nRoot password (shown once, save it now):\n$password_line"
+                show_msg "Root SSH Enabled" "$summary"
+                ;;
+            8)
+                local containers
+                containers=$(pve_list_containers)
+                if [[ -z "$containers" ]]; then
+                    show_msg "No Containers" "No containers found."
+                    continue
+                fi
+
+                local mode
+                mode=$(show_menu "Root SSH Auth Mode" "How should root authenticate over SSH on ALL running containers?" \
+                    "key" "SSH key only (recommended)" \
+                    "password" "Password only (auto-generated per container)" \
+                    "both" "SSH key + password")
+                [[ -z "$mode" ]] && continue
+
+                local confirm_text="Enable root SSH (mode: $mode) on all running containers?"
+                [[ "$mode" != "key" ]] && confirm_text="This allows root to log in with a password on ALL running containers.\n\nA unique random password will be generated per container and shown once.\n\nProceed?"
+                if ! show_yesno "Confirm" "$confirm_text"; then
+                    continue
+                fi
+
+                local results="" ok_count=0 fail_count=0
+                while read -r vmid status _ name; do
+                    [[ -z "$vmid" ]] && continue
+                    [[ "$status" != "running" ]] && continue
+
+                    show_info "Enabling Root SSH" "Processing container $vmid ($name)..."
+
+                    local out ip_line password_line pwfile
+                    pwfile=$(mktemp); chmod 600 "$pwfile"
+                    out=$(lxc_enable_root_ssh "$vmid" "$mode" "$pwfile" 2>&1)
+                    if [[ $? -eq 0 ]]; then
+                        ip_line=$(echo "$out" | grep '^IP address:' | tail -1 | sed 's/^IP address: //')
+                        password_line=$(cat "$pwfile" 2>/dev/null)
+                        results+="$vmid ($name): OK, IP ${ip_line:-unknown}"
+                        [[ -n "$password_line" ]] && results+=", password: $password_line"
+                        results+=$'\n'
+                        ((ok_count++))
+                    else
+                        results+="$vmid ($name): FAILED"$'\n'
+                        ((fail_count++))
+                    fi
+                    rm -f "$pwfile"
+                done <<< "$containers"
+
+                show_scrollmsg "Root SSH - All Containers" "Enabled: $ok_count | Failed: $fail_count
+
+$results"
+                ;;
             0|"")
                 break
                 ;;
         esac
     done
+}
+
+#######################################
+# USER MANAGEMENT FUNCTIONS
+#######################################
+
+# Create a user inside a guest (LXC container or VM), optionally granted
+# sudo/wheel membership and SSH key access. Dispatches through exec_fn/
+# exec_live_fn/os_fn (names of the lxc_*/vm_* primitives) so the same logic
+# serves both guest types instead of duplicating it per guest kind.
+# enable_sudo/enable_ssh: "1" to enable, anything else to skip.
+# pwfile: optional path; the generated password is written there (0600)
+# instead of stdout, since stdout is routinely teed to OPERATIONS_LOG by
+# show_progress_box and must never carry a plaintext secret.
+guest_create_user() {
+    local exec_fn="$1" exec_live_fn="$2" os_fn="$3"
+    local vmid="$4" username="$5" enable_sudo="$6" enable_ssh="$7" pwfile="${8:-}"
+
+    log_ssh_op "CREATE_USER" "vmid=$vmid user=$username sudo=$enable_sudo ssh=$enable_ssh"
+
+    local os_type
+    os_type=$("$os_fn" "$vmid")
+    echo "Detected OS: ${os_type:-unknown}"
+
+    if "$exec_fn" "$vmid" "id -u '$username'" &>/dev/null; then
+        echo "ERROR: user '$username' already exists on this guest."
+        return 1
+    fi
+
+    echo "Creating user '$username'..."
+    if [[ "$os_type" == "alpine" ]]; then
+        "$exec_fn" "$vmid" "adduser -D -s /bin/ash '$username'"
+    else
+        "$exec_fn" "$vmid" "useradd -m -s /bin/bash '$username'"
+    fi
+
+    if ! "$exec_fn" "$vmid" "id -u '$username'" &>/dev/null; then
+        echo "ERROR: failed to create user '$username'."
+        return 1
+    fi
+
+    local generated_password
+    generated_password=$(openssl rand -base64 16)
+    "$exec_fn" "$vmid" "echo '${username}:${generated_password}' | chpasswd"
+    [[ -n "$pwfile" ]] && (umask 077; printf '%s' "$generated_password" > "$pwfile")
+
+    if [[ "$enable_sudo" == "1" ]]; then
+        echo "Granting sudo privileges..."
+        if ! "$exec_fn" "$vmid" "command -v sudo" &>/dev/null; then
+            echo "Installing sudo..."
+            case "$os_type" in
+                debian|ubuntu)
+                    "$exec_live_fn" "$vmid" "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y sudo"
+                    ;;
+                alpine)
+                    "$exec_live_fn" "$vmid" "apk update && apk add sudo"
+                    ;;
+                centos|rhel|rocky|almalinux|fedora)
+                    "$exec_live_fn" "$vmid" "dnf install -y sudo"
+                    ;;
+                *)
+                    echo "WARNING: unknown OS ('$os_type'); skipping sudo install, assuming it is already present."
+                    ;;
+            esac
+        fi
+
+        local sudo_group="wheel"
+        "$exec_fn" "$vmid" "getent group sudo" &>/dev/null && sudo_group="sudo"
+        "$exec_fn" "$vmid" "usermod -aG $sudo_group '$username'"
+    fi
+
+    if [[ "$enable_ssh" == "1" ]]; then
+        echo "Enabling SSH access for '$username'..."
+        if ! "$exec_fn" "$vmid" "command -v sshd" &>/dev/null; then
+            echo "Installing SSH server..."
+            case "$os_type" in
+                debian|ubuntu)
+                    "$exec_live_fn" "$vmid" "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server"
+                    ;;
+                alpine)
+                    "$exec_live_fn" "$vmid" "apk update && apk add openssh"
+                    ;;
+                centos|rhel|rocky|almalinux|fedora)
+                    "$exec_live_fn" "$vmid" "dnf install -y openssh-server"
+                    ;;
+                *)
+                    echo "ERROR: Unsupported or undetected OS ('$os_type'); install an SSH server manually."
+                    ;;
+            esac
+        fi
+
+        local pubkey
+        pubkey=$(ssh_get_pubkey)
+        if [[ -z "$pubkey" ]]; then
+            ssh_generate_key
+            pubkey=$(ssh_get_pubkey)
+        fi
+
+        local home_dir="/home/${username}"
+        "$exec_fn" "$vmid" "mkdir -p '$home_dir/.ssh' && chmod 700 '$home_dir/.ssh'"
+        "$exec_fn" "$vmid" "echo '$pubkey' >> '$home_dir/.ssh/authorized_keys'"
+        "$exec_fn" "$vmid" "chmod 600 '$home_dir/.ssh/authorized_keys'"
+        "$exec_fn" "$vmid" "chown -R '${username}:${username}' '$home_dir/.ssh'"
+
+        case "$os_type" in
+            alpine)
+                "$exec_fn" "$vmid" "rc-update add sshd default 2>/dev/null; rc-service sshd restart 2>/dev/null || rc-service sshd start 2>/dev/null"
+                ;;
+            debian|ubuntu)
+                "$exec_fn" "$vmid" "systemctl enable ssh 2>/dev/null; systemctl restart ssh 2>/dev/null || systemctl start ssh 2>/dev/null"
+                ;;
+            *)
+                "$exec_fn" "$vmid" "systemctl enable sshd 2>/dev/null; systemctl restart sshd 2>/dev/null || systemctl start sshd 2>/dev/null"
+                ;;
+        esac
+    fi
+
+    echo ""
+    echo "=== User '$username' created on guest $vmid ==="
+    [[ "$enable_sudo" == "1" ]] && echo "Sudo: yes ($sudo_group)" || echo "Sudo: no"
+    [[ "$enable_ssh" == "1" ]] && echo "SSH key access: yes (pve-manager key)" || echo "SSH key access: no"
+    echo "Password generated (not shown here; see the dialog that follows)."
+
+    return 0
+}
+
+# Wizard: create a user inside an LXC container
+lxc_create_user_wizard() {
+    local containers
+    containers=$(pve_list_containers)
+    if [[ -z "$containers" ]]; then
+        show_msg "No Containers" "No containers found."
+        return
+    fi
+
+    local ct_array=()
+    while read -r vmid status _ name; do
+        [[ -z "$vmid" ]] && continue
+        [[ "$status" != "running" ]] && continue
+        ct_array+=("$vmid" "$name")
+    done <<< "$containers"
+
+    if [[ ${#ct_array[@]} -eq 0 ]]; then
+        show_msg "No Running Containers" "No running containers found."
+        return
+    fi
+
+    local selected
+    selected=$(show_menu "Select Container" "Create a user in which container?" "${ct_array[@]}")
+    [[ -z "$selected" ]] && return
+
+    guest_create_user_wizard_common "$selected" lxc_exec lxc_exec_live detect_container_os
+}
+
+# Wizard: create a user inside a VM (requires QEMU Guest Agent)
+vm_create_user_wizard() {
+    local vms
+    vms=$(pve_list_vms)
+    if [[ -z "$vms" ]]; then
+        show_msg "No VMs" "No virtual machines found."
+        return
+    fi
+
+    local vm_array=()
+    while read -r vmid status _ name; do
+        [[ -z "$vmid" ]] && continue
+        [[ "$status" != "running" ]] && continue
+        vm_array+=("$vmid" "$name")
+    done <<< "$vms"
+
+    if [[ ${#vm_array[@]} -eq 0 ]]; then
+        show_msg "No Running VMs" "No running VMs found."
+        return
+    fi
+
+    local selected
+    selected=$(show_menu "Select VM" "Create a user in which VM?" "${vm_array[@]}")
+    [[ -z "$selected" ]] && return
+
+    if ! vm_has_guest_agent "$selected"; then
+        show_msg "Guest Agent Required" "QEMU Guest Agent is not available on VM $selected."
+        return
+    fi
+
+    guest_create_user_wizard_common "$selected" vm_exec vm_exec_live detect_vm_os
+}
+
+# Shared prompt/confirm/run/report flow for the two wizards above.
+guest_create_user_wizard_common() {
+    local vmid="$1" exec_fn="$2" exec_live_fn="$3" os_fn="$4"
+
+    local username
+    username=$(show_input "Create User" "Username to create on guest $vmid:" "")
+    [[ -z "$username" ]] && return
+
+    if ! [[ "$username" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+        show_msg "Invalid Username" "Use lowercase letters, digits, '-' or '_', starting with a letter or underscore."
+        return
+    fi
+
+    local enable_sudo=0 enable_ssh=0
+    show_yesno "Sudo Access" "Add '$username' to the sudo/wheel group?" && enable_sudo=1
+    show_yesno "SSH Access" "Enable SSH key-based access for '$username'?\n(installs/enables sshd if needed, copies the pve-manager key)" && enable_ssh=1
+
+    local outfile="/tmp/pve-manager-create-user-$$.log"
+    local pwfile; pwfile=$(mktemp); chmod 600 "$pwfile"
+    (guest_create_user "$exec_fn" "$exec_live_fn" "$os_fn" "$vmid" "$username" "$enable_sudo" "$enable_ssh" "$pwfile") \
+        2>&1 | tee "$outfile" | show_progress_box "Create User: $username" 24 76
+
+    local password_line
+    password_line=$(cat "$pwfile" 2>/dev/null)
+    rm -f "$outfile" "$pwfile"
+
+    local summary="User: $username\nGuest: $vmid\nSudo: $([[ "$enable_sudo" == "1" ]] && echo yes || echo no)\nSSH key: $([[ "$enable_ssh" == "1" ]] && echo yes || echo no)"
+    [[ -n "$password_line" ]] && summary+="\n\nPassword (shown once, save it now):\n$password_line"
+    show_msg "User Created" "$summary"
 }
 
 #######################################
@@ -7790,6 +8242,2403 @@ ca_verify_cert() {
     return $?
 }
 
+#######################################
+# ACME / CLOUDFLARE CERTIFICATES
+#
+# Issues a publicly-trusted wildcard certificate from an ACME CA (Let's Encrypt)
+# using Cloudflare DNS-01 validation, then deploys it to LXC containers and VMs
+# to replace self-signed certificates.
+#
+# Why a wildcard rather than one cert per guest:
+#   - guests never need the Cloudflare token; only this host holds it
+#   - one issuance covers every guest, so ACME rate limits are a non-issue
+#   - renewal is a single operation plus a re-push to recorded targets
+#
+# Internal names live at <guest>.<ACME_SUBDOMAIN>.<ACME_DOMAIN> and must resolve
+# to the guest's LAN IP via split-horizon DNS (e.g. AdGuard rewrites). DNS-01
+# validates against the public zone, so nothing is exposed to the internet.
+#######################################
+
+# Issue a wildcard certificate via Cloudflare DNS-01.
+#
+# SAN construction is deliberate. Let's Encrypt REJECTS an order that contains
+# both a wildcard and a name that wildcard already covers, with:
+#   "Domain name X is redundant with a wildcard domain in the same request"
+# So with ACME_SUBDOMAIN=lan and ACME_DOMAIN=example.com we request:
+#   example.com, *.example.com, *.lan.example.com
+# and must NOT add lan.example.com, which *.example.com already covers.
+acme_build_san_args() {
+    local domain="$1" sub="$2"
+    local -a args=(-d "$domain" -d "*.$domain")
+    if [[ -n "$sub" ]]; then
+        args+=(-d "*.${sub}.${domain}")
+    fi
+    printf '%s\n' "${args[@]}"
+}
+
+# Fully-qualified internal name for a guest
+acme_guest_fqdn() {
+    local host="$1"
+    local domain="${ACME_DOMAIN:-}" sub="${ACME_SUBDOMAIN:-}"
+    [[ -z "$domain" ]] && return 1
+    host="${host,,}"
+    if [[ -n "$sub" ]]; then
+        echo "${host}.${sub}.${domain}"
+    else
+        echo "${host}.${domain}"
+    fi
+}
+
+#######################################
+# Token storage
+#######################################
+
+# Persist the Cloudflare API token. Kept out of CONFIG_FILE so the token never
+# lands in a file that might be shared, diffed, or backed up casually.
+acme_save_token() {
+    local token="$1"
+
+    # Sanitise and validate before writing. The file is source'd, so anything
+    # containing whitespace or a quote would break it in a way that fails
+    # silently later (CF_Token ends up empty). This also catches a dialog
+    # diagnostic being captured as the "password": whiptail writes its result
+    # AND its error messages to stderr, so a box that is too small to render
+    # returns its own error text as the value.
+    token="${token//[$'\t\r\n']/}"
+    token="${token#"${token%%[![:space:]]*}"}"   # ltrim
+    token="${token%"${token##*[![:space:]]}"}"   # rtrim
+
+    if [[ ! "$token" =~ ^[A-Za-z0-9_-]{20,200}$ ]]; then
+        log_error "Refusing to save an implausible Cloudflare token"
+        echo "That does not look like a Cloudflare API token."
+        echo ""
+        echo "Expected 20-200 characters of letters, digits, '-' or '_' only."
+        echo "Got ${#token} character(s)."
+        [[ "$token" == *"sub-window"* || "$token" == *"Can't"* ]] && \
+            echo "" && echo "The terminal appears too small for the dialog: its error text was captured instead of your input. Enlarge the window and retry."
+        return 1
+    fi
+
+    mkdir -p "$ACME_DIR"
+    chmod 700 "$ACME_DIR"
+    umask 077
+    printf 'CF_Token=%s\n' "$token" > "$ACME_TOKEN_FILE"
+    chmod 600 "$ACME_TOKEN_FILE"
+    log_cert_op "ACME_TOKEN_SAVED" "file=$ACME_TOKEN_FILE len=${#token}"
+    return 0
+}
+
+acme_load_token() {
+    [[ -f "$ACME_TOKEN_FILE" ]] || return 1
+    # shellcheck disable=SC1090
+    source "$ACME_TOKEN_FILE"
+    [[ -n "${CF_Token:-}" ]]
+}
+
+acme_have_token() { [[ -s "$ACME_TOKEN_FILE" ]]; }
+
+# Validate the token against Cloudflare and confirm it can see exactly the zone
+# we intend to use. Returns 0 on success and echoes a human-readable summary.
+acme_verify_token() {
+    local domain="${1:-${ACME_DOMAIN:-}}"
+    local out rc
+
+    if ! acme_load_token; then
+        echo "No Cloudflare API token configured."
+        return 1
+    fi
+
+    out=$(curl -s -m 20 -H "Authorization: Bearer $CF_Token" \
+            https://api.cloudflare.com/client/v4/user/tokens/verify 2>/dev/null)
+    if ! grep -q '"success":true' <<<"$out"; then
+        echo "Token verification FAILED."
+        echo "$out" | head -c 400
+        return 1
+    fi
+    echo "Token: valid and active"
+
+    [[ -z "$domain" ]] && { echo "No domain configured yet; skipping zone check."; return 0; }
+
+    out=$(curl -s -m 20 -H "Authorization: Bearer $CF_Token" \
+            "https://api.cloudflare.com/client/v4/zones?name=${domain}" 2>/dev/null)
+    if ! grep -q '"success":true' <<<"$out"; then
+        echo "Zone lookup FAILED for ${domain}."
+        return 1
+    fi
+
+    local zone_id
+    zone_id=$(sed -n 's/.*"result":\[{"id":"\([0-9a-f]\{32\}\)".*/\1/p' <<<"$out")
+    if [[ -z "$zone_id" ]]; then
+        echo "Zone ${domain} NOT visible to this token."
+        echo "Check the token's Zone Resources include this zone."
+        return 1
+    fi
+    echo "Zone:  ${domain} visible (id ${zone_id:0:8}...)"
+    echo "Scope: DNS edit permission assumed; issuance will confirm it."
+    return 0
+}
+#######################################
+# acme.sh client
+#######################################
+
+# Path to the acme.sh binary inside our private home, if installed
+acme_bin() { echo "$ACME_DIR/acme.sh"; }
+
+acme_client_installed() { [[ -x "$ACME_DIR/acme.sh" ]]; }
+
+# Run acme.sh against OUR private home.
+#
+# This wrapper is mandatory: acme.sh does NOT infer its working directory from
+# the location of the script. `--install --home X` only writes an env file, so
+# any later invocation without --home silently falls back to $HOME/.acme.sh and
+# operates on a completely different set of accounts and certificates. That
+# produced a cert in the wrong place and a bogus "issuance did not produce a
+# certificate" error. Never call "$ACME_DIR/acme.sh" directly.
+acme_sh() {
+    "$ACME_DIR/acme.sh" \
+        --home "$ACME_DIR" \
+        --config-home "$ACME_DIR" \
+        --cert-home "$ACME_DIR/certs" \
+        "$@"
+}
+
+acme_client_version() {
+    acme_client_installed || { echo "not installed"; return 1; }
+    acme_sh --version 2>/dev/null | grep -m1 '^v' || echo "unknown"
+}
+
+# Directory acme.sh uses for this domain, given the configured key type
+acme_domain_dir() {
+    local domain="${1:-$ACME_DOMAIN}"
+    if [[ "${ACME_KEY_TYPE:-ec-256}" == ec-* ]]; then
+        echo "$ACME_DIR/certs/${domain}_ecc"
+    else
+        echo "$ACME_DIR/certs/${domain}"
+    fi
+}
+
+# Which ACME directory URL the existing cert for this domain was issued against.
+# Used to detect a staging -> production switch, which acme.sh would otherwise
+# refuse as "Domains not changed / Skipping", issuing nothing at all.
+acme_existing_server() {
+    local dir; dir=$(acme_domain_dir "${1:-$ACME_DOMAIN}")
+    local conf="$dir/${1:-$ACME_DOMAIN}.conf"
+    [[ -f "$conf" ]] || return 1
+    sed -n "s/^Le_API='\(.*\)'$/\1/p" "$conf" | head -1
+}
+
+# Install acme.sh into ACME_DIR. Deliberately --nocron: renewal is driven by
+# acme_renew_all() (menu or systemd timer) so the deploy step always runs too.
+acme_install_client() {
+    local src="$CONFIG_DIR/src/acme.sh"
+
+    if acme_client_installed; then
+        log_info "acme.sh already installed ($(acme_client_version))"
+        return 0
+    fi
+
+    for tool in git curl openssl; do
+        command -v "$tool" >/dev/null 2>&1 || {
+            log_error "Missing required tool: $tool"
+            echo "ERROR: $tool is required but not installed."
+            return 1
+        }
+    done
+
+    mkdir -p "$CONFIG_DIR/src" "$ACME_DIR"
+    chmod 700 "$ACME_DIR"
+
+    if [[ ! -d "$src/.git" ]]; then
+        echo "Cloning acme.sh..."
+        git clone --depth 1 https://github.com/acmesh-official/acme.sh.git "$src" 2>&1 | tail -3 || {
+            log_error "acme.sh clone failed"
+            return 1
+        }
+    else
+        echo "Updating acme.sh source..."
+        ( cd "$src" && git pull --ff-only 2>&1 | tail -2 )
+    fi
+
+    echo "Installing acme.sh to $ACME_DIR ..."
+    ( cd "$src" && ./acme.sh --install \
+        --home "$ACME_DIR" \
+        --config-home "$ACME_DIR" \
+        --cert-home "$ACME_DIR/certs" \
+        --accountemail "${ACME_EMAIL:-admin@${ACME_DOMAIN:-localhost}}" \
+        --nocron 2>&1 | tail -6 )
+    mkdir -p "$ACME_DIR/certs"
+
+    if acme_client_installed; then
+        log_cert_op "ACME_CLIENT_INSTALLED" "version=$(acme_client_version)"
+        echo "acme.sh installed: $(acme_client_version)"
+        return 0
+    fi
+    log_error "acme.sh installation failed"
+    return 1
+}
+
+# Pre-flight checks that catch the common, silent failure modes before we spend
+# an ACME order on them.
+acme_preflight() {
+    local domain="${ACME_DOMAIN:-}"
+    local rc=0
+
+    echo "=== Pre-flight checks ==="
+
+    if [[ -z "$domain" ]]; then
+        echo "  [FAIL] No domain configured"
+        return 1
+    fi
+    echo "  domain: $domain"
+
+    # Nameservers must be Cloudflare, or dns_cf cannot create the TXT records
+    local ns
+    ns=$(dig +short +time=5 NS "$domain" 2>/dev/null | tr '\n' ' ')
+    if grep -qi 'cloudflare' <<<"$ns"; then
+        echo "  [ OK ] nameservers are Cloudflare: $ns"
+    else
+        echo "  [FAIL] nameservers are NOT Cloudflare: ${ns:-<none>}"
+        echo "         DNS-01 via the Cloudflare API cannot work for this zone."
+        rc=1
+    fi
+
+    # CAA records can forbid the chosen CA outright
+    local caa
+    caa=$(dig +short +time=5 CAA "$domain" 2>/dev/null | tr '\n' ' ')
+    if [[ -z "$caa" ]]; then
+        echo "  [ OK ] no CAA records (no issuance restriction)"
+    elif grep -q 'letsencrypt.org' <<<"$caa"; then
+        echo "  [ OK ] CAA permits letsencrypt.org"
+    else
+        echo "  [WARN] CAA present and may block Let's Encrypt: $caa"
+        echo "         Needs: 0 issue \"letsencrypt.org\" and 0 issuewild \"letsencrypt.org\""
+        rc=1
+    fi
+
+    # ACME is JWS-signed and time-sensitive; >5min skew is rejected
+    if command -v timedatectl >/dev/null 2>&1; then
+        if timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -qi yes; then
+            echo "  [ OK ] clock is NTP-synchronised"
+        else
+            echo "  [WARN] clock may not be synchronised; ACME may reject signatures"
+        fi
+    fi
+
+    # Reachability
+    if curl -s -o /dev/null -m 15 https://acme-v02.api.letsencrypt.org/directory; then
+        echo "  [ OK ] Let's Encrypt reachable"
+    else
+        echo "  [FAIL] cannot reach Let's Encrypt"
+        rc=1
+    fi
+    if curl -s -o /dev/null -m 15 https://api.cloudflare.com/client/v4/; then
+        echo "  [ OK ] Cloudflare API reachable"
+    else
+        echo "  [FAIL] cannot reach the Cloudflare API"
+        rc=1
+    fi
+
+    echo ""
+    acme_verify_token "$domain" | sed 's/^/  /'
+    [[ ${PIPESTATUS[0]} -ne 0 ]] && rc=1
+
+    return $rc
+}
+#######################################
+# CERTIFICATE SOURCE / SINGLE-ISSUER MODEL
+#
+# Exactly one host in the fleet should hold the Cloudflare token and run the
+# ACME client. Every other host DEPLOYS a certificate it did not issue.
+#
+# Running an issuer per node looks convenient but goes wrong quietly: each one
+# consumes Let's Encrypt's 5-duplicate-certificates-per-week budget, each has
+# its own renewal schedule (or none -- a second issuer here had no timer at all,
+# so its certificate would simply have expired), and the same guest ends up
+# recorded as a renewal target on two hosts that then fight over it.
+#
+# Two settings control where a certificate comes from:
+#   ACME_ISSUER_HOST      empty  = this host issues (it is the issuer)
+#                         set    = pull the certificate from that host over SSH
+#   ACME_CERT_SOURCE_DIR  empty  = use this host's own acme.sh live directory
+#                         set    = read the certificate from this local path,
+#                                  e.g. when a standalone acme.sh already
+#                                  manages it outside the tool
+#######################################
+
+acme_is_issuer() { [[ -z "${ACME_ISSUER_HOST:-}" ]]; }
+
+# Directory the deployable certificate is read from.
+acme_source_dir() {
+    if [[ -n "${ACME_CERT_SOURCE_DIR:-}" ]]; then
+        echo "$ACME_CERT_SOURCE_DIR"
+    else
+        acme_live_dir
+    fi
+}
+
+# Pull the certificate from the designated issuer into the local live directory.
+# Only the three files a deployment needs are copied; the account key and the
+# Cloudflare token stay on the issuer.
+acme_fetch_from_issuer() {
+    local host="${ACME_ISSUER_HOST:-}"
+    [[ -z "$host" ]] && return 0          # we are the issuer; nothing to fetch
+
+    local remote="${ACME_ISSUER_DIR:-/etc/ssl/homelab/${ACME_DOMAIN}}"
+    local live; live=$(acme_live_dir)
+    mkdir -p "$live"; chmod 750 "$live"
+
+    echo "Fetching certificate from issuer $host:$remote"
+    local f ok=1
+    for f in fullchain.pem privkey.pem chain.pem; do
+        if ! scp -q -o BatchMode=yes -o ConnectTimeout=15 \
+               "root@${host}:${remote}/${f}" "$live/${f}" 2>/dev/null; then
+            [[ "$f" == "chain.pem" ]] && continue      # optional
+            echo "  FAILED to fetch $f"
+            ok=0
+        fi
+    done
+    chmod 640 "$live/privkey.pem" 2>/dev/null
+
+    if [[ "$ok" != 1 ]]; then
+        echo ""
+        echo "Could not fetch the certificate from the issuer."
+        echo "Check that this host can reach it:"
+        echo "  ssh root@${host} ls ${remote}"
+        log_error "ACME fetch from issuer $host failed"
+        return 1
+    fi
+
+    if ! acme_validate_local_cert >/dev/null 2>&1; then
+        echo "  fetched certificate is not usable: $(acme_validate_local_cert 2>&1 | head -1)"
+        return 1
+    fi
+    echo "  fetched: $(openssl x509 -in "$live/fullchain.pem" -noout -serial -enddate | tr '\n' ' ')"
+    log_cert_op "ACME_FETCH" "issuer=$host serial=$(openssl x509 -in "$live/fullchain.pem" -noout -serial | cut -d= -f2)"
+    return 0
+}
+
+# Refuse issuance on a host that is not the designated issuer, with an
+# explanation rather than a confusing duplicate certificate.
+acme_guard_issuance() {
+    acme_is_issuer && return 0
+    echo "This host is NOT the certificate issuer."
+    echo ""
+    echo "  issuer: ${ACME_ISSUER_HOST}"
+    echo ""
+    echo "Issuing here would create a SECOND certificate for the same names:"
+    echo "  - it consumes Let's Encrypt's 5-duplicate-certs-per-week budget"
+    echo "  - it renews on a separate schedule from the issuer's"
+    echo "  - guests end up owned by two hosts that overwrite each other"
+    echo ""
+    echo "Deploy instead: the certificate is fetched from the issuer."
+    echo "To make THIS host the issuer, clear ACME_ISSUER_HOST in the config."
+    return 1
+}
+
+#######################################
+# Issuance
+#######################################
+
+# Where the installed (deployable) cert lives on this host
+acme_live_dir() { echo "$ACME_DIR/live/${ACME_DOMAIN}"; }
+
+acme_cert_present() {
+    local d; d=$(acme_source_dir)
+    [[ -s "$d/fullchain.pem" && -s "$d/privkey.pem" ]]
+}
+
+# Issue (or re-issue) the wildcard. staging=1 uses Let's Encrypt's staging CA,
+# which has far higher rate limits and its own account namespace.
+#
+# Rate limits worth respecting: 50 certs/week per registered domain, and only
+# 5 duplicate certificates (identical SAN set) per week. Debug deployment with
+# acme_deploy_* against the already-issued files instead of re-issuing.
+acme_issue() {
+    local staging="${1:-0}"
+    local domain="${ACME_DOMAIN:-}"
+    local sub="${ACME_SUBDOMAIN:-}"
+    local keytype="${ACME_KEY_TYPE:-ec-256}"
+    local server="letsencrypt"
+    [[ "$staging" == "1" ]] && server="letsencrypt_test"
+
+    [[ -z "$domain" ]] && { echo "ERROR: no domain configured"; return 1; }
+    acme_guard_issuance || return 1
+    acme_client_installed || { echo "ERROR: acme.sh not installed"; return 1; }
+    acme_load_token || { echo "ERROR: no Cloudflare token configured"; return 1; }
+
+    local -a san_args force_flag=()
+    mapfile -t san_args < <(acme_build_san_args "$domain" "$sub")
+
+    local want_url="https://acme-v02.api.letsencrypt.org/directory"
+    [[ "$staging" == "1" ]] && want_url="https://acme-staging-v02.api.letsencrypt.org/directory"
+
+    echo "CA:       $server"
+    echo "Key type: $keytype"
+    echo "SANs:     ${san_args[*]//-d /}"
+    echo ""
+    log_cert_op "ACME_ISSUE" "domain=$domain sub=$sub server=$server keytype=$keytype"
+
+    # A certificate may already exist for this exact SAN set from an earlier run.
+    # acme.sh then treats the request as a renewal and refuses with
+    #   "Domains not changed. Skipping. Next renewal time is ..."
+    # issuing nothing. That is correct for a repeat of the same CA, but wrong
+    # when switching staging -> production: the existing staging cert would
+    # silently block the production order. Clear the state in that case.
+    local had_url
+    if had_url=$(acme_existing_server "$domain"); then
+        if [[ "$had_url" != "$want_url" ]]; then
+            echo "An existing certificate was issued against a different CA:"
+            echo "  had:  $had_url"
+            echo "  want: $want_url"
+            echo "Clearing that state so a fresh order is placed..."
+            acme_sh --remove -d "$domain" $([[ "$keytype" == ec-* ]] && echo --ecc) >/dev/null 2>&1
+            rm -rf "$(acme_domain_dir "$domain")"
+            echo ""
+        else
+            echo "A certificate for this SAN set already exists from the same CA."
+            echo "Re-issuing with --force (this consumes duplicate-certificate quota)."
+            force_flag=(--force)
+            echo ""
+        fi
+    fi
+
+    # Register the account for this CA (idempotent)
+    acme_sh --register-account --server "$server" \
+        -m "${ACME_EMAIL:-admin@$domain}" 2>&1 | tail -2
+
+    echo ""
+    echo "Requesting certificate (DNS-01 via Cloudflare)..."
+    # acme.sh polls Cloudflare's own nameservers for the TXT records, which is
+    # faster and more reliable than a fixed sleep.
+    acme_sh --issue \
+            --server "$server" --dns dns_cf \
+            "${san_args[@]}" \
+            --keylength "$keytype" \
+            "${force_flag[@]}" \
+            --log "$LOG_DIR/acme.sh.log" --log-level 2 2>&1 \
+            | grep -vE '^[A-Za-z0-9+/=]{60,}$|^-----(BEGIN|END)' | tail -25
+
+    # acme.sh exits non-zero in some skip cases, so judge by the artifact
+    local certdir; certdir=$(acme_domain_dir "$domain")
+    if [[ ! -s "$certdir/fullchain.cer" ]]; then
+        echo ""
+        echo "ERROR: no certificate was produced."
+        echo ""
+        echo "Expected it at:"
+        echo "  $certdir/fullchain.cer"
+        echo ""
+        echo "Common causes, in order of likelihood:"
+        echo "  - the Cloudflare token lacks Zone:DNS:Edit on this zone"
+        echo "    (run 'Pre-flight checks' from the menu)"
+        echo "  - the zone is not served by Cloudflare nameservers"
+        echo "  - a CAA record forbids this CA"
+        echo "  - Let's Encrypt rate limit: only 5 identical certificates per week"
+        echo ""
+        echo "Last lines of $LOG_DIR/acme.sh.log:"
+        grep -viE '^[A-Za-z0-9+/=]{60,}$' "$LOG_DIR/acme.sh.log" 2>/dev/null | tail -12 | sed 's/^/    /'
+        log_error "ACME issuance failed for $domain (server=$server)"
+        return 1
+    fi
+
+    # Install to a stable path so deploys and renewals read the same files
+    local live; live=$(acme_live_dir)
+    mkdir -p "$live"; chmod 750 "$live"
+    local -a ecc_flag=()
+    [[ "$keytype" == ec-* ]] && ecc_flag=(--ecc)
+
+    acme_sh --install-cert -d "$domain" "${ecc_flag[@]}" \
+        --cert-file      "$live/cert.pem" \
+        --key-file       "$live/privkey.pem" \
+        --fullchain-file "$live/fullchain.pem" \
+        --ca-file        "$live/chain.pem" 2>&1 | tail -5
+    chmod 640 "$live/privkey.pem" 2>/dev/null
+
+    echo ""
+    if [[ "$staging" == "1" ]]; then
+        echo "STAGING certificate issued. It is NOT publicly trusted -- expected."
+        echo "Re-run issuance against production when you are satisfied."
+    else
+        echo "Production certificate issued and installed:"
+        acme_cert_summary | sed 's/^/  /'
+    fi
+    log_cert_op "ACME_ISSUE_OK" "domain=$domain server=$server"
+    return 0
+}
+
+# Human-readable summary of the installed cert
+acme_cert_summary() {
+    local live; live=$(acme_source_dir)
+    if ! acme_cert_present; then
+        echo "No certificate installed."
+        return 1
+    fi
+    local fc="$live/fullchain.pem"
+    echo "Subject : $(openssl x509 -in "$fc" -noout -subject 2>/dev/null | sed 's/^subject=//')"
+    echo "Issuer  : $(openssl x509 -in "$fc" -noout -issuer  2>/dev/null | sed 's/^issuer=//')"
+    echo "Expires : $(openssl x509 -in "$fc" -noout -enddate 2>/dev/null | sed 's/^notAfter=//')"
+    echo "SANs    : $(openssl x509 -in "$fc" -noout -ext subjectAltName 2>/dev/null | tail -1 | sed 's/^ *//')"
+    echo "Chain   : $(grep -c 'BEGIN CERTIFICATE' "$fc") certificates"
+    if openssl verify -purpose sslserver -CAfile /etc/ssl/certs/ca-certificates.crt \
+         -untrusted "$fc" "$fc" >/dev/null 2>&1; then
+        echo "Trust   : PUBLICLY TRUSTED (verifies against the system trust store)"
+    else
+        echo "Trust   : NOT publicly trusted (staging cert, or incomplete chain)"
+    fi
+    local days
+    days=$(( ( $(date -d "$(openssl x509 -in "$fc" -noout -enddate | sed 's/notAfter=//')" +%s) - $(date +%s) ) / 86400 ))
+    echo "Days left: $days"
+}
+
+# Guard used before deploying: never push a cert that isn't a usable pair, and
+# never silently push a staging cert to production services.
+acme_validate_local_cert() {
+    local live; live=$(acme_source_dir)
+    local fc="$live/fullchain.pem" key="$live/privkey.pem"
+
+    [[ -s "$fc"  ]] || { echo "Missing $fc"; return 1; }
+    [[ -s "$key" ]] || { echo "Missing $key"; return 1; }
+    openssl x509 -in "$fc" -noout >/dev/null 2>&1 || { echo "Certificate does not parse"; return 1; }
+    openssl pkey -in "$key" -noout >/dev/null 2>&1 || { echo "Private key does not parse"; return 1; }
+
+    local a b
+    a=$(openssl x509 -in "$fc" -noout -pubkey | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1)
+    b=$(openssl pkey -in "$key" -pubout -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1)
+    [[ "$a" == "$b" ]] || { echo "Certificate and key are not a matching pair"; return 1; }
+
+    openssl x509 -in "$fc" -noout -checkend 86400 >/dev/null 2>&1 \
+        || { echo "Certificate expires within 24h"; return 1; }
+    return 0
+}
+#######################################
+# Deployment to guests
+#######################################
+
+#######################################
+# CLUSTER-WIDE (CROSS-NODE) EXECUTION
+#
+# Proxmox pct/qm only work for guests the local node owns. Rather than making
+# the user reconnect, resolve the owning node and run the command there over the
+# cluster's existing root SSH trust.
+#
+# Node addresses come from /etc/pve/.members, which pmxcfs replicates, so any
+# node can resolve any other. SSH uses the IP rather than the node name: the
+# name may not be in known_hosts (it frequently is not) while the IP is how the
+# cluster already talks to itself.
+#######################################
+
+# IP of a cluster node, from the replicated members file.
+acme_node_ip() {
+    local node="$1"
+    pve_exec "sed -n 's/.*\"$node\"[^{]*{[^}]*\"ip\": *\"\([0-9.]*\)\".*/\1/p' /etc/pve/.members 2>/dev/null | head -1" \
+        | tr -d '\r'
+}
+
+# All node names in the cluster.
+acme_nodes() {
+    pve_exec "grep -oE '\"[A-Za-z0-9._-]+\": *\{ *\"id\"' /etc/pve/.members 2>/dev/null | sed 's/\": *{.*//; s/^\"//'" \
+        | tr -d '\r'
+}
+
+# Run a command on a specific cluster node.
+#
+# The command is base64-encoded before transport. It may pass through two layers
+# of shell (pve_exec's ssh, then the node-to-node ssh) and quoting survives none
+# of that reliably; base64 does.
+acme_node_exec() {
+    local node="$1" cmd="$2"
+    local here b64 ip
+    here=$(acme_connected_node)
+    b64=$(printf '%s' "$cmd" | base64 -w0)
+
+    # < /dev/null on every path: ssh (and anything else that reads stdin) will
+    # otherwise swallow the caller's input, which silently truncates a
+    # `while read ... done < <(...)` loop after the first remote iteration.
+    if [[ -z "$node" || "$node" == "$here" ]]; then
+        # NOTE: no redirect on `bash` itself -- it reads the decoded script from
+        # the pipe, so `bash < /dev/null` would execute nothing at all.
+        pve_exec "echo $b64 | base64 -d | bash" < /dev/null
+        return $?
+    fi
+    ip=$(acme_node_ip "$node")
+    if [[ -z "$ip" ]]; then
+        echo "acme_node_exec: cannot resolve an address for node '$node'" >&2
+        return 1
+    fi
+    # ssh -n is what stops ssh reading the caller's stdin; the remote bash still
+    # needs the pipe to receive its script, so it must NOT be redirected.
+    pve_exec "ssh -n -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new root@$ip 'echo $b64 | base64 -d | bash'" < /dev/null
+}
+
+# Cache of vmid -> "<kind> <node>" so a deploy loop does not re-glob pmxcfs.
+declare -gA ACME_GUEST_OWNER=()
+
+acme_guest_owner() {
+    local vmid="$1"
+    if [[ -n "${ACME_GUEST_OWNER[$vmid]:-}" ]]; then
+        echo "${ACME_GUEST_OWNER[$vmid]}"
+        return 0
+    fi
+    local loc
+    loc=$(acme_locate_guest "$vmid") || return 1
+    ACME_GUEST_OWNER[$vmid]="$loc"
+    echo "$loc"
+}
+
+# Every guest in the cluster, with its owning node: "<kind>|<vmid>|<name>|<status>|<node>"
+#
+# Asks each node for its own pct/qm list rather than parsing the 35-column
+# /cluster/resources table, so it reuses the parsing that is already proven and
+# needs no JSON tooling on the host.
+acme_cluster_guests() {
+    local node listing
+    # Read the whole node list first rather than streaming it: the loop body
+    # runs remote commands, and anything that touches stdin would eat the rest.
+    local -a nodes=()
+    mapfile -t nodes < <(acme_nodes)
+    for node in "${nodes[@]}"; do
+        [[ -z "$node" ]] && continue
+        listing=$(acme_node_exec "$node" "pct list 2>/dev/null | tail -n +2" 2>/dev/null)
+        if [[ -n "$listing" ]]; then
+            awk -v n="$node" 'NF>=3 && $1 ~ /^[0-9]+$/ {print "lxc|" $1 "|" $NF "|" $2 "|" n}' <<< "$listing"
+        fi
+        listing=$(acme_node_exec "$node" "qm list 2>/dev/null | tail -n +2" 2>/dev/null)
+        if [[ -n "$listing" ]]; then
+            awk -v n="$node" 'NF>=3 && $1 ~ /^[0-9]+$/ {print "vm|" $1 "|" $2 "|" $3 "|" n}' <<< "$listing"
+        fi
+    done
+}
+# Execute a command inside a guest, wherever in the cluster it lives.
+#
+# The local case delegates to the existing lxc_exec/vm_exec, which are already
+# proven; only a guest on another node takes the cross-node path. Commands are
+# quoted with printf %q for the inner shell and base64-encoded by
+# acme_node_exec for transport, so arbitrary quoting survives.
+acme_guest_exec() {
+    local kind="$1" vmid="$2" cmd="$3"
+    local loc owner here q
+
+    here=$(acme_connected_node)
+    if loc=$(acme_guest_owner "$vmid"); then
+        owner=${loc##* }
+    else
+        owner="$here"
+    fi
+
+    if [[ -z "$owner" || "$owner" == "$here" ]]; then
+        case "$kind" in
+            lxc) lxc_exec "$vmid" "$cmd" ;;
+            vm)  vm_exec  "$vmid" "$cmd" ;;
+            *)   log_error "acme_guest_exec: unknown kind '$kind'"; return 1 ;;
+        esac
+        return $?
+    fi
+
+    printf -v q '%q' "$cmd" 2>/dev/null || q="'${cmd//\'/\'\\\'\'}'"
+    case "$kind" in
+        lxc)
+            acme_node_exec "$owner" "pct exec $vmid -- /bin/bash -c $q < /dev/null"
+            ;;
+        vm)
+            # qm returns JSON; pull out-data on the owning node
+            acme_node_exec "$owner" \
+                "qm guest exec $vmid -- /bin/bash -c $q 2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); print(d.get('out-data','').rstrip())\" 2>/dev/null"
+            ;;
+        *) log_error "acme_guest_exec: unknown kind '$kind'"; return 1 ;;
+    esac
+}
+
+# Copy a local file into a guest, wherever it lives.
+#
+# Content is base64'd and decoded inside the guest, which works identically for
+# LXC and VM and on any node -- unlike `pct push`, which requires both the file
+# and the command to be on the owning node. Certificates are a few KB, well
+# inside any argument-length limit.
+acme_guest_push() {
+    local kind="$1" vmid="$2" src="$3" dst="$4"
+    [[ -s "$src" ]] || { log_error "acme_guest_push: missing source $src"; return 1; }
+
+    local loc owner here
+    here=$(acme_connected_node)
+    if loc=$(acme_guest_owner "$vmid"); then owner=${loc##* }; else owner="$here"; fi
+
+    # Fast path: local node, LXC, pct push handles it directly
+    if [[ "$kind" == "lxc" && "$IS_LOCAL_PVE" == true && ( -z "$owner" || "$owner" == "$here" ) ]]; then
+        pct push "$vmid" "$src" "$dst" && return 0
+        # fall through to the base64 path if pct push refused
+    fi
+
+    local b64
+    b64=$(base64 -w0 "$src") || return 1
+    acme_guest_exec "$kind" "$vmid" \
+        "mkdir -p \"\$(dirname '$dst')\" && printf '%s' '$b64' | base64 -d > '$dst'"
+}
+
+# Write content to a file inside a guest WITHOUT changing its inode.
+#
+# Essential for a path that is a Docker single-file bind mount: replacing the
+# file (install/mv/sed -i all do) creates a new inode, the mount keeps pointing
+# at the old one, and the container silently keeps reading stale content -- or
+# sees the file vanish. Truncate-and-write preserves the inode.
+acme_guest_write_inplace() {
+    local kind="$1" vmid="$2" path="$3" content="$4"
+    local b64
+    b64=$(printf '%s' "$content" | base64 -w0)
+    acme_guest_exec "$kind" "$vmid" \
+        "printf '%s' '$b64' | base64 -d | cat > '$path'"
+}
+# Guest-side path of a service's config file.
+#
+# For a containerised proxy the config path found in the container is a CONTAINER
+# path; it has to be translated through the container's mounts before it can be
+# edited from the guest. Echoes nothing when the config is not bind-mounted out,
+# which means it cannot be rewritten from here.
+acme_guest_config_path() {
+    local kind="$1" vmid="$2" spec="$3" cfg="$4"
+    case "$spec" in
+        docker:*)
+            local cname mounts
+            cname=${spec#docker:}; cname=${cname%%:*}
+            mounts=$(acme_guest_exec "$kind" "$vmid" \
+                "docker inspect -f '{{range .Mounts}}{{.Source}}|{{.Destination}}{{\"\\n\"}}{{end}}' '$cname' 2>/dev/null" 2>/dev/null)
+            acme_map_container_path "$cfg" "$mounts"
+            ;;
+        caddy)   echo "${cfg:-/etc/caddy/Caddyfile}" ;;
+        nginx)   echo "${cfg:-}" ;;      # set when a single file holds server_name
+        apache2) echo "" ;;              # multi-file layout; not rewritten
+        *) echo "" ;;
+    esac
+}
+
+# Validate a service's config, in place, before reloading it.
+acme_service_validate() {
+    local kind="$1" vmid="$2" spec="$3" cfg="$4"
+    case "$spec" in
+        docker:*:caddy)
+            local c=${spec#docker:}; c=${c%%:*}
+            acme_guest_exec "$kind" "$vmid" "docker exec '$c' caddy validate --config '$cfg' --adapter caddyfile >/dev/null 2>&1 && echo OK" 2>/dev/null | grep -q OK
+            ;;
+        docker:*:nginx)
+            local c=${spec#docker:}; c=${c%%:*}
+            acme_guest_exec "$kind" "$vmid" "docker exec '$c' nginx -t >/dev/null 2>&1 && echo OK" 2>/dev/null | grep -q OK
+            ;;
+        caddy)   acme_guest_exec "$kind" "$vmid" "caddy validate --config '${cfg:-/etc/caddy/Caddyfile}' >/dev/null 2>&1 && echo OK" 2>/dev/null | grep -q OK ;;
+        nginx)   acme_guest_exec "$kind" "$vmid" "nginx -t >/dev/null 2>&1 && echo OK" 2>/dev/null | grep -q OK ;;
+        apache2) acme_guest_exec "$kind" "$vmid" "(apache2ctl configtest || httpd -t) >/dev/null 2>&1 && echo OK" 2>/dev/null | grep -q OK ;;
+        *) return 0 ;;
+    esac
+}
+
+# Point a service's virtual host at a name our certificate actually covers.
+#
+# Replacing the certificate alone leaves a vhost named <app>.myhome.lan, which
+# no public certificate can match -- the service loads the new cert but every
+# client still sees a name mismatch. This rewrites the configured name to
+# <guest>.<subdomain>.<domain>, in place so a single-file bind mount survives,
+# then validates, reloads and confirms adoption. Rolls the config back if the
+# validation fails.
+acme_rewrite_vhost() {
+    local kind="$1" vmid="$2" spec="$3" cfg="$4" newname="$5"
+    local gcfg content names n changed=0 stamp
+
+    gcfg=$(acme_guest_config_path "$kind" "$vmid" "$spec" "$cfg")
+    if [[ -z "$gcfg" ]]; then
+        echo "  vhost rename SKIPPED: this service's config is not reachable from"
+        echo "    the guest (multi-file layout, or inside the image/a named volume)."
+        echo "    Point its server name at $newname by hand."
+        return 1
+    fi
+
+    names=$(acme_service_names "$kind" "$vmid" "$spec" "$cfg")
+    [[ -z "$names" ]] && { echo "  vhost rename SKIPPED: no server name found in $gcfg"; return 1; }
+
+    content=$(acme_guest_exec "$kind" "$vmid" "cat '$gcfg' 2>/dev/null")
+    [[ -z "$content" ]] && { echo "  vhost rename SKIPPED: could not read $gcfg"; return 1; }
+
+    local newcontent="$content"
+    while read -r n; do
+        [[ -z "$n" || "$n" == "$newname" ]] && continue
+        # already covered? leave it alone
+        if [[ "$n" == "$ACME_DOMAIN" || "$n" == *".$ACME_DOMAIN" ]]; then continue; fi
+        newcontent="${newcontent//$n/$newname}"
+        changed=1
+        echo "  vhost rename: $n -> $newname"
+    done <<< "$names"
+
+    if [[ "$changed" -eq 0 ]]; then
+        echo "  vhost already uses a covered name"
+        return 0
+    fi
+
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    acme_guest_exec "$kind" "$vmid" "cp -a '$gcfg' '$gcfg.pvebak.$stamp'" >/dev/null 2>&1
+
+    # inode-preserving write: $gcfg may be a single-file Docker bind mount
+    if ! acme_guest_write_inplace "$kind" "$vmid" "$gcfg" "$newcontent"; then
+        echo "  vhost rename FAILED: could not write $gcfg"
+        return 1
+    fi
+
+    if ! acme_service_validate "$kind" "$vmid" "$spec" "$cfg"; then
+        echo "  vhost rename FAILED validation -- restoring $gcfg"
+        acme_guest_write_inplace "$kind" "$vmid" "$gcfg" "$content"
+        return 1
+    fi
+    echo "  config validated"
+    return 0
+}
+
+# Discover which TLS-terminating service a guest runs, and where it currently
+# reads its certificate from. Overwriting those exact paths replaces the cert
+# without editing any service config, which is both safer and more certain to
+# take effect than rewriting directives.
+#
+# Echoes one line per finding: service|cert_path|key_path
+acme_detect_tls_service() {
+    local kind="$1" vmid="$2"
+    local out
+
+    # nginx
+    if acme_guest_exec "$kind" "$vmid" "command -v nginx >/dev/null 2>&1 && echo yes" 2>/dev/null | grep -q yes \
+       && acme_service_active "$kind" "$vmid" nginx; then
+        # Must be a single clean token: this becomes a field in a pipe-delimited
+        # record, so an embedded newline would corrupt every downstream parse.
+        local NGINX_CONF
+        NGINX_CONF=$(acme_guest_exec "$kind" "$vmid" \
+            "grep -rlE '^[[:space:]]*server_name' /etc/nginx 2>/dev/null | head -1" 2>/dev/null \
+            | tr -d '\r' | head -1 | tr -d '\n' | tr -d '|')
+        out=$(acme_guest_exec "$kind" "$vmid" \
+            "grep -rhE '^[[:space:]]*ssl_certificate(_key)?[[:space:]]' /etc/nginx 2>/dev/null | head -20" 2>/dev/null)
+        local c k
+        c=$(grep -E 'ssl_certificate[[:space:]]'     <<<"$out" | head -1 | sed -E 's/.*ssl_certificate[[:space:]]+//;s/;.*//'      | tr -d '"'"'"' ')
+        k=$(grep -E 'ssl_certificate_key[[:space:]]' <<<"$out" | head -1 | sed -E 's/.*ssl_certificate_key[[:space:]]+//;s/;.*//'  | tr -d '"'"'"' ')
+        [[ -n "$c" && -n "$k" ]] && echo "nginx|$c|$k|${NGINX_CONF:-}"
+    fi
+
+    # apache2 / httpd
+    if acme_guest_exec "$kind" "$vmid" "command -v apache2 >/dev/null 2>&1 || command -v httpd >/dev/null 2>&1 && echo yes" 2>/dev/null | grep -q yes \
+       && { acme_service_active "$kind" "$vmid" apache2 || acme_service_active "$kind" "$vmid" httpd; }; then
+        out=$(acme_guest_exec "$kind" "$vmid" \
+            "grep -rhiE '^[[:space:]]*SSLCertificate(File|KeyFile)[[:space:]]' /etc/apache2 /etc/httpd 2>/dev/null | head -20" 2>/dev/null)
+        local c k
+        c=$(grep -iE 'SSLCertificateFile[[:space:]]'    <<<"$out" | head -1 | sed -E 's/.*[Ff]ile[[:space:]]+//'    | tr -d '"'"'"' ')
+        k=$(grep -iE 'SSLCertificateKeyFile[[:space:]]' <<<"$out" | head -1 | sed -E 's/.*[Kk]eyFile[[:space:]]+//' | tr -d '"'"'"' ')
+        [[ -n "$c" && -n "$k" ]] && echo "apache2|$c|$k"
+    fi
+
+    # caddy (explicit `tls <cert> <key>` only; auto_https-managed certs are not ours to touch)
+    if acme_guest_exec "$kind" "$vmid" "command -v caddy >/dev/null 2>&1 && echo yes" 2>/dev/null | grep -q yes \
+       && acme_service_active "$kind" "$vmid" caddy; then
+        out=$(acme_guest_exec "$kind" "$vmid" \
+            "grep -rhE '^[[:space:]]*tls[[:space:]]+/' /etc/caddy 2>/dev/null | head -5" 2>/dev/null)
+        local c k
+        c=$(head -1 <<<"$out" | awk '{print $2}')
+        k=$(head -1 <<<"$out" | awk '{print $3}')
+        [[ -n "$c" && -n "$k" ]] && echo "caddy|$c|$k"
+    fi
+}
+
+# Is a host-installed service actually running?
+#
+# Presence of the binary and a config file is not enough. Nextcloud's container
+# image ships apache2 installed but dormant, with Caddy holding :80/:443 — a
+# stopped service has nothing to reload, so treating it as a TLS terminator
+# overwrites its certificate for no reason and reports a spurious failure.
+acme_service_active() {
+    local kind="$1" vmid="$2" svc="$3"
+    local out
+    # systemd only -- deliberately NO pgrep fallback. Inside an LXC running
+    # Docker, the containers' processes are visible in the LXC's own PID
+    # namespace, so `pgrep -x apache2` matches an apache inside the application
+    # container and wrongly declares the host service live. That made the tool
+    # overwrite the guest's snakeoil certificate and fail a deployment that had
+    # actually succeeded. If systemd does not manage it, it is not a host
+    # service we should be touching.
+    out=$(acme_guest_exec "$kind" "$vmid" "systemctl is-active $svc 2>/dev/null" 2>/dev/null | tr -d '\r')
+    [[ "$out" == "active" ]]
+}
+
+# Reload command per service, preferring a graceful reload over a restart.
+acme_service_reload_cmd() {
+    case "$1" in
+        nginx)   echo "nginx -t && (systemctl reload nginx || nginx -s reload)" ;;
+        apache2) echo "(apache2ctl configtest || httpd -t) && (systemctl reload apache2 || systemctl reload httpd || apache2ctl graceful)" ;;
+        # --force matters: `caddy reload` with an identical config logs
+        # "config is unchanged", exits 0, and never re-reads the certificate
+        # files from disk. Without it the cert is replaced but not adopted.
+        caddy)   echo "caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1 && (caddy reload --config /etc/caddy/Caddyfile --force || systemctl reload caddy || systemctl restart caddy)" ;;
+        *)       echo "" ;;
+    esac
+}
+
+# Find which cluster node owns a guest, and its kind.
+#
+# /etc/pve is pmxcfs and is replicated cluster-wide, so the config file's path
+# identifies the owning node from ANY node -- no API call or extra tooling.
+# Echoes "<kind> <node>"; returns 1 if the guest does not exist at all.
+acme_locate_guest() {
+    local vmid="$1" p
+    p=$(pve_exec "ls /etc/pve/nodes/*/lxc/${vmid}.conf 2>/dev/null | head -1" | tr -d '\r')
+    if [[ -n "$p" ]]; then
+        echo "lxc $(sed 's|.*/nodes/\([^/]*\)/.*|\1|' <<<"$p")"
+        return 0
+    fi
+    p=$(pve_exec "ls /etc/pve/nodes/*/qemu-server/${vmid}.conf 2>/dev/null | head -1" | tr -d '\r')
+    if [[ -n "$p" ]]; then
+        echo "vm $(sed 's|.*/nodes/\([^/]*\)/.*|\1|' <<<"$p")"
+        return 0
+    fi
+    return 1
+}
+
+# Node we are currently driving
+acme_connected_node() {
+    pve_exec "hostname -s" 2>/dev/null | tr -d '\r'
+}
+
+# Verify a guest can actually be operated on before attempting anything.
+# Prints a human-readable explanation of any blocker. Returns 0 if usable.
+#
+# This exists because the underlying failures are cryptic: operating on a guest
+# owned by another node produces "Configuration file 'nodes/PDxxx/lxc/N.conf'
+# does not exist", and pushing to a stopped container produces "can only push
+# files to a running CT" -- neither of which names the real problem.
+acme_guest_preflight() {
+    local kind="$1" vmid="$2"
+    local here loc real_kind owner status
+
+    here=$(acme_connected_node)
+
+    if ! loc=$(acme_locate_guest "$vmid"); then
+        echo "Guest $vmid does not exist anywhere in this cluster."
+        echo ""
+        echo "Connected node: ${here:-<unknown>}"
+        echo "Check the ID, or refresh the guest list."
+        return 1
+    fi
+    real_kind=${loc%% *}
+    owner=${loc##* }
+
+    if [[ "$real_kind" != "$kind" ]]; then
+        echo "Guest $vmid is a $real_kind, not a $kind."
+        echo ""
+        echo "Use the '$real_kind' deployment menu entry instead."
+        return 1
+    fi
+
+    # A guest on another node is fine: commands are routed to its owner over
+    # the cluster's root SSH trust. Only report it, and fail if unreachable.
+    if [[ -n "$here" && "$owner" != "$here" ]]; then
+        local ip
+        ip=$(acme_node_ip "$owner")
+        if [[ -z "$ip" ]]; then
+            echo "Guest $vmid lives on node '$owner', but that node has no address"
+            echo "in /etc/pve/.members -- it may be offline."
+            return 1
+        fi
+        if ! acme_node_exec "$owner" "true" >/dev/null 2>&1; then
+            echo "Guest $vmid lives on node '$owner' ($ip), which cannot be reached"
+            echo "over SSH from '$here'."
+            echo ""
+            echo "The cluster's node-to-node root SSH trust is what makes cross-node"
+            echo "deployment work. Verify with:"
+            echo "  ssh root@$ip hostname"
+            echo "If that prompts or fails, fix the host key / authorized_keys first."
+            return 1
+        fi
+        echo "NOTE: guest is on node '$owner'; commands will be routed there."
+    fi
+
+    case "$kind" in
+        lxc) status=$(acme_node_exec "$owner" "pct status $vmid 2>/dev/null | awk '{print \$2}'" | tr -d '\r') ;;
+        vm)  status=$(acme_node_exec "$owner" "qm status $vmid 2>/dev/null | awk '{print \$2}'"  | tr -d '\r') ;;
+    esac
+    if [[ "$status" != "running" ]]; then
+        echo "Guest $vmid ($kind) is '${status:-unknown}', not running."
+        echo ""
+        echo "Certificates can only be installed into a running guest."
+        echo "Start it first, then retry."
+        return 1
+    fi
+
+    if [[ "$kind" == "vm" ]] \
+       && ! acme_node_exec "$owner" "qm agent $vmid ping >/dev/null 2>&1 && echo ok" 2>/dev/null | grep -q ok; then
+        echo "VM $vmid is running but the QEMU Guest Agent is not responding."
+        echo ""
+        echo "The agent is required to copy files into a VM. Install it in the"
+        echo "guest (qemu-guest-agent) and enable the agent option on the VM."
+        return 1
+    fi
+
+    return 0
+}
+# Detect a TLS terminator running as a DOCKER CONTAINER inside a guest.
+#
+# This is a common homelab shape -- immich, for instance, ships a caddy:2-alpine
+# container that terminates :443 and reads its certificate from a bind-mounted
+# host directory. Nothing is installed on the guest itself, so the plain
+# nginx/apache/caddy probe finds nothing and "replace" would silently do nothing.
+#
+# The certificate path in the container config is a CONTAINER path; it must be
+# translated to the guest-side path through the container's own mount table
+# before it can be written.
+#
+# Echoes one line per finding:
+#   docker:<container>:<flavour>|<guest_cert_path>|<guest_key_path>|<config_path>
+acme_detect_docker_tls_service() {
+    local kind="$1" vmid="$2"
+
+    acme_guest_exec "$kind" "$vmid" "command -v docker >/dev/null 2>&1 && echo yes" 2>/dev/null \
+        | grep -q yes || return 0
+
+    local names
+    names=$(acme_guest_exec "$kind" "$vmid" "docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null" 2>/dev/null)
+    [[ -z "$names" ]] && return 0
+
+    local cname image flavour cfg ctr_cert ctr_key mounts host_cert host_key
+    while read -r cname image; do
+        [[ -z "$cname" ]] && continue
+        flavour=""
+        case "${image,,}" in
+            *caddy*)   flavour=caddy ;;
+            *nginx*)   flavour=nginx ;;
+            *traefik*) flavour=traefik ;;
+        esac
+        [[ -z "$flavour" ]] && continue
+
+        # Only interested in something actually terminating TLS
+        acme_guest_exec "$kind" "$vmid" "docker port '$cname' 2>/dev/null | grep -q 443 && echo yes" 2>/dev/null \
+            | grep -q yes || continue
+
+        ctr_cert=""; ctr_key=""; cfg=""
+        case "$flavour" in
+            caddy)
+                cfg=/etc/caddy/Caddyfile
+                local line
+                line=$(acme_guest_exec "$kind" "$vmid" \
+                    "docker exec '$cname' sh -c 'grep -hE \"^[[:space:]]*tls[[:space:]]+/\" $cfg 2>/dev/null | head -1' 2>/dev/null" 2>/dev/null)
+                ctr_cert=$(awk '{print $2}' <<<"$line")
+                ctr_key=$(awk  '{print $3}' <<<"$line")
+                if [[ -z "$ctr_cert" ]]; then
+                    # No `tls <cert> <key>` line. Caddy may be managing its own
+                    # certificates -- either its internal PKI (`issuer internal`)
+                    # or automatic ACME. Replacing a file cannot change that, so
+                    # say so instead of reporting "no TLS service found", which
+                    # is what this looked like before and is simply wrong.
+                    local mode
+                    mode=$(acme_guest_exec "$kind" "$vmid" \
+                        "docker exec '$cname' sh -c \"grep -hoE 'issuer[[:space:]]+internal|tls[[:space:]]+internal|auto_https' $cfg 2>/dev/null | head -1\" 2>/dev/null" 2>/dev/null | tr -d '\r')
+                    echo "docker:${cname}:caddy|SELFMANAGED:${mode:-automatic}|SELFMANAGED|$cfg"
+                    continue
+                fi
+                ;;
+            nginx)
+                # Point cfg at the specific file holding server_name. Using the
+                # /etc/nginx directory instead makes the vhost rename impossible,
+                # because a directory cannot be mapped to a single bind mount.
+                cfg=$(acme_guest_exec "$kind" "$vmid" \
+                    "docker exec '$cname' sh -c \"grep -rlE '^[[:space:]]*server_name' /etc/nginx 2>/dev/null | head -1\" 2>/dev/null" 2>/dev/null \
+                    | tr -d '\r' | head -1 | tr -d '\n' | tr -d '|')
+                [[ -z "$cfg" ]] && cfg=/etc/nginx
+                local out
+                out=$(acme_guest_exec "$kind" "$vmid" \
+                    "docker exec '$cname' sh -c 'grep -rhE \"^[[:space:]]*ssl_certificate(_key)?[[:space:]]\" /etc/nginx 2>/dev/null | head -20' 2>/dev/null" 2>/dev/null)
+                ctr_cert=$(grep -E 'ssl_certificate[[:space:]]'     <<<"$out" | head -1 | sed -E 's/.*ssl_certificate[[:space:]]+//;s/;.*//'     | tr -d '"'"'"' ')
+                ctr_key=$( grep -E 'ssl_certificate_key[[:space:]]' <<<"$out" | head -1 | sed -E 's/.*ssl_certificate_key[[:space:]]+//;s/;.*//' | tr -d '"'"'"' ')
+                ;;
+            traefik)
+                # Traefik's cert paths live in a dynamic config whose location varies;
+                # report the container so the user knows, but do not guess paths.
+                echo "docker:${cname}:traefik|UNSUPPORTED|UNSUPPORTED|"
+                continue
+                ;;
+        esac
+
+        [[ -z "$ctr_cert" || -z "$ctr_key" ]] && continue
+
+        # Translate container paths to guest paths using the bind mounts
+        mounts=$(acme_guest_exec "$kind" "$vmid" \
+            "docker inspect -f '{{range .Mounts}}{{.Source}}|{{.Destination}}{{\"\\n\"}}{{end}}' '$cname' 2>/dev/null" 2>/dev/null)
+        host_cert=$(acme_map_container_path "$ctr_cert" "$mounts")
+        host_key=$( acme_map_container_path "$ctr_key"  "$mounts")
+
+        if [[ -z "$host_cert" || -z "$host_key" ]]; then
+            # Paths live inside the image or a named volume, not a bind mount --
+            # writing them from the guest is not possible.
+            echo "docker:${cname}:${flavour}|NOTBOUND:${ctr_cert}|NOTBOUND:${ctr_key}|$cfg"
+        else
+            echo "docker:${cname}:${flavour}|${host_cert}|${host_key}|$cfg"
+        fi
+    done <<< "$names"
+}
+
+# Map a path inside a container to its path on the guest, using the container's
+# mount table ("<source>|<destination>" lines). Longest destination wins, so a
+# nested mount is preferred over its parent. Echoes nothing if unmapped.
+acme_map_container_path() {
+    local cpath="$1" mounts="$2"
+    local best_src="" best_dst="" src dst
+    while IFS='|' read -r src dst; do
+        [[ -z "$dst" ]] && continue
+        if [[ "$cpath" == "$dst" || "$cpath" == "$dst"/* ]]; then
+            if (( ${#dst} > ${#best_dst} )); then best_dst="$dst"; best_src="$src"; fi
+        fi
+    done <<< "$mounts"
+    [[ -z "$best_dst" ]] && return 0
+    if [[ "$cpath" == "$best_dst" ]]; then
+        echo "$best_src"
+    else
+        echo "${best_src}${cpath#"$best_dst"}"
+    fi
+}
+
+# After a reload, confirm the service is really serving OUR certificate.
+#
+# This is the check that matters: writing the file and getting exit 0 from a
+# reload does not mean the service adopted it. Caddy in particular answers
+# "config is unchanged" and keeps the certificate it already had in memory.
+# Compares serial numbers over a real TLS handshake from inside the guest.
+acme_verify_service_cert() {
+    local kind="$1" vmid="$2" sni="$3" port="${4:-443}"
+    local want got
+    want=$(openssl x509 -in "$(acme_source_dir)/fullchain.pem" -noout -serial 2>/dev/null | cut -d= -f2)
+    [[ -z "$want" ]] && return 0
+    if [[ -z "$sni" ]]; then
+        echo "  NOT VERIFIED: no server name available to probe with, so adoption"
+        echo "    could not be confirmed. Check manually with:"
+        echo "    openssl s_client -connect <guest>:${port} | openssl x509 -noout -serial"
+        return 1
+    fi
+
+    local i
+    for i in 1 2 3 4 5; do
+        got=$(acme_guest_exec "$kind" "$vmid" \
+            "echo | openssl s_client -connect 127.0.0.1:${port} -servername '${sni}' 2>/dev/null | openssl x509 -noout -serial 2>/dev/null | cut -d= -f2" \
+            2>/dev/null | tr -d '\r')
+        [[ "$got" == "$want" ]] && { echo "  verified: :$port is serving the new certificate (SNI $sni)"; return 0; }
+        sleep 2
+    done
+
+    echo "  NOT ADOPTED: :$port is still serving a different certificate."
+    echo "    expected serial: ${want:0:20}"
+    echo "    serving serial : ${got:-<no certificate returned>}"
+    if [[ -z "$got" ]]; then
+        echo "    No certificate came back for SNI '$sni'. The proxy probably has"
+        echo "    no virtual host for that name, so it aborts the handshake."
+    else
+        echo "    The file was replaced but the service did not re-read it."
+        echo "    Try restarting the service rather than reloading it."
+    fi
+    return 1
+}
+
+# Reload a containerised proxy, preferring a graceful reload.
+acme_docker_reload_cmd() {
+    local cname="$1" flavour="$2" cfg="$3"
+    case "$flavour" in
+        # --force: see acme_service_reload_cmd. Without it caddy answers
+        # "config is unchanged" and keeps serving the certificate already in
+        # memory, so the deployment silently has no effect.
+        caddy) echo "docker exec '$cname' caddy reload --config '$cfg' --adapter caddyfile --force || docker restart '$cname'" ;;
+        nginx) echo "docker exec '$cname' nginx -t && docker exec '$cname' nginx -s reload || docker restart '$cname'" ;;
+        *)     echo "docker restart '$cname'" ;;
+    esac
+}
+# All TLS terminators in a guest: host-installed services AND containerised ones.
+# Normalised to four fields: <spec>|<cert>|<key>|<config>
+#   spec = nginx | apache2 | caddy | docker:<container>:<flavour>
+acme_detect_all_tls() {
+    local kind="$1" vmid="$2" line n
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        # normalise to exactly 4 fields (host detectors may emit 3 or 4)
+        n=$(awk -F'|' '{print NF}' <<<"$line")
+        if [[ "$n" -lt 4 ]]; then echo "${line}|"; else echo "$line"; fi
+    done < <(acme_detect_tls_service "$kind" "$vmid")
+    acme_detect_docker_tls_service "$kind" "$vmid"
+}
+
+# Does the service's configured server name fall under our certificate?
+# A cert replacement that leaves the vhost named <host>.myhome.lan still shows a
+# name mismatch in browsers, so say so rather than reporting success.
+# Server names a service is configured for (first line is the primary).
+acme_service_names() {
+    local kind="$1" vmid="$2" spec="$3" cfg="$4"
+    local names=""
+    case "$spec" in
+        docker:*:caddy)
+            local cname=${spec#docker:}; cname=${cname%%:*}
+            names=$(acme_guest_exec "$kind" "$vmid" \
+                "docker exec '$cname' sh -c 'grep -hoE \"^[A-Za-z0-9_.*-]+\\.[A-Za-z0-9_.*-]+\" ${cfg:-/etc/caddy/Caddyfile} 2>/dev/null' 2>/dev/null" 2>/dev/null | head -5)
+            ;;
+        caddy)
+            names=$(acme_guest_exec "$kind" "$vmid" \
+                "grep -hoE '^[A-Za-z0-9_.*-]+\\.[A-Za-z0-9_.*-]+' /etc/caddy/Caddyfile 2>/dev/null" 2>/dev/null | head -5)
+            ;;
+        docker:*:nginx)
+            # must look INSIDE the container: /etc/nginx on the guest is a
+            # different filesystem (often absent entirely)
+            local cn=${spec#docker:}; cn=${cn%%:*}
+            names=$(acme_guest_exec "$kind" "$vmid" \
+                "docker exec '$cn' sh -c \"grep -rhE '^[[:space:]]*server_name[[:space:]]' /etc/nginx 2>/dev/null\" 2>/dev/null | sed -E 's/.*server_name[[:space:]]+//;s/;.*//'" 2>/dev/null \
+                | tr ' ' '\n' | sed '/^$/d;/^_$/d' | head -5)
+            ;;
+        nginx)
+            names=$(acme_guest_exec "$kind" "$vmid" \
+                "grep -rhE '^[[:space:]]*server_name[[:space:]]' /etc/nginx 2>/dev/null | sed -E 's/.*server_name[[:space:]]+//;s/;.*//'" 2>/dev/null | tr ' ' '\n' | sed '/^$/d;/^_$/d' | head -5)
+            ;;
+        docker:*:apache2)
+            local ca=${spec#docker:}; ca=${ca%%:*}
+            names=$(acme_guest_exec "$kind" "$vmid" \
+                "docker exec '$ca' sh -c \"grep -rhiE '^[[:space:]]*ServerName[[:space:]]' /etc/apache2 /etc/httpd 2>/dev/null\" 2>/dev/null | sed -E 's/.*[Nn]ame[[:space:]]+//'" 2>/dev/null | head -5)
+            ;;
+        apache2)
+            names=$(acme_guest_exec "$kind" "$vmid" \
+                "grep -rhiE '^[[:space:]]*ServerName[[:space:]]' /etc/apache2 /etc/httpd 2>/dev/null | sed -E 's/.*[Nn]ame[[:space:]]+//'" 2>/dev/null | head -5)
+            ;;
+    esac
+    printf '%s\n' "$names" | sed '/^$/d'
+}
+
+# Warn when a configured name is not covered by our certificate.
+acme_check_servername() {
+    local kind="$1" vmid="$2" spec="$3" cfg="$4"
+    local names
+    names=$(acme_service_names "$kind" "$vmid" "$spec" "$cfg")
+    [[ -z "$names" ]] && return 0
+
+    local n bad=()
+    while read -r n; do
+        [[ -z "$n" ]] && continue
+        # covered by <domain>, *.<domain> or *.<sub>.<domain>?
+        if [[ "$n" == "$ACME_DOMAIN" ]] \
+           || [[ "$n" == *".$ACME_DOMAIN" ]] \
+           || [[ -n "${ACME_SUBDOMAIN:-}" && "$n" == *".${ACME_SUBDOMAIN}.${ACME_DOMAIN}" ]]; then
+            continue
+        fi
+        bad+=("$n")
+    done <<< "$names"
+
+    if (( ${#bad[@]} )); then
+        echo "  WARNING: this service is configured for ${bad[*]}"
+        echo "           which the certificate does NOT cover. TLS will load, but"
+        echo "           clients using that name still see a name mismatch."
+        echo "           Update the vhost to a *.${ACME_SUBDOMAIN:-lan}.${ACME_DOMAIN} name."
+        return 1
+    fi
+    return 0
+}
+
+# Deploy the wildcard cert into one guest.
+#   kind      lxc|vm
+#   vmid      guest id
+#   mode      "inplace"  overwrite the paths the detected service already uses
+#             "standard" install to /etc/ssl/pve-manager/<domain>/ only
+acme_deploy_to_guest() {
+    local kind="$1" vmid="$2" mode="${3:-inplace}" rename="${4:-0}"
+    local domain="${ACME_DOMAIN:-}"
+    local live; live=$(acme_source_dir)
+    local std="/etc/ssl/pve-manager/${domain}"
+
+    # Reachability first: the underlying pct/qm errors are cryptic, so diagnose
+    # the guest before touching a certificate.
+    local pf
+    if ! pf=$(acme_guest_preflight "$kind" "$vmid"); then
+        echo "CANNOT DEPLOY to $kind/$vmid"
+        echo ""
+        printf '%s\n' "$pf"
+        return 1
+    fi
+
+    local problem
+    if ! problem=$(acme_validate_local_cert); then
+        echo "CANNOT DEPLOY: $problem"
+        return 1
+    fi
+
+    # Refuse to push a staging certificate to a real service
+    if ! openssl verify -purpose sslserver -CAfile /etc/ssl/certs/ca-certificates.crt \
+           -untrusted "$live/fullchain.pem" "$live/fullchain.pem" >/dev/null 2>&1; then
+        echo "CANNOT DEPLOY: the local certificate is NOT publicly trusted"
+        echo "(this is a staging certificate, or the chain is incomplete)"
+        echo "Issue a PRODUCTION certificate first."
+        return 1
+    fi
+
+    local hostname fqdn
+    case "$kind" in
+        lxc) hostname=$(acme_guest_exec lxc "$vmid" "hostname" 2>/dev/null | tr -d '\r') ;;
+        vm)  hostname=$(vm_get_hostname "$vmid" 2>/dev/null | tr -d '\r') ;;
+    esac
+    hostname="${hostname:-guest$vmid}"
+    fqdn=$(acme_guest_fqdn "$hostname")
+
+    echo "Guest    : $kind/$vmid ($hostname)"
+    echo "Covered  : $fqdn  (by the *.${ACME_SUBDOMAIN:+${ACME_SUBDOMAIN}.}${domain} wildcard)"
+    log_cert_op "ACME_DEPLOY" "kind=$kind vmid=$vmid host=$hostname mode=$mode"
+
+    # Always install to the canonical path as well, so services configured later
+    # have a stable location to point at.
+    acme_guest_exec "$kind" "$vmid" "mkdir -p '$std'" >/dev/null 2>&1
+    acme_guest_push "$kind" "$vmid" "$live/fullchain.pem" "$std/fullchain.pem" || return 1
+    acme_guest_push "$kind" "$vmid" "$live/privkey.pem"   "$std/privkey.pem"   || return 1
+    acme_guest_push "$kind" "$vmid" "$live/chain.pem"     "$std/chain.pem"     >/dev/null 2>&1
+    acme_guest_exec "$kind" "$vmid" "chmod 644 '$std/fullchain.pem' '$std/chain.pem' 2>/dev/null; chmod 640 '$std/privkey.pem'" >/dev/null 2>&1
+    echo "Installed: $std/{fullchain,privkey,chain}.pem"
+
+    # Record BEFORE the mode branch: a standard-mode target still needs the new
+    # cert pushed on renewal, and an early return here would silently exclude it.
+    # Recorded before the service loop runs, so `rename` here is the REQUEST.
+    # A guest where nothing was renamed is corrected at the end of the loop.
+    acme_record_target "$kind" "$vmid" "$hostname" "$mode" "$rename"
+
+    [[ "$mode" == "standard" ]] && { echo "Mode     : standard (no service reconfigured)"; return 0; }
+
+    # In-place: overwrite whatever the running service already reads.
+    # Covers services installed in the guest AND proxies running as Docker
+    # containers (immich, for example, terminates TLS in a caddy container).
+    local found=0 actionable=0 fails=0 spec cpath kpath cfg reload label
+    while IFS='|' read -r spec cpath kpath cfg; do
+        [[ -z "$spec" ]] && continue
+        found=$((found+1))
+        label="$spec"
+        echo ""
+        echo "Service  : $label"
+
+        if [[ "$cpath" == UNSUPPORTED ]]; then
+            echo "  SKIPPED: certificate paths for this proxy are not discoverable"
+            echo "           automatically. Point it at:"
+            echo "             $std/fullchain.pem"
+            echo "             $std/privkey.pem"
+            fails=$((fails+1))
+            continue
+        fi
+        if [[ "$cpath" == SELFMANAGED:* ]]; then
+            echo "  SKIPPED: this proxy issues its OWN certificates (${cpath#SELFMANAGED:})."
+            echo "           Nothing on disk to replace -- Caddy generates the cert"
+            echo "           itself, so it would overwrite anything we wrote."
+            echo ""
+            echo "           To use this certificate instead, change its site block"
+            echo "           from the internal/automatic issuer to explicit files:"
+            echo "               tls $std/fullchain.pem $std/privkey.pem"
+            echo "           and rename the site to a *.${ACME_SUBDOMAIN:-lan}.${domain} name,"
+            echo "           then reload. Both files are already installed above."
+            fails=$((fails+1))
+            continue
+        fi
+        if [[ "$cpath" == NOTBOUND:* ]]; then
+            echo "  SKIPPED: the container reads ${cpath#NOTBOUND:}"
+            echo "           which is inside the image or a named volume, not a"
+            echo "           bind mount, so it cannot be written from the guest."
+            echo "           Bind-mount a host directory for its certificates,"
+            echo "           or point it at $std/."
+            fails=$((fails+1))
+            continue
+        fi
+
+        actionable=$((actionable+1))
+        echo "  cert   : $cpath"
+        echo "  key    : $kpath"
+
+        # back up inside the guest before overwriting
+        acme_guest_exec "$kind" "$vmid" \
+            "for f in '$cpath' '$kpath'; do [ -f \"\$f\" ] && cp -a \"\$f\" \"\$f.pvebak.$(date -u +%Y%m%dT%H%M%SZ)\"; done" >/dev/null 2>&1
+
+        if ! acme_guest_push "$kind" "$vmid" "$live/fullchain.pem" "$cpath"; then
+            echo "  FAILED writing $cpath"
+            fails=$((fails+1)); continue
+        fi
+        if ! acme_guest_push "$kind" "$vmid" "$live/privkey.pem" "$kpath"; then
+            echo "  FAILED writing $kpath"
+            fails=$((fails+1)); continue
+        fi
+        acme_guest_exec "$kind" "$vmid" "chmod 644 '$cpath'; chmod 640 '$kpath'" >/dev/null 2>&1
+
+        # confirm the bytes really landed
+        local remote_sha local_sha
+        remote_sha=$(acme_guest_exec "$kind" "$vmid" "sha256sum '$cpath' 2>/dev/null | cut -d' ' -f1" 2>/dev/null | tr -d '\r')
+        local_sha=$(sha256sum "$live/fullchain.pem" | cut -d' ' -f1)
+        if [[ "$remote_sha" != "$local_sha" ]]; then
+            echo "  FAILED verification: certificate on disk does not match what was sent"
+            echo "    sent   : ${local_sha:0:16}"
+            echo "    on disk: ${remote_sha:0:16}"
+            fails=$((fails+1)); continue
+        fi
+        echo "  written and verified"
+
+        # Optionally repoint the virtual host at a name the certificate covers.
+        # Done BEFORE the reload so the cert and the name change take effect in
+        # one restart rather than leaving a window with a mismatched vhost.
+        local renamed=0
+        if [[ "$rename" == "1" ]]; then
+            if acme_rewrite_vhost "$kind" "$vmid" "$spec" "$cfg" "$fqdn"; then
+                renamed=1
+            else
+                fails=$((fails+1))
+            fi
+        fi
+
+        case "$spec" in
+            docker:*)
+                local dname dflav
+                dname=${spec#docker:}; dflav=${dname##*:}; dname=${dname%%:*}
+                reload=$(acme_docker_reload_cmd "$dname" "$dflav" "$cfg")
+                ;;
+            *) reload=$(acme_service_reload_cmd "$spec") ;;
+        esac
+
+        local reloaded=0
+        if [[ -n "$reload" ]]; then
+            local rout
+            if rout=$(acme_guest_exec "$kind" "$vmid" "$reload" 2>&1); then
+                echo "  reload command succeeded"
+                reloaded=1
+            else
+                echo "  RELOAD FAILED -- the service is still serving the old cert."
+                echo "  Its config test probably rejected something. Output:"
+                printf '%s\n' "$rout" | head -12 | sed 's/^/    | /'
+                echo "  Backups are beside the originals as *.pvebak.*"
+                fails=$((fails+1))
+            fi
+        fi
+
+        # A successful reload is NOT proof of adoption, so check the live socket.
+        if [[ "$reloaded" == 1 ]]; then
+            local primary
+            if [[ "$renamed" == 1 ]]; then
+                primary="$fqdn"
+            else
+                primary=$(acme_service_names "$kind" "$vmid" "$spec" "$cfg" | head -1)
+            fi
+            # Some proxies declare no server name at all (Harbor's nginx uses
+            # `server_name _`), and an empty SNI would skip verification
+            # entirely. Fall back to the guest's own covered name: such a proxy
+            # answers every SNI, so the handshake still proves adoption.
+            [[ -z "$primary" ]] && primary="$fqdn"
+            if ! acme_verify_service_cert "$kind" "$vmid" "$primary" 443; then
+                fails=$((fails+1))
+            fi
+        fi
+
+        # Only warn about coverage if we did not just fix it
+        if [[ "$renamed" != 1 ]]; then
+            acme_check_servername "$kind" "$vmid" "$spec" "$cfg" || true
+        else
+            echo "  reminder: add a DNS record  $fqdn -> this guest's LAN IP"
+        fi
+    done < <(acme_detect_all_tls "$kind" "$vmid")
+
+    if [[ "$found" -eq 0 ]]; then
+        echo ""
+        echo "No TLS service found to replace."
+        echo ""
+        echo "Looked for: nginx, apache2 and caddy installed in the guest, and"
+        echo "caddy/nginx/traefik running as a Docker container publishing :443."
+        echo ""
+        echo "The certificate IS installed at $std/ for manual wiring."
+        echo "If this guest terminates TLS some other way, point that service at:"
+        echo "  cert: $std/fullchain.pem"
+        echo "  key : $std/privkey.pem"
+        # Re-record as 'standard': the certificate is in place and should keep
+        # being refreshed, but there is nothing to replace in-place. Leaving it
+        # recorded as 'inplace' would make every future renewal report a failure
+        # for a guest that simply has no web server.
+        acme_record_target "$kind" "$vmid" "$hostname" standard 0
+        echo ""
+        echo "Recorded as 'standard' so renewals keep it fresh without reporting"
+        echo "a failure each time."
+        return 0
+    fi
+
+    # Every detected service was self-managed / unwritable, so there is nothing
+    # in-place to do here -- ever. Record it as 'standard' (the certificate IS
+    # installed at the canonical path) so renewals keep it fresh instead of
+    # reporting the same unfixable failure every 60 days.
+    if [[ "$actionable" -eq 0 && "$found" -gt 0 ]]; then
+        acme_record_target "$kind" "$vmid" "$hostname" standard 0
+        echo ""
+        echo "RESULT: nothing here can be replaced in place (see above)."
+        echo "Re-recorded as 'standard' so renewals refresh the certificate at"
+        echo "$std/ without reporting this as a failure each time."
+        return 0
+    fi
+
+    if [[ "$fails" -gt 0 ]]; then
+        echo ""
+        echo "RESULT: $fails of $found service(s) did not complete -- see above."
+        return 1
+    fi
+    echo ""
+    echo "RESULT: $found service(s) updated successfully."
+    return 0
+}
+
+# Remember deploy targets so renewal can re-push without re-discovering them
+acme_record_target() {
+    local kind="$1" vmid="$2" hostname="$3" mode="$4" rename="${5:-0}"
+    mkdir -p "$ACME_DIR"
+    touch "$ACME_TARGETS_FILE"
+    grep -vE "^${kind}:${vmid}:" "$ACME_TARGETS_FILE" > "$ACME_TARGETS_FILE.tmp" 2>/dev/null || true
+    printf '%s:%s:%s:%s:%s\n' "$kind" "$vmid" "$hostname" "$mode" "$rename" >> "$ACME_TARGETS_FILE.tmp"
+    mv -f "$ACME_TARGETS_FILE.tmp" "$ACME_TARGETS_FILE"
+}
+
+acme_list_targets() {
+    [[ -s "$ACME_TARGETS_FILE" ]] || { echo "(no deploy targets recorded yet)"; return 0; }
+    printf '%-5s %-6s %-24s %-9s %s\n' TYPE VMID HOSTNAME MODE RENAMED
+    while IFS=':' read -r kind vmid hostname mode rename; do
+        [[ -z "$kind" ]] && continue
+        printf '%-5s %-6s %-24s %-9s %s\n' "$kind" "$vmid" "$hostname" "$mode" "${rename:-0}"
+    done < "$ACME_TARGETS_FILE"
+}
+#######################################
+# Renewal
+#######################################
+
+# Renew if due, then re-push to every recorded target. Safe to run from cron or
+# a systemd timer; acme.sh exits cleanly when nothing is due.
+acme_renew_all() {
+    local force="${1:-0}"
+    [[ -n "${ACME_DOMAIN:-}" ]] || { echo "no domain configured"; return 1; }
+
+    # On a non-issuer host there is nothing to renew: fetch the issuer's current
+    # certificate and re-push it to the recorded targets.
+    if ! acme_is_issuer; then
+        echo "=== Not the issuer (${ACME_ISSUER_HOST}); fetching instead of renewing ==="
+        acme_fetch_from_issuer || return 1
+        acme_redeploy_targets
+        return $?
+    fi
+
+    acme_client_installed || { echo "acme.sh not installed"; return 1; }
+    acme_load_token       || { echo "no Cloudflare token configured"; return 1; }
+
+    local -a ecc_flag=()
+    [[ "${ACME_KEY_TYPE:-ec-256}" == ec-* ]] && ecc_flag=(--ecc)
+    local -a force_flag=()
+    [[ "$force" == "1" ]] && force_flag=(--force)
+
+    echo "=== Renewal ==="
+    if [[ "$force" == "1" ]]; then
+        echo "NOTE: a forced renewal consumes one of Let's Encrypt's 5"
+        echo "      duplicate-certificates-per-week for this SAN set."
+        echo ""
+        acme_sh --renew -d "$ACME_DOMAIN" \
+            "${ecc_flag[@]}" "${force_flag[@]}" 2>&1 \
+            | grep -vE '^[A-Za-z0-9+/=]{60,}$|^-----(BEGIN|END)' | tail -15
+    else
+        acme_sh --cron 2>&1 | tail -10
+    fi
+
+    echo ""
+    if ! acme_validate_local_cert >/dev/null 2>&1; then
+        echo "Local certificate is not usable after renewal; not deploying."
+        return 1
+    fi
+    acme_cert_summary | sed 's/^/  /'
+
+    acme_redeploy_targets
+    return $?
+}
+
+# Re-push the current certificate to every recorded target.
+acme_redeploy_targets() {
+    echo ""
+    echo "=== Re-deploying to recorded targets ==="
+    if [[ ! -s "$ACME_TARGETS_FILE" ]]; then
+        echo "(none recorded)"
+        return 0
+    fi
+
+    local rc=0 kind vmid hostname mode rename
+    while IFS=':' read -r kind vmid hostname mode rename; do
+        [[ -z "$kind" ]] && continue
+        echo ""
+        echo "--- $kind/$vmid ($hostname) ---"
+        # Renewal never renames a vhost: that is a one-off migration decision,
+        # not something to redo unattended every 60 days.
+        if [[ "$kind" == "papi" ]]; then
+            if ! acme_deploy_proxmox_api "$vmid" "$hostname"; then
+                echo "  deploy FAILED"
+                rc=1
+            fi
+        elif ! acme_deploy_to_guest "$kind" "$vmid" "${mode:-inplace}" 0; then
+            echo "  deploy FAILED"
+            rc=1
+        fi
+    done < "$ACME_TARGETS_FILE"
+    return $rc
+}
+
+# Hint text: a publicly-trusted cert is useless until the names resolve to the
+# guests' LAN addresses. This is the step people forget.
+acme_dns_hint() {
+    local domain="${ACME_DOMAIN:-example.com}" sub="${ACME_SUBDOMAIN:-lan}"
+    cat << EOF
+The certificate is valid for *.${sub}.${domain}, but browsers still need those
+names to resolve to your guests' LAN addresses. DNS-01 validated against the
+public zone; it created no address records.
+
+Add split-horizon records on your internal resolver, one per guest, e.g.:
+
+    gitea.${sub}.${domain}       ->  10.x.x.x
+    nextcloud.${sub}.${domain}   ->  10.x.x.x
+
+On AdGuard Home: Filters -> DNS rewrites. Note that AdGuard's rewrite entries
+need "enabled: true"; an entry without it is stored but silently inert.
+
+Do NOT create a wildcard rewrite for *.${domain} itself -- it would shadow every
+public record in that zone (www, mail, MX targets) for every client on the LAN.
+Keep internal names under the .${sub}. namespace.
+
+Avoid publishing RFC1918 addresses in the public zone instead: public resolvers
+strip private answers as DNS-rebinding protection, so it breaks unpredictably.
+
+If a name still fails to resolve after you add it, flush the caches on any
+forwarding resolver in front of AdGuard -- a cached NXDOMAIN will persist.
+EOF
+}
+
+#######################################
+# Menus
+#######################################
+
+acme_config_menu() {
+    while true; do
+        local tok_state="NOT SET"
+        acme_have_token && tok_state="set (hidden)"
+
+        local choice
+        choice=$(show_menu "ACME / Cloudflare Configuration" \
+            "Configure publicly-trusted certificate issuance.\n\nSelect a setting:" \
+            "1" "Cloudflare API token [$tok_state]" \
+            "2" "Public domain (${ACME_DOMAIN:-<unset>})" \
+            "3" "Internal subdomain (${ACME_SUBDOMAIN:-<unset>})" \
+            "4" "Account email (${ACME_EMAIL:-<unset>})" \
+            "5" "Key type (${ACME_KEY_TYPE:-ec-256})" \
+            "6" "Test token against Cloudflare" \
+            "7" "Issuer host (${ACME_ISSUER_HOST:-<this host issues>})" \
+            "8" "Local cert source dir (${ACME_CERT_SOURCE_DIR:-<acme.sh live dir>})" \
+            "0" "Back")
+
+        case "$choice" in
+            1)
+                # Instructions go in their own message box. The password box
+                # itself must stay short: show_password renders a fixed 10-row
+                # dialog, and a prompt too tall for it makes whiptail emit an
+                # error that would be captured as the entered value.
+                show_scrollmsg "Cloudflare API Token" \
+"Create the token in the Cloudflare dashboard:
+
+  My Profile -> API Tokens -> Create Token -> Create Custom Token
+
+  Permissions    : Zone -> DNS   -> Edit
+                   Zone -> Zone  -> Read
+  Zone Resources : Include -> Specific zone -> your domain
+  TTL            : leave blank (an expiring token silently breaks
+                   unattended renewal)
+
+Do NOT use a Global API Key, and do not grant Account-level scopes.
+
+The token is stored at
+  $ACME_TOKEN_FILE
+with mode 0600, on this host only. It is never copied to guests.
+
+Press OK, then paste the token on the next screen."
+                local token
+                token=$(show_password "Cloudflare API Token" "Paste the API token:")
+                if [[ -n "$token" ]]; then
+                    local saveout
+                    if saveout=$(acme_save_token "$token" 2>&1); then
+                        local res
+                        res=$(acme_verify_token "${ACME_DOMAIN:-}")
+                        show_msg "Token Saved" "Stored at:\n$ACME_TOKEN_FILE (mode 0600)\n\n$res"
+                    else
+                        show_msg "Token Rejected" "$saveout"
+                    fi
+                fi
+                ;;
+            2)
+                local v
+                v=$(show_input "Public Domain" \
+"Enter the public domain you own and host on Cloudflare.
+
+This must be a real, registrable domain. A reserved pseudo-TLD such as
+.lan, .local or .home can NEVER be certified by a public CA, because
+there is no way to prove ownership of it." "${ACME_DOMAIN:-}")
+                if [[ -n "$v" ]]; then
+                    if [[ "$v" =~ \.(lan|local|home|internal|corp|localdomain)$ ]]; then
+                        show_msg "Not Usable" \
+"'$v' ends in a reserved pseudo-TLD.\n\nNo public CA can issue for it. Use a domain you have registered and delegated to Cloudflare."
+                    else
+                        save_config "ACME_DOMAIN" "$v" && ACME_DOMAIN="$v"
+                    fi
+                fi
+                ;;
+            3)
+                local v
+                v=$(show_input "Internal Subdomain" \
+"Label for internal hosts, giving <guest>.<label>.<domain>.
+
+Keeping internal names under one label means a single wildcard covers
+them all, and your internal records can never shadow public ones.
+Leave empty to place guests directly on the domain." "${ACME_SUBDOMAIN:-lan}")
+                save_config "ACME_SUBDOMAIN" "$v" && ACME_SUBDOMAIN="$v"
+                ;;
+            4)
+                local v
+                v=$(show_input "Account Email" "Email for the ACME account (expiry notices, account recovery):" "${ACME_EMAIL:-}")
+                [[ -n "$v" ]] && save_config "ACME_EMAIL" "$v" && ACME_EMAIL="$v"
+                ;;
+            5)
+                local v
+                v=$(show_menu "Key Type" "Select certificate key type:" \
+                    "ec-256" "ECDSA P-256 (recommended: faster handshakes)" \
+                    "ec-384" "ECDSA P-384" \
+                    "2048"   "RSA 2048 (for legacy clients only)" \
+                    "4096"   "RSA 4096")
+                [[ -n "$v" ]] && save_config "ACME_KEY_TYPE" "$v" && ACME_KEY_TYPE="$v"
+                ;;
+            6)
+                local res
+                res=$(acme_verify_token "${ACME_DOMAIN:-}" 2>&1)
+                show_scrollmsg "Token Test" "$res"
+                ;;
+            7)
+                local v
+                v=$(show_input "Issuer Host" \
+"Which host issues the certificate for the whole fleet?
+
+Leave EMPTY if THIS host is the issuer (it holds the Cloudflare
+token and runs the ACME client).
+
+Set it to the issuer's hostname or IP on every other host. Those
+hosts then only deploy: they fetch the certificate over SSH and
+never issue their own. Running an issuer per node consumes the
+5-duplicate-certificates-per-week budget, creates competing
+renewal schedules, and lets two hosts fight over one guest." "${ACME_ISSUER_HOST:-}")
+                save_config "ACME_ISSUER_HOST" "$v" && ACME_ISSUER_HOST="$v"
+                if [[ -n "$v" ]]; then
+                    local d
+                    d=$(show_input "Issuer Certificate Directory" \
+"Path on ${v} holding fullchain.pem / privkey.pem / chain.pem:" \
+"${ACME_ISSUER_DIR:-/etc/ssl/homelab/${ACME_DOMAIN}}")
+                    save_config "ACME_ISSUER_DIR" "$d" && ACME_ISSUER_DIR="$d"
+                fi
+                ;;
+            8)
+                local v
+                v=$(show_input "Local Certificate Source" \
+"Read the deployable certificate from this local directory instead
+of the tool's own acme.sh live directory.
+
+Use this when a standalone acme.sh already manages the certificate
+outside the tool, e.g. /etc/ssl/homelab/${ACME_DOMAIN:-<domain>}.
+
+Leave empty to use the tool's own live directory." "${ACME_CERT_SOURCE_DIR:-}")
+                save_config "ACME_CERT_SOURCE_DIR" "$v" && ACME_CERT_SOURCE_DIR="$v"
+                ;;
+            0|"") return ;;
+        esac
+    done
+}
+# Build a list of running guests of one kind. Echoes "vmid|name" lines.
+#
+# Column layouts differ and are not fixed-width safe:
+#   pct list  -> "VMID Status Lock Name", but Lock is usually EMPTY, so the row
+#                collapses to 3 fields and the name is the LAST field.
+#   pve_list_vms -> "VMID Status Name MEM" (it already reorders qm list).
+# Taking $1/$2 plus the name by position-from-the-correct-end handles both,
+# including a container that happens to be locked mid-backup.
+acme_running_guests() {
+    local kind="$1" listing
+    case "$kind" in
+        lxc) listing=$(pve_list_containers) ;;
+        vm)  listing=$(pve_list_vms) ;;
+        *)   return 1 ;;
+    esac
+    [[ -z "$listing" ]] && return 1
+
+    if [[ "$kind" == "lxc" ]]; then
+        # name is the last field whether or not Lock is populated
+        awk 'NF>=3 && $1 ~ /^[0-9]+$/ && $2=="running" { print $1 "|" $NF }' <<< "$listing"
+    else
+        awk 'NF>=3 && $1 ~ /^[0-9]+$/ && $2=="running" { print $1 "|" $3 }' <<< "$listing"
+    fi
+}
+
+# Let the user pick one or more running guests, then deploy to each.
+#
+# Output is written to a log file and ALWAYS shown afterwards, pass or fail.
+# Piping straight into show_progress_box lost the exit status and, when a guest
+# failed early, closed the box before anything could be read.
+acme_deploy_menu() {
+    local kind="$1"
+    local label="LXC containers"; [[ "$kind" == "vm" ]] && label="VMs"
+
+    if [[ -z "$CURRENT_PVE" ]]; then
+        show_msg "Not Connected" "Connect to a PVE server first."
+        return
+    fi
+    # A deployer host may not have the certificate yet, or may be holding a
+    # stale copy; refresh from the issuer before every deployment.
+    if ! acme_is_issuer; then
+        local fout
+        fout=$(acme_fetch_from_issuer 2>&1)
+        if [[ $? -ne 0 ]]; then
+            show_scrollmsg "Cannot Fetch Certificate" "$fout"
+            return
+        fi
+    fi
+
+    if ! acme_cert_present; then
+        show_msg "No Certificate" \
+"No certificate is available at:
+  $(acme_source_dir)
+
+$(acme_is_issuer && echo "This host is the issuer -- use 'Issue certificate' first." || echo "Fetch it from the issuer (${ACME_ISSUER_HOST}) with menu option F.")"
+        return
+    fi
+    if ! acme_validate_local_cert >/dev/null 2>&1; then
+        show_msg "Certificate Unusable" "The local certificate cannot be deployed:\n\n$(acme_validate_local_cert 2>&1)"
+        return
+    fi
+
+    local node; node=$(acme_connected_node)
+
+    # Cluster-wide: guests on other nodes are reachable, so list them all and
+    # label each with its owning node.
+    local -a items=()
+    local g gkind gvmid gname gstatus gnode
+    local -a rows=(); local row
+    mapfile -t rows < <(acme_cluster_guests)
+    for row in "${rows[@]}"; do
+        IFS='|' read -r gkind gvmid gname gstatus gnode <<< "$row"
+        [[ -z "$gvmid" ]] && continue
+        [[ "$gkind" != "$kind" ]] && continue
+        [[ "$gstatus" != "running" ]] && continue
+        items+=("$gvmid" "$(printf '%-22s [%s]' "$gname" "$gnode")" "off")
+    done
+
+    if [[ ${#items[@]} -eq 0 ]]; then
+        show_msg "None Found" \
+"No running $label anywhere in the cluster.
+
+Checked every node listed in /etc/pve/.members. Start the guest first,
+or check that the other nodes are online and reachable."
+        return
+    fi
+
+    local selected
+    selected=$(show_checklist "Deploy Certificate" \
+"Certificate: ${ACME_DOMAIN}   (connected via ${node:-?})
+
+All running $label in the cluster are listed, with their owning node.
+Guests on other nodes are reached over the cluster SSH trust.
+
+Select targets:" "${items[@]}")
+    [[ -z "$selected" ]] && return
+
+    local mode
+    mode=$(show_menu "Deployment Mode" \
+"How should the certificate be applied?" \
+        "inplace"  "Replace the cert the service already uses (recommended)" \
+        "standard" "Install to /etc/ssl/pve-manager only, change nothing")
+    [[ -z "$mode" ]] && return
+
+    # Replacing the certificate is only half the job when the vhost is still
+    # named <app>.myhome.lan: no public cert can cover that, so clients keep
+    # seeing a name mismatch. Offer to repoint it.
+    local rename=0
+    if [[ "$mode" == "inplace" ]]; then
+        if show_yesno "Rewrite Virtual Host Name?" \
+"Also repoint each service's virtual host at a name this certificate covers,
+i.e. <guest>.${ACME_SUBDOMAIN:-lan}.${ACME_DOMAIN} ?
+
+  YES  the new name works with a green padlock straight away.
+       The OLD name stops working, so update bookmarks and any
+       mobile apps that use it. A backup of each config is kept
+       in the guest as *.pvebak.<timestamp>.
+
+  NO   only the certificate is replaced. The service will load it,
+       but clients using the old name still see a mismatch.
+
+Either way you must add DNS for the new name on your internal resolver."; then
+            rename=1
+        fi
+    fi
+
+    local stamp logf
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    logf="$LOG_DIR/acme-deploy-${stamp}.log"
+    : > "$logf" 2>/dev/null || logf="/tmp/acme-deploy-${stamp}.log"
+
+    show_info "Deploying" "Deploying ${ACME_DOMAIN} certificate...\n\nLog: $logf"
+
+    local id ok=0 fail=0 failed_ids=""
+    {
+        echo "ACME certificate deployment"
+        echo "  when      : $(date -Iseconds)"
+        echo "  node      : ${node:-?}"
+        echo "  kind      : $kind"
+        echo "  mode      : $mode"
+        echo "  rename    : $([[ "$rename" == 1 ]] && echo 'yes - vhost repointed at the new domain' || echo 'no')"
+        echo "  domain    : ${ACME_DOMAIN}"
+        echo "  targets   : $(tr -d '\"' <<<"$selected")"
+        echo "=================================================================="
+    } >> "$logf"
+
+    for id in $selected; do
+        id="${id//\"/}"
+        {
+            echo ""
+            echo "################ $kind/$id ################"
+        } >> "$logf"
+        if acme_deploy_to_guest "$kind" "$id" "$mode" "$rename" >> "$logf" 2>&1; then
+            ok=$((ok+1))
+            echo "[OK] $kind/$id" >> "$logf"
+        else
+            fail=$((fail+1)); failed_ids="$failed_ids $id"
+            echo "[FAILED] $kind/$id" >> "$logf"
+        fi
+    done
+
+    {
+        echo ""
+        echo "=================================================================="
+        echo "Succeeded: $ok    Failed: $fail"
+        if [[ "$fail" -gt 0 ]]; then
+            echo "Failed targets:$failed_ids"
+            echo ""
+            echo "Scroll up for the reason against each guest."
+        fi
+        if [[ "$ok" -gt 0 ]]; then
+            echo ""
+            acme_dns_hint
+        fi
+    } >> "$logf"
+
+    # Always show the full transcript, pass or fail.
+    show_textbox "Deployment Log ($ok ok, $fail failed)" "$logf"
+
+    # And make a failure impossible to miss.
+    if [[ "$fail" -gt 0 ]]; then
+        local reasons
+        reasons=$(grep -E '^(CANNOT DEPLOY|  SKIPPED|  FAILED|  RELOAD FAILED|No TLS service found)' "$logf" \
+                  | sed 's/^ *//' | sort -u | head -8)
+        show_scrollmsg "Deployment FAILED for$failed_ids" \
+"$fail of $((ok+fail)) target(s) failed.
+
+Reasons seen:
+$reasons
+
+Full log:
+  $logf
+
+Review it with:
+  less $logf"
+    else
+        show_msg "Deployment Complete" \
+"$ok target(s) updated successfully.
+
+Remember the names must resolve to each guest's LAN IP on your internal
+resolver, or browsers cannot reach them. See 'Show DNS setup requirements'.
+
+Log: $logf"
+    fi
+}
+
+#######################################
+# PROXMOX-PRODUCT TARGETS (certificate API)
+#
+# Proxmox Datacenter Manager and Proxmox Backup Server run as VMs whose TLS is
+# owned by their own proxy, and they expose a certificate API for replacing it:
+#   POST /api2/json/nodes/localhost/certificates/custom
+#        certificates=<PEM chain>  key=<PEM key>  force=1  restart=1
+# That is the supported path. It needs no guest agent and no SSH into the VM,
+# and the product keeps managing the certificate files itself.
+#
+# Recorded as kind "papi". Connection details live in an env file per target,
+# $ACME_DIR/api/<vmid>.env (mode 0600), which may be a symlink to wherever the
+# secret is kept. Keys:
+#   PX_URL           https://<host>:<port>          (PDM 8443, PBS 8007)
+#   PX_SCHEME        PDMAPIToken | PBSAPIToken      (default by product)
+#   PX_TOKEN_ID      user@realm!tokenid
+#   PX_TOKEN_SECRET  <uuid>
+# PDM_URL / PDM_TOKEN_ID / PDM_TOKEN_SECRET are accepted as aliases.
+#
+# The token needs System.Modify on / . With Privilege Separation enabled that
+# must be granted to the TOKEN (an "API Token Permission"); a grant on the user
+# does not flow through, and the token then authenticates with every privilege
+# false -- /access/permissions reports it plainly.
+#######################################
+
+acme_papi_envfile() { echo "$ACME_DIR/api/$1.env"; }
+
+# Load a target's connection details into PX_* variables.
+acme_papi_load() {
+    local vmid="$1" f
+    f=$(acme_papi_envfile "$vmid")
+    PX_URL=""; PX_SCHEME=""; PX_TOKEN_ID=""; PX_TOKEN_SECRET=""
+    PDM_URL=""; PDM_TOKEN_ID=""; PDM_TOKEN_SECRET=""
+    PBS_URL=""; PBS_TOKEN_ID=""; PBS_TOKEN_SECRET=""
+    if [[ ! -r "$f" ]]; then
+        echo "no API credentials for target $vmid (expected $f)"
+        return 1
+    fi
+    # shellcheck disable=SC1090
+    source "$f"
+    if [[ -n "$PDM_TOKEN_ID" ]]; then
+        : "${PX_URL:=$PDM_URL}" "${PX_TOKEN_ID:=$PDM_TOKEN_ID}" "${PX_TOKEN_SECRET:=$PDM_TOKEN_SECRET}" "${PX_SCHEME:=PDMAPIToken}"
+    elif [[ -n "$PBS_TOKEN_ID" ]]; then
+        : "${PX_URL:=$PBS_URL}" "${PX_TOKEN_ID:=$PBS_TOKEN_ID}" "${PX_TOKEN_SECRET:=$PBS_TOKEN_SECRET}" "${PX_SCHEME:=PBSAPIToken}"
+    fi
+    : "${PX_SCHEME:=PDMAPIToken}"
+    local missing=""
+    [[ -z "$PX_URL" ]]          && missing+=" PX_URL"
+    [[ -z "$PX_TOKEN_ID" ]]     && missing+=" PX_TOKEN_ID"
+    [[ -z "$PX_TOKEN_SECRET" ]] && missing+=" PX_TOKEN_SECRET"
+    if [[ -n "$missing" ]]; then
+        echo "incomplete API credentials in $f:$missing"
+        return 1
+    fi
+    PX_URL="${PX_URL%/}"
+    return 0
+}
+
+# Call the product API. Echoes the body; the HTTP status goes to PX_HTTP.
+acme_papi_call() {
+    local method="$1" path="$2"; shift 2
+    local out
+    out=$(curl -sk -m 60 -X "$method" \
+            -H "Authorization: ${PX_SCHEME}=${PX_TOKEN_ID}:${PX_TOKEN_SECRET}" \
+            -w $'\n%{http_code}' "$@" "${PX_URL}/api2/json${path}" < /dev/null 2>/dev/null)
+    PX_HTTP="${out##*$'\n'}"
+    printf '%s' "${out%$'\n'*}"
+}
+
+# Serial currently served on the product's TLS port, probed with a real handshake.
+acme_papi_live_serial() {
+    local sni="$1" hostport="${PX_URL#https://}"
+    hostport="${hostport%%/*}"
+    echo | timeout 10 openssl s_client -connect "$hostport" -servername "$sni" 2>/dev/null \
+        | openssl x509 -noout -serial 2>/dev/null | cut -d= -f2
+}
+
+acme_deploy_proxmox_api() {
+    local vmid="$1" name="${2:-guest$1}"
+    local live; live=$(acme_source_dir)
+    local fqdn; fqdn=$(acme_guest_fqdn "$name")
+
+    local problem
+    if ! problem=$(acme_validate_local_cert); then
+        echo "CANNOT DEPLOY: $problem"; return 1
+    fi
+    # Load credentials in THIS shell. Wrapping this in $(...) runs it in a
+    # subshell and discards the PX_* variables it sets, so the calls below
+    # silently use whatever an earlier target left behind -- one product's
+    # token for another's key, or none at all during unattended renewal.
+    local msgf; msgf=$(mktemp)
+    if ! acme_papi_load "$vmid" >"$msgf" 2>&1; then
+        echo "CANNOT DEPLOY to papi/$vmid: $(cat "$msgf")"
+        echo ""
+        echo "Create $(acme_papi_envfile "$vmid") (mode 0600) with PX_URL,"
+        echo "PX_TOKEN_ID and PX_TOKEN_SECRET, or register the target again."
+        rm -f "$msgf"
+        return 1
+    fi
+    rm -f "$msgf"
+
+    echo "Target   : papi/$vmid ($name) via ${PX_URL}"
+    echo "Covered  : $fqdn"
+
+    # Authenticate and check rights before sending a private key anywhere.
+    acme_papi_call GET /version >/dev/null
+    if [[ "$PX_HTTP" != 200 ]]; then
+        echo "CANNOT DEPLOY: API rejected the token (http $PX_HTTP)."
+        echo "Check the token ID/secret and the ${PX_SCHEME} scheme."
+        return 1
+    fi
+    local perms
+    perms=$(acme_papi_call GET /access/permissions)
+    if ! grep -q '"System.Modify":true' <<<"$perms"; then
+        echo "CANNOT DEPLOY: the token authenticates but lacks System.Modify on /."
+        echo ""
+        echo "With Privilege Separation enabled, the grant must be an"
+        echo "'API Token Permission' for ${PX_TOKEN_ID} (role Administrator,"
+        echo "path /). A permission on the user does not reach the token."
+        echo "Or edit the token and untick Privilege Separation."
+        return 1
+    fi
+
+    local want
+    want=$(openssl x509 -in "$live/fullchain.pem" -noout -serial | cut -d= -f2)
+
+    # Idempotent: uploading restarts the product's proxy, so skip when current.
+    if [[ "$(acme_papi_live_serial "$fqdn")" == "$want" ]]; then
+        echo "  already serving this certificate -- nothing to do"
+        acme_record_target papi "$vmid" "$name" api 0
+        return 0
+    fi
+
+    local body
+    body=$(acme_papi_call POST /nodes/localhost/certificates/custom \
+            --data-urlencode "certificates@$live/fullchain.pem" \
+            --data-urlencode "key@$live/privkey.pem" \
+            --data-urlencode "force=1" \
+            --data-urlencode "restart=1")
+    if [[ "$PX_HTTP" != 200 ]]; then
+        echo "  UPLOAD FAILED (http $PX_HTTP):"
+        printf '%s\n' "$body" | head -8 | sed 's/^/    | /'
+        return 1
+    fi
+    echo "  uploaded; the product's proxy is restarting"
+
+    local i got=""
+    for i in $(seq 1 15); do
+        got=$(acme_papi_live_serial "$fqdn")
+        [[ "$got" == "$want" ]] && break
+        sleep 2
+    done
+    if [[ "$got" != "$want" ]]; then
+        echo "  NOT ADOPTED: still serving ${got:-<no certificate>}"
+        echo "    expected serial: ${want:0:20}"
+        echo "    Rollback: DELETE ${PX_URL}/api2/json/nodes/localhost/certificates/custom"
+        echo "    makes the product regenerate its own self-signed certificate."
+        return 1
+    fi
+    echo "  verified: ${PX_URL#https://} is serving the new certificate (SNI $fqdn)"
+    acme_record_target papi "$vmid" "$name" api 0
+    echo ""
+    echo "RESULT: 1 service(s) updated successfully."
+    return 0
+}
+
+# Record a Proxmox-product target and link its credentials into place.
+acme_register_proxmox_api() {
+    local vmid="$1" name="$2" envsrc="$3"
+    [[ -r "$envsrc" ]] || { echo "credentials file not readable: $envsrc"; return 1; }
+    local perm; perm=$(stat -c %a "$envsrc" 2>/dev/null)
+    if [[ "$perm" != 600 && "$perm" != 400 ]]; then
+        echo "refusing: $envsrc is mode $perm; a token secret must be 0600"
+        return 1
+    fi
+    mkdir -p "$ACME_DIR/api"; chmod 700 "$ACME_DIR/api"
+    ln -sfn "$envsrc" "$(acme_papi_envfile "$vmid")"
+    acme_papi_load "$vmid" || return 1
+    echo "registered papi/$vmid ($name) -> $envsrc"
+    acme_deploy_proxmox_api "$vmid" "$name"
+}
+
+# Survey every running guest in the cluster and report what TLS terminator it
+# has, so it is obvious up front which apps "replace" can handle and which need
+# manual wiring. Read-only.
+acme_cluster_scan() {
+    local gkind gvmid gname gstatus gnode det line spec cpath kpath cfg
+    echo "Cluster TLS survey"
+    echo "  certificate: ${ACME_DOMAIN:-<unset>}  (*.${ACME_SUBDOMAIN:-lan}.${ACME_DOMAIN:-?})"
+    echo "  scanning every running guest on every node; this takes a moment."
+    echo "======================================================================"
+    local -a rows=()
+    mapfile -t rows < <(acme_cluster_guests)
+    local row
+    for row in "${rows[@]}"; do
+        IFS='|' read -r gkind gvmid gname gstatus gnode <<< "$row"
+        [[ -z "$gvmid" ]] && continue
+        [[ "$gstatus" != "running" ]] && continue
+        printf '\n%-4s %-6s %-20s [%s]\n' "$gkind" "$gvmid" "$gname" "$gnode"
+
+        det=$(acme_detect_all_tls "$gkind" "$gvmid" 2>/dev/null)
+        if [[ -z "$det" ]]; then
+            echo "      no nginx/apache2/caddy, and no caddy/nginx/traefik container on :443"
+            echo "      -> 'standard' mode only (cert installed, wire it up yourself)"
+            continue
+        fi
+        while IFS='|' read -r spec cpath kpath cfg; do
+            [[ -z "$spec" ]] && continue
+            case "$cpath" in
+                UNSUPPORTED) echo "      $spec -> cert paths not discoverable; manual" ;;
+                SELFMANAGED:*) echo "      $spec -> issues its own certs (${cpath#SELFMANAGED:}); needs a Caddyfile change" ;;
+                NOTBOUND:*)  echo "      $spec -> reads ${cpath#NOTBOUND:} (not bind-mounted); manual" ;;
+                *)
+                    echo "      $spec"
+                    echo "        cert: $cpath"
+                    local nm
+                    nm=$(acme_service_names "$gkind" "$gvmid" "$spec" "$cfg" 2>/dev/null | head -3 | tr '\n' ' ')
+                    echo "        names: ${nm:-<none found>}"
+                    if [[ -n "$nm" ]] && ! grep -q "$ACME_DOMAIN" <<<"$nm"; then
+                        echo "        NOTE: not covered by the certificate -- use the vhost rename option"
+                    fi
+                    ;;
+            esac
+        done <<< "$det"
+    done
+    echo ""
+    echo "======================================================================"
+    echo "Done."
+}
+
+# Main ACME menu
+acme_menu() {
+    while true; do
+        local cert_line="not issued"
+        if acme_cert_present; then
+            local exp
+            exp=$(openssl x509 -in "$(acme_live_dir)/fullchain.pem" -noout -enddate 2>/dev/null | sed 's/notAfter=//')
+            cert_line="issued, expires $exp"
+        fi
+        local client_line="not installed"
+        acme_client_installed && client_line="$(acme_client_version)"
+        local tok_line="NOT SET"
+        acme_have_token && tok_line="set"
+
+        local role_line="ISSUER (this host issues and renews)"
+        acme_is_issuer || role_line="DEPLOYER (issuer: ${ACME_ISSUER_HOST})"
+        local src_line="$(acme_source_dir)"
+
+        local status="Domain:   ${ACME_DOMAIN:-<unset>}
+Internal: *.${ACME_SUBDOMAIN:-lan}.${ACME_DOMAIN:-<unset>}
+Role:     $role_line
+Source:   $src_line
+Token:    $tok_line
+Client:   $client_line
+Cert:     $cert_line"
+
+        local choice
+        choice=$(show_menu "Cloudflare / Let's Encrypt Certificates" \
+            "$status\n\nSelect an operation:" \
+            "1" "Configure (token, domain, email)" \
+            "2" "Install / update acme.sh client" \
+            "3" "Run pre-flight checks" \
+            "4" "Issue certificate - STAGING (dry run, no rate-limit cost)" \
+            "5" "Issue certificate - PRODUCTION" \
+            "6" "Show certificate details" \
+            "7" "Deploy to LXC containers (any node)" \
+            "8" "Deploy to VMs (any node)" \
+            "9" "Renew now and re-deploy to all recorded targets" \
+            "F" "Fetch certificate from the issuer host" \
+            "S" "Scan cluster: what TLS service each guest has" \
+            "T" "List recorded deploy targets" \
+            "P" "Register a Proxmox product (PDM/PBS) via its API" \
+            "D" "Show DNS setup requirements" \
+            "0" "Back")
+
+        case "$choice" in
+            1) acme_config_menu ;;
+            2) ( acme_install_client ) | show_progress_box "Install acme.sh" ;;
+            3)
+                if [[ -z "${ACME_DOMAIN:-}" ]]; then
+                    show_msg "Not Configured" "Set the domain and token first (option 1)."
+                    continue
+                fi
+                ( acme_preflight ) | show_progress_box "Pre-flight Checks"
+                ;;
+            4|5)
+                local staging=1 what="STAGING"
+                [[ "$choice" == "5" ]] && { staging=0; what="PRODUCTION"; }
+
+                if [[ -z "${ACME_DOMAIN:-}" ]] || ! acme_have_token; then
+                    show_msg "Not Configured" "Set the domain and Cloudflare token first (option 1)."
+                    continue
+                fi
+                if ! acme_client_installed; then
+                    show_msg "No Client" "acme.sh is not installed. Run option 2 first."
+                    continue
+                fi
+                if [[ "$staging" == "0" ]]; then
+                    if ! show_yesno "Production Issuance" \
+"Issue a PRODUCTION certificate for:
+
+  ${ACME_DOMAIN}
+  *.${ACME_DOMAIN}${ACME_SUBDOMAIN:+
+  *.${ACME_SUBDOMAIN}.${ACME_DOMAIN}}
+
+Let's Encrypt allows only 5 identical certificates per week, so
+avoid repeated production issuance. Run STAGING first if unsure.
+
+Continue?"; then
+                        continue
+                    fi
+                fi
+                ( acme_issue "$staging" ) | show_progress_box "Issue Certificate ($what)"
+                ;;
+            6)
+                local info
+                info=$(acme_cert_summary 2>&1)
+                show_scrollmsg "Certificate Details" "$info"
+                ;;
+            7) acme_deploy_menu lxc ;;
+            8) acme_deploy_menu vm ;;
+            9)
+                if ! show_yesno "Renew" "Renew if due, then re-deploy to all recorded targets?"; then
+                    continue
+                fi
+                ( acme_renew_all 0 ) | show_progress_box "Renew and Re-deploy"
+                ;;
+            F|f)
+                if acme_is_issuer; then
+                    show_msg "This Host Is The Issuer" \
+"No issuer host is configured, so this host issues its own certificate
+and there is nothing to fetch.
+
+If another host should be the issuer, set it in Configure -> option 7."
+                    continue
+                fi
+                ( acme_fetch_from_issuer ) | show_progress_box "Fetch From Issuer"
+                ;;
+            S|s)
+                if [[ -z "${ACME_DOMAIN:-}" ]]; then
+                    show_msg "Not Configured" "Set the domain first (option 1)."
+                    continue
+                fi
+                local scanlog="$LOG_DIR/acme-scan-$(date -u +%Y%m%dT%H%M%SZ).log"
+                : > "$scanlog" 2>/dev/null || scanlog="/tmp/acme-scan-$$.log"
+                show_info "Scanning" "Surveying every running guest in the cluster..."
+                acme_cluster_scan > "$scanlog" 2>&1
+                show_textbox "Cluster TLS Survey" "$scanlog"
+                ;;
+            T|t)
+                local t
+                t=$(acme_list_targets 2>&1)
+                show_scrollmsg "Deploy Targets" "$t"
+                ;;
+            P|p)
+                if ! acme_cert_present; then
+                    show_msg "No Certificate" "No certificate available at $(acme_source_dir)."
+                    continue
+                fi
+                show_scrollmsg "Proxmox Product via API" \
+"Proxmox Datacenter Manager and Proxmox Backup Server replace their own
+certificate through their API, so no guest agent or SSH is needed.
+
+1. In the product's UI create an API token (e.g. root@pam!certdeploy).
+2. Give the TOKEN System.Modify on / : either untick Privilege
+   Separation, or add an 'API Token Permission' (not a user
+   permission) with role Administrator on path /.
+3. Save a 0600 env file on this host, e.g. /etc/homelab/pdm-token.env:
+
+     PX_URL='https://<host>:8443'          (PBS: port 8007)
+     PX_SCHEME='PDMAPIToken'               (PBS: PBSAPIToken)
+     PX_TOKEN_ID='root@pam!certdeploy'
+     PX_TOKEN_SECRET='<secret>'
+
+   Quote the values: the token ID contains '!'."
+                local pv pn pe
+                pv=$(show_input "VM ID" "VM ID of the product (used as the target key):" "")
+                [[ -z "$pv" ]] && continue
+                pn=$(show_input "Name" "Short name; the certificate name will be <name>.${ACME_SUBDOMAIN:-lan}.${ACME_DOMAIN}:" "")
+                [[ -z "$pn" ]] && continue
+                pe=$(show_input "Credentials File" "Path to the 0600 env file:" "/etc/homelab/${pn}-token.env")
+                [[ -z "$pe" ]] && continue
+                local plog="$LOG_DIR/acme-papi-$(date -u +%Y%m%dT%H%M%SZ).log"
+                acme_register_proxmox_api "$pv" "$pn" "$pe" > "$plog" 2>&1
+                show_textbox "Proxmox Product Deployment" "$plog"
+                ;;
+            D|d) show_scrollmsg "DNS Requirements" "$(acme_dns_hint)" ;;
+            0|"") return ;;
+        esac
+    done
+}
+
 # Certificate Management Menu
 certificate_menu() {
     while true; do
@@ -7807,6 +10656,7 @@ certificate_menu() {
             "7" "List generated certificates" \
             "8" "Export CA certificate" \
             "9" "Renew certificate" \
+            "C" "Cloudflare / Let's Encrypt (publicly-trusted certs)" \
             "0" "Back to main menu")
 
         case "$choice" in
@@ -8298,6 +11148,7 @@ certificate_menu() {
                     ) 2>&1 | show_progress_box "Renew Certificate"
                 fi
                 ;;
+            C|c) acme_menu ;;
             0|"")
                 break
                 ;;
@@ -9672,6 +12523,10 @@ nginx_auto_https_wizard() {
         return
     fi
 
+    # Fixed Docker reverse-proxy identity (used when method="docker")
+    local docker_proxy_container="pve-auto-https-nginx"
+    local docker_proxy_conf_dir="/opt/pve-manager/auto-https/conf.d"
+
     # Determine OS-specific paths/commands
     local os_type conf_dir reload_cmd install_cmd
     os_type=$(detect_container_os "$selected")
@@ -9688,38 +12543,45 @@ nginx_auto_https_wizard() {
             ;;
     esac
 
-    # Ensure nginx is installed in the container
-    local has_nginx
+    # Detect existing reverse-proxy setup and Docker availability, then pick a method
+    local has_nginx docker_available existing_docker existing_native method
     has_nginx=$(lxc_exec "$selected" "command -v nginx 2>/dev/null")
-    if [[ -z "$has_nginx" ]]; then
+    docker_available=$(lxc_exec "$selected" "command -v docker 2>/dev/null")
+    existing_docker=$(lxc_exec "$selected" "docker inspect -f '{{.Name}}' $docker_proxy_container 2>/dev/null")
+    existing_native=$(lxc_exec "$selected" "test -f $conf_dir/pve-https-upgrade-map.conf && echo yes")
+
+    if [[ -n "$existing_docker" && -z "$existing_native" ]]; then
+        method="docker"
+    elif [[ -z "$existing_docker" && -n "$existing_native" ]]; then
+        method="native"
+    elif [[ -z "$docker_available" ]]; then
+        method="native"
+    else
+        method=$(show_menu "Reverse Proxy Method" "Choose how to run the Nginx reverse proxy in container $selected:" \
+            "native" "Native nginx (installed as a system service)" \
+            "docker" "Dockerized nginx (container: $docker_proxy_container)")
+        [[ -z "$method" ]] && return
+    fi
+
+    if [[ "$method" == "docker" ]]; then
+        conf_dir="$docker_proxy_conf_dir"
+    elif [[ -z "$has_nginx" ]]; then
         if ! show_yesno "Install Nginx" "Nginx is not installed in container $selected.\n\nInstall nginx now (native) to use as the HTTPS reverse proxy?"; then
             return
         fi
     fi
 
-    # Assign a dedicated HTTPS port to each selected service and build summary
-    local -A USED_PORTS
-    # Mark all detected service ports as used so we never collide with them
-    local cn
-    for cn in "${!SVC_PORT[@]}"; do USED_PORTS["${SVC_PORT[$cn]}"]=1; done
-
-    local svc_tags=() svc_ports=() svc_https=()
-    local summary=""
+    # Resolve the picked checklist tags to valid (tag, port) pairs first, so we
+    # know up front whether exactly one service is being integrated.
+    local svc_tags=() svc_ports=()
     local tag
     for tag in $picked; do
         tag="${tag//\"/}"
         [[ -z "$tag" ]] && continue
         local sport="${SVC_PORT[$tag]}"
         [[ -z "$sport" ]] && continue
-        # Default HTTPS port = service port + 10000, fall back to 9443+ on collision/overflow
-        local hport=$((sport + 10000))
-        if [[ $hport -gt 65000 ]]; then hport=9443; fi
-        while [[ -n "${USED_PORTS[$hport]}" ]]; do hport=$((hport + 1)); done
-        USED_PORTS["$hport"]=1
         svc_tags+=("$tag")
         svc_ports+=("$sport")
-        svc_https+=("$hport")
-        summary+="  • ${SVC_LABEL[$tag]}: https://${ip}:${hport}  ->  127.0.0.1:${sport}\n"
     done
 
     if [[ ${#svc_tags[@]} -eq 0 ]]; then
@@ -9727,7 +12589,51 @@ nginx_auto_https_wizard() {
         return
     fi
 
-    if ! show_yesno "Confirm Auto-HTTPS" "This will configure Nginx HTTPS reverse proxies in container $selected:\n\n${summary}\nCertificate: $hostname ($ip), issued by PVE Manager CA.\n\nProceed?"; then
+    # Assign a dedicated HTTPS port to each selected service and build summary.
+    # A single integrated service defaults to the standard HTTPS port (443);
+    # with multiple services each gets its own port (service port + 10000).
+    local -A USED_PORTS
+    # Mark ports actually published by Docker in THIS container as used, so we
+    # only collide-avoid against real conflicts (e.g. an existing "nginx" or
+    # "traefik" proxy already on 443) instead of every plugin's declared port
+    # across the whole catalog (several unrelated plugins also declare 443).
+    local used_port
+    for used_port in $(lxc_exec "$selected" "docker ps --format '{{.Ports}}' 2>/dev/null" | grep -oE '[0-9]+->' | cut -d'-' -f1); do
+        USED_PORTS["$used_port"]=1
+    done
+
+    local single_service=false
+    [[ ${#svc_tags[@]} -eq 1 ]] && single_service=true
+
+    local svc_https=()
+    local summary=""
+    local i
+    for i in "${!svc_tags[@]}"; do
+        local sport="${svc_ports[$i]}"
+        local hport
+        if $single_service; then
+            hport=443
+        else
+            # Default HTTPS port = service port + 10000, fall back to 9443+ on collision/overflow
+            hport=$((sport + 10000))
+            if [[ $hport -gt 65000 ]]; then hport=9443; fi
+        fi
+        local wanted_443=false
+        $single_service && [[ "$hport" == "443" ]] && wanted_443=true
+        while [[ -n "${USED_PORTS[$hport]}" ]]; do hport=$((hport + 1)); done
+        USED_PORTS["$hport"]=1
+        svc_https+=("$hport")
+        local url="https://${ip}:${hport}"
+        [[ "$hport" == "443" ]] && url="https://${ip}"
+        summary+="  • ${SVC_LABEL[${svc_tags[$i]}]}: ${url}  ->  127.0.0.1:${sport}\n"
+        if $wanted_443 && [[ "$hport" != "443" ]]; then
+            summary+="    (port 443 is already in use by another service in this container; using ${hport} instead)\n"
+        fi
+    done
+
+    local method_desc="native nginx (system service)"
+    [[ "$method" == "docker" ]] && method_desc="Dockerized nginx (container: $docker_proxy_container)"
+    if ! show_yesno "Confirm Auto-HTTPS" "This will configure Nginx HTTPS reverse proxies in container $selected using ${method_desc}:\n\n${summary}\nCertificate: $hostname ($ip), issued by PVE Manager CA.\n\nProceed?"; then
         return
     fi
 
@@ -9746,10 +12652,10 @@ MAPEOF
 
     # Apply everything with a progress box
     (
-        echo "=== Auto-HTTPS via Nginx - Container $selected ==="
+        echo "=== Auto-HTTPS via Nginx - Container $selected (method: $method) ==="
         echo ""
 
-        if [[ -z "$has_nginx" ]]; then
+        if [[ "$method" == "native" && -z "$has_nginx" ]]; then
             echo "Installing nginx ($os_type)..."
             lxc_exec_live "$selected" "$install_cmd"
             echo ""
@@ -9776,7 +12682,9 @@ MAPEOF
             local t="${svc_tags[$i]}"
             local sp="${svc_ports[$i]}"
             local hp="${svc_https[$i]}"
-            echo "Configuring ${SVC_LABEL[$t]}: https://${ip}:${hp} -> 127.0.0.1:${sp}"
+            local hp_url="https://${ip}:${hp}"
+            [[ "$hp" == "443" ]] && hp_url="https://${ip}"
+            echo "Configuring ${SVC_LABEL[$t]}: ${hp_url} -> 127.0.0.1:${sp}"
 
             local site
             site=$(cat << EOF
@@ -9818,16 +12726,36 @@ EOF
         done
         echo ""
 
-        echo "Validating nginx configuration..."
-        if lxc_exec "$selected" "nginx -t 2>&1"; then
-            echo "Configuration valid. Reloading nginx..."
-            lxc_exec_live "$selected" "$reload_cmd"
-            echo ""
-            echo "=== Auto-HTTPS configuration complete ==="
+        if [[ "$method" == "native" ]]; then
+            echo "Validating nginx configuration..."
+            if lxc_exec "$selected" "nginx -t 2>&1"; then
+                echo "Configuration valid. Reloading nginx..."
+                lxc_exec_live "$selected" "$reload_cmd"
+                echo ""
+                echo "=== Auto-HTTPS configuration complete ==="
+            else
+                echo ""
+                echo "ERROR: nginx configuration test failed. No changes were reloaded."
+                echo "Review the generated files in $conf_dir/pve-https-*.conf"
+            fi
         else
-            echo ""
-            echo "ERROR: nginx configuration test failed. No changes were reloaded."
-            echo "Review the generated files in $conf_dir/pve-https-*.conf"
+            echo "Validating nginx configuration (Docker)..."
+            if lxc_exec "$selected" "docker run --rm -v $conf_dir:/etc/nginx/conf.d:ro -v /etc/ssl/pve-manager:/etc/ssl/pve-manager:ro nginx:stable nginx -t 2>&1"; then
+                echo "Configuration valid."
+                if [[ -n "$existing_docker" ]]; then
+                    echo "Restarting existing $docker_proxy_container container..."
+                    lxc_exec_live "$selected" "docker restart $docker_proxy_container"
+                else
+                    echo "Starting $docker_proxy_container container (network: host)..."
+                    lxc_exec_live "$selected" "docker run -d --name $docker_proxy_container --network host --restart unless-stopped -v $conf_dir:/etc/nginx/conf.d:ro -v /etc/ssl/pve-manager:/etc/ssl/pve-manager:ro nginx:stable"
+                fi
+                echo ""
+                echo "=== Auto-HTTPS configuration complete ==="
+            else
+                echo ""
+                echo "ERROR: nginx configuration test failed. No changes were applied."
+                echo "Review the generated files in $conf_dir/pve-https-*.conf"
+            fi
         fi
     ) 2>&1 | show_progress_box "Configuring Auto-HTTPS" 24 84
 
@@ -9835,9 +12763,11 @@ EOF
     local access=""
     local i
     for i in "${!svc_tags[@]}"; do
-        access+="${SVC_LABEL[${svc_tags[$i]}]}: https://${ip}:${svc_https[$i]}\n"
+        local access_url="https://${ip}:${svc_https[$i]}"
+        [[ "${svc_https[$i]}" == "443" ]] && access_url="https://${ip}"
+        access+="${SVC_LABEL[${svc_tags[$i]}]}: ${access_url}\n"
     done
-    show_msg "Auto-HTTPS Complete" "Nginx HTTPS reverse proxies configured in container $selected:\n\n${access}\nThe PVE Manager CA certificate is trusted inside the container. To trust these URLs from your workstation, import the CA cert (Certificate Management > Export CA certificate)."
+    show_msg "Auto-HTTPS Complete" "Nginx HTTPS reverse proxies configured in container $selected using ${method_desc}:\n\n${access}\nThe PVE Manager CA certificate is trusted inside the container. To trust these URLs from your workstation, import the CA cert (Certificate Management > Export CA certificate)."
 }
 
 # Enable HTTPS wizard
@@ -11774,6 +14704,11 @@ Options:
   -v, --version   Show version information
   --check         Check dependencies and exit
   --init          Initialize configuration only
+  --acme-status   Show the ACME certificate and its deploy targets
+  --acme-renew    Renew the ACME certificate if due, then re-deploy (headless)
+  --acme-redeploy Re-push the current certificate to recorded targets (no CA call)
+  --acme-renew-force
+                  Force renewal even if not due (consumes rate-limit quota)
 
 Features:
   - LXC container creation and management
@@ -11870,6 +14805,41 @@ main() {
         --init)
             init_config
             echo "Configuration initialized at $CONFIG_DIR"
+            exit 0
+            ;;
+        --acme-renew|--acme-renew-force)
+            # Non-interactive renewal for cron / systemd timers: renew if due,
+            # then re-push to every recorded target. No dialog is used, so this
+            # is safe to run headless.
+            init_config
+            load_config
+            if is_pve_host; then
+                pve_connect "local" &>/dev/null
+            fi
+            local _force=0
+            [[ "${1}" == "--acme-renew-force" ]] && _force=1
+            acme_renew_all "$_force"
+            exit $?
+            ;;
+        --acme-redeploy)
+            # Re-push the CURRENT certificate to every recorded target without
+            # contacting the ACME CA. This is the hook for an external issuer
+            # (e.g. a standalone acme.sh renew hook) to refresh guest targets
+            # after it renews, so they cannot silently go stale.
+            init_config
+            load_config
+            if is_pve_host; then
+                pve_connect "local" &>/dev/null
+            fi
+            acme_redeploy_targets
+            exit $?
+            ;;
+        --acme-status)
+            init_config
+            load_config
+            acme_cert_summary
+            echo ""
+            acme_list_targets
             exit 0
             ;;
     esac

@@ -5,12 +5,16 @@ A comprehensive single-file Bash TUI application for managing Proxmox VE infrast
 ## Features
 
 - **LXC Container Management**: Create, start, stop, delete containers with a wizard interface
+- **VM Management**: Manage QEMU VMs via the guest agent, including HTTPS and service deployment
 - **Template Management**: Browse, download, and manage container templates
 - **Docker Setup**: Automated Docker installation with LXC-specific configuration
 - **SSH Key Management**: Generate and distribute SSH keys across containers
+- **Root SSH Access**: One-click install/enable of sshd and root login (key-only, password, or both) on any container, single or fleet-wide
+- **User Provisioning**: Create a user with optional sudo/wheel membership and SSH key access, on either an LXC container or a VM
 - **Certificate Authority**: Self-signed CA with automatic certificate generation, deployment, and renewal
-- **Service Deployment**: 22 pre-configured services with Docker and native installation options
+- **Service Deployment**: 25 pre-configured services with Docker and native installation options
 - **FreeIPA Setup Wizard**: Complete LDAP structure management for identity services
+- **Publicly-trusted certificates** via ACME (Let's Encrypt) with Cloudflare DNS-01, deployable to LXC containers and VMs
 
 ## Requirements
 
@@ -55,6 +59,10 @@ chmod +x /opt/pve-manager/pve-manager.sh
 | `-v, --version` | Show version information |
 | `--check` | Check dependencies and exit |
 | `--init` | Initialize configuration only |
+| `--acme-status` | Show the ACME certificate and its deploy targets |
+| `--acme-renew` | Renew the ACME certificate if due, then re-deploy (headless) |
+| `--acme-redeploy` | Re-push the current certificate to recorded targets (no CA call) |
+| `--acme-renew-force` | Force renewal even if not due (consumes rate-limit quota) |
 
 ## Configuration
 
@@ -92,7 +100,7 @@ SSH_KEY_TYPE="ed25519"    # SSH key type (ed25519, rsa, ecdsa)
 LOG_LEVEL="INFO"          # Log level (INFO, DEBUG)
 ```
 
-## Supported Services (22 Total)
+## Supported Services (25 Total)
 
 ### Monitoring Stack
 | Service | Description | Ports |
@@ -148,15 +156,16 @@ LOG_LEVEL="INFO"          # Log level (INFO, DEBUG)
 
 ```
 ┌─────────────────────────────────────┐
-│        PVE Manager v1.0.0           │
+│        PVE Manager v2.1.0           │
 ├─────────────────────────────────────┤
 │  1. Connect to PVE Server           │
 │  2. LXC Container Management        │
-│  3. Docker Setup                    │
-│  4. SSH Key Management              │
-│  5. Service Deployment              │
-│  6. Certificate Management          │
-│  7. Settings                        │
+│  3. VM Management                   │
+│  4. Docker Setup                    │
+│  5. SSH Key Management              │
+│  6. Service Deployment              │
+│  7. Certificate Management          │
+│  8. Settings                        │
 │  0. Exit                            │
 └─────────────────────────────────────┘
 ```
@@ -190,6 +199,38 @@ Operations:
 - Delete containers (with confirmation)
 - View detailed container configuration
 
+### 2b. VM Management
+
+Manages QEMU VMs through the QEMU Guest Agent (`qm guest exec`), mirroring the
+LXC workflow wherever the guest agent makes it possible:
+- List VMs and view their configuration, including guest agent status and IP
+- Execute arbitrary commands inside a running VM (requires the guest agent)
+- Enable HTTPS for a detected service (Docker or native) the same way as LXC containers
+- Deploy Jenkins or Nginx to a VM
+- Create a user (see [2c. User Provisioning](#2c-user-provisioning-lxc--vm))
+
+Operations that need guest access (command execution, user creation) are
+disabled with a clear message if the QEMU Guest Agent isn't installed/running
+in the VM.
+
+### 2c. User Provisioning (LXC & VM)
+
+Available from both **LXC Container Management → Create user** and
+**VM Management → Create user** (same underlying logic for both guest types):
+
+1. Pick a running container or VM
+2. Enter a username (lowercase letters/digits/`-`/`_`, must not already exist)
+3. Choose whether to grant sudo/wheel group membership
+4. Choose whether to enable SSH key-based access for the new user
+
+The wizard creates the account with a random password, adds it to `sudo`
+(Debian/Ubuntu) or `wheel` (RHEL-family/Alpine) if requested — installing the
+`sudo` package first if it's missing — and, if SSH access is requested,
+installs/enables `sshd` and appends the pve-manager SSH public key to the
+user's `~/.ssh/authorized_keys`. The generated password is shown once in a
+results dialog; it is written to a private temp file and never passed through
+stdout, so it never ends up in `~/.pve-manager/logs/operations.log`.
+
 ### 3. Docker Setup
 
 Pre-installation checks:
@@ -211,6 +252,13 @@ Supported distributions:
 - Distribute public key to containers
 - Setup passwordless inter-container SSH
 - Test connectivity matrix across all containers
+- **Enable root SSH** on one container or all running containers: installs/enables
+  `sshd` if missing, sets `PermitRootLogin` (`prohibit-password` for key-only,
+  `yes` for password/both), optionally copies the pve-manager SSH key, optionally
+  sets a random root password (shown once), and opens the firewall (`ufw`/`firewalld`)
+  if one is active. A high-precedence `sshd_config.d/00-pve-manager-root-ssh.conf`
+  drop-in is written as well, since some distro images (e.g. Ubuntu cloud images)
+  ship an `Include`'d config that would otherwise override the setting
 
 ### 5. Certificate Authority
 
@@ -229,6 +277,243 @@ Certificate locations in containers:
 ├── <hostname>.crt        # Certificate
 ├── <hostname>-chain.pem  # Certificate chain
 └── ca.crt               # CA certificate
+```
+
+### 5b. Cloudflare / Let's Encrypt Certificates (ACME)
+
+Issues a **publicly-trusted** wildcard certificate and pushes it to guests,
+replacing self-signed certificates. Browsers trust it with no CA import.
+
+Reach it from **Certificate Management → C**.
+
+#### Why a wildcard
+
+One certificate covers every guest, which means:
+
+- guests never hold the Cloudflare token — only the PVE host does
+- a single issuance covers the whole fleet, so ACME rate limits are a non-issue
+- renewal is one operation plus a re-push to recorded targets
+
+#### Requirements
+
+1. **A real, registrable domain on Cloudflare nameservers.** A reserved
+   pseudo-TLD (`.lan`, `.local`, `.home`, `.internal`) can *never* be certified
+   by a public CA — there is no way to prove ownership. The configuration menu
+   rejects these outright.
+2. **A scoped Cloudflare API token**:
+   - `Zone → DNS → Edit`
+   - `Zone → Zone → Read`
+   - Zone Resources → Include → Specific zone → your domain
+   - TTL blank (an expiring token silently breaks unattended renewal)
+
+   Do **not** use a Global API Key. The token is stored `0600` at
+   `~/.pve-manager/acme/cloudflare.env`, on the PVE host only.
+3. **Split-horizon DNS.** DNS-01 validates against the *public* zone and creates
+   no address records, so internal names must be pointed at LAN IPs on your own
+   resolver (e.g. AdGuard Home DNS rewrites). Menu option `D` prints the details.
+
+#### Naming
+
+Guests are addressed as `<guest>.<ACME_SUBDOMAIN>.<ACME_DOMAIN>`, e.g.
+`gitea.lan.example.com`. The issued SAN set is:
+
+```
+example.com
+*.example.com
+*.lan.example.com
+```
+
+Note that `lan.example.com` is deliberately **absent**. Let's Encrypt rejects an
+order containing both a wildcard and a name that wildcard already covers:
+
+```
+Domain name "lan.example.com" is redundant with a wildcard
+domain in the same request. Remove one or the other.
+```
+
+`*.example.com` already covers it, so nothing is lost.
+
+#### Single-issuer model
+
+Exactly **one** host should hold the Cloudflare token and run the ACME client.
+Every other host deploys a certificate it did not issue.
+
+Running an issuer per node looks convenient and fails quietly: each consumes
+Let's Encrypt's 5-duplicate-certificates-per-week budget, each renews on its own
+schedule (or none — a second issuer in testing had no timer at all, so its
+certificate would simply have expired), and the same guest ends up recorded as a
+renewal target on two hosts that overwrite each other.
+
+Two settings control where a certificate comes from:
+
+| Setting | Meaning |
+|---|---|
+| `ACME_ISSUER_HOST` | empty = **this host issues**. Set = fetch from that host over SSH and never issue locally. |
+| `ACME_ISSUER_DIR` | path on the issuer holding `fullchain.pem` / `privkey.pem` / `chain.pem` |
+| `ACME_CERT_SOURCE_DIR` | read the certificate from this local path instead of the tool's own acme.sh live directory — for when a standalone acme.sh already manages it |
+
+On a deployer host:
+
+- **Issuance is refused** with an explanation, not a silent duplicate certificate
+- The deploy menu **fetches from the issuer first**, so a stale copy cannot be pushed
+- `--acme-renew` **fetches and re-deploys** rather than renewing
+- Only the three deployable files are fetched — never the account key or the token
+
+The main menu shows the role (`ISSUER` / `DEPLOYER (issuer: …)`) and the resolved
+certificate source, so it is never ambiguous which host is authoritative.
+
+#### Integrating with an external issuer
+
+If a standalone `acme.sh` already renews the certificate, point the tool at its
+output with `ACME_CERT_SOURCE_DIR` and call the tool from that client's renew
+hook so guests are refreshed in the same pass:
+
+```bash
+/root/pve-manager/pve-manager.sh --acme-redeploy
+```
+
+That re-pushes the current certificate to every recorded target **without
+contacting the CA**. Without it, a renewal refreshes whatever the external hook
+knows about and leaves every guest on the old certificate until it expires.
+
+#### Proxmox products (PDM / PBS)
+
+Proxmox Datacenter Manager and Proxmox Backup Server own their TLS and replace
+it through their API, so they are deployed as target kind **`papi`** — no guest
+agent and no SSH into the VM:
+
+```
+POST /api2/json/nodes/localhost/certificates/custom
+     certificates=<chain> key=<key> force=1 restart=1
+```
+
+Register with menu option **P**. Credentials live in a 0600 env file, linked as
+`~/.pve-manager/acme/api/<vmid>.env`:
+
+```
+PX_URL='https://10.88.20.200:8443'   # PBS: port 8007
+PX_SCHEME='PDMAPIToken'              # PBS: PBSAPIToken
+PX_TOKEN_ID='root@pam!certdeploy'    # quote it: contains '!'
+PX_TOKEN_SECRET='<secret>'
+```
+
+The token needs `System.Modify` on `/`. **With Privilege Separation enabled,
+grant it as an "API Token Permission"** — a permission on the user does not
+reach the token, which then authenticates with every privilege `false`.
+
+Before any key leaves the host the tool checks that the token authenticates and
+holds `System.Modify`. Upload is skipped when the product already serves the
+current certificate (it restarts the product's proxy), adoption is verified by a
+real handshake, and a non-adoption prints the rollback
+(`DELETE .../certificates/custom` regenerates the self-signed cert).
+
+#### Consumers that pin certificates
+
+Anything that **pins a fingerprint** breaks when the certificate changes — and a
+renewal changes it every ~60 days. PDM pinned each PVE node's fingerprint and
+every remote failed with `HTTP 400: Could not establish a TLS connection`.
+Re-pinning only defers the failure; instead point such clients at a **name the
+certificate covers** and drop the pin, so they validate against the public trust
+store and renewals are invisible to them.
+
+#### Cluster-wide deployment
+
+Guests on **any node** are deployable. Proxmox's `pct`/`qm` only work for guests
+the local node owns, so commands are routed to the owning node over the cluster's
+existing root SSH trust. Node addresses come from `/etc/pve/.members` (replicated
+by pmxcfs), and SSH uses the IP rather than the node name, which is frequently
+absent from `known_hosts`.
+
+The deploy picker lists every running guest in the cluster, labelled with its
+node. If a node is unreachable you get a specific message naming it, not a
+cryptic `Configuration file 'nodes/PDxxx/lxc/N.conf' does not exist`.
+
+#### Supported application shapes
+
+| Shape | Detected | Replaceable |
+|---|---|---|
+| nginx / apache2 / caddy installed in the guest | yes | yes (apache: cert only, no vhost rename) |
+| caddy or nginx in a **Docker container** | yes | yes |
+| traefik in a container | reported | no — cert paths not discoverable |
+| cert path inside an image or named volume | reported as `NOTBOUND` | no — nothing to write |
+| anything else | reported | `standard` mode only |
+
+For containerised proxies the certificate path found in the config is a
+*container* path; it is translated to the guest path through
+`docker inspect .Mounts` before anything is written. Nginx's config file is
+located by searching for `server_name` rather than assuming a path.
+
+**Menu option `S` scans the whole cluster** and reports, per guest, which TLS
+terminator it runs, where its certificate lives, what server names it answers to,
+and whether those names are covered by your certificate.
+
+#### Virtual host rename
+
+Replacing a certificate is only half the job when the vhost is still named
+`<app>.myhome.lan` — no public certificate can cover a reserved pseudo-TLD, so
+the service loads the new cert and every client still sees a name mismatch. The
+deploy therefore offers to repoint the vhost at `<guest>.<sub>.<domain>`.
+
+It is **opt-in**, asked once per deployment, and never repeated on renewal (a
+one-off migration should not be redone unattended every 60 days). The config is
+backed up in the guest as `*.pvebak.<timestamp>`, validated after editing, and
+restored automatically if validation fails.
+
+Config edits are written with **truncate-and-write to preserve the inode**. This
+matters: a Docker single-file bind mount is bound to the inode, so `sed -i`,
+`install` or `mv` silently detach the mount and the container keeps reading stale
+content — or sees the file disappear.
+
+#### Verification
+
+A reload reporting success does not mean the service adopted the certificate.
+`caddy reload` with an unchanged config logs *"config is unchanged"*, keeps the
+cert already in memory, and **exits 0** — so the deploy performs a real TLS
+handshake from inside the guest and compares serial numbers. A mismatch is
+reported as `NOT ADOPTED`, distinguishing "did not re-read the file" from "no
+virtual host for that name, handshake aborted".
+
+#### Deployment modes
+
+| Mode | Behaviour |
+|------|-----------|
+| `inplace` (default) | Detects nginx / apache2 / caddy, finds the cert paths each already reads, backs them up in-guest as `*.pvebak.<stamp>`, overwrites them, then config-tests and gracefully reloads. No service config is edited, so it cannot break on a directive it did not expect. |
+| `standard` | Installs to `/etc/ssl/pve-manager/<domain>/` only and changes nothing else. |
+
+Both modes also install to the canonical path, and both are recorded as renewal
+targets.
+
+```
+/etc/ssl/pve-manager/<domain>/
+├── fullchain.pem   # leaf + intermediates (644)
+├── privkey.pem     # private key (640)
+└── chain.pem       # intermediates only (644)
+```
+
+#### Safety guards
+
+Deployment is refused, with a reason, if the certificate and key are not a
+matching pair, the certificate expires within 24h, or the chain does **not**
+verify against the system trust store — the last of which stops a staging
+certificate from ever reaching a real service.
+
+#### Rate limits
+
+Let's Encrypt permits 50 certificates per registered domain per week, but only
+**5 duplicate certificates** (identical SAN set) per week. Use **option 4
+(STAGING)** for dry runs; it has far higher limits. To debug *deployment*, re-run
+a deploy against the already-issued certificate rather than re-issuing.
+
+#### Renewal
+
+Option `9` renews if due and re-pushes to every recorded target. For unattended
+renewal, drive the same path from a timer:
+
+```bash
+# /etc/systemd/system/pve-manager-acme-renew.service
+[Service]
+Type=oneshot
+ExecStart=/root/pve-manager/pve-manager.sh --acme-renew
 ```
 
 ### 6. Service Deployment Menu
@@ -471,6 +756,12 @@ tail -f ~/.pve-manager/pve-manager.log
 ```
 
 Or use Settings -> View log file in the TUI.
+
+Operation output (install/config steps, errors) is also mirrored to
+`~/.pve-manager/logs/operations.log`. Generated passwords (root SSH, user
+provisioning) are deliberately kept out of both logs — they're written to a
+private, caller-owned temp file and shown once in a results dialog instead of
+being printed to stdout.
 
 ## License
 
